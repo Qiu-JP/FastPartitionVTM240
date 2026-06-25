@@ -1,0 +1,14 @@
+{
+	"backtraceGraph" : 
+	{
+		"commands" : [],
+		"files" : [],
+		"nodes" : []
+	},
+	"installers" : [],
+	"paths" : 
+	{
+		"build" : "source/App/BitstreamExtractorApp",
+		"source" : "source/App/BitstreamExtractorApp"
+	}
+}

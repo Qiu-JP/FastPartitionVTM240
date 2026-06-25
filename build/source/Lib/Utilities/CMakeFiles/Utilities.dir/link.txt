@@ -1,0 +1,2 @@
+/usr/bin/ar qc /home/qiujunpeng.726/qiujp/FastPartitionVTM/VVCSoftware_VTM/lib/umake/gcc-12.2/x86_64/debug/libUtilities.a CMakeFiles/Utilities.dir/VideoIOYuv.cpp.o CMakeFiles/Utilities.dir/program_options_lite.cpp.o
+/usr/bin/ranlib /home/qiujunpeng.726/qiujp/FastPartitionVTM/VVCSoftware_VTM/lib/umake/gcc-12.2/x86_64/debug/libUtilities.a

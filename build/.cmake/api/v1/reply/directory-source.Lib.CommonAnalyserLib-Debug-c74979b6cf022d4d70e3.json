@@ -1,0 +1,14 @@
+{
+	"backtraceGraph" : 
+	{
+		"commands" : [],
+		"files" : [],
+		"nodes" : []
+	},
+	"installers" : [],
+	"paths" : 
+	{
+		"build" : "source/Lib/CommonAnalyserLib",
+		"source" : "source/Lib/CommonAnalyserLib"
+	}
+}
