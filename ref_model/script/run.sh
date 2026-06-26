@@ -3,9 +3,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+REF_MODEL_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 DATA_ROOT="${PROJECT_ROOT}/data"
-DEFAULT_ENCODER="${SCRIPT_DIR}/EncoderAppStatic"
-DEFAULT_DECODER="${SCRIPT_DIR}/DecoderAppStatic"
+DEFAULT_ENCODER="${REF_MODEL_DIR}/bin/dumpPartition/EncoderAppStatic"
+DEFAULT_DECODER="${REF_MODEL_DIR}/bin/dumpPartition/DecoderAppStatic"
 ENCODER="${DEFAULT_ENCODER}"
 DECODER="${DEFAULT_DECODER}"
 
@@ -15,7 +16,7 @@ Usage:
   $(basename "$0") --dataset DATASET --qp QP [options]
 
 Workflow:
-  1. Run network/script/gencfg.sh first to generate cfg files.
+  1. Run ref_model/script/gencfg.sh first to generate cfg files.
   2. Run this script to execute encode/decode using those cfg files.
 
 Options:
@@ -27,14 +28,14 @@ Options:
   --partition-root PATH    Partition output root. Default: data/partition/<dataset>/<split>.
   --log-root PATH          Codec log root. Default: data/logs/<dataset>/qp_<qp>.
   --work-root PATH         Codec output root. Default: data/codec_run/<dataset>/qp_<qp>.
-  --encoder PATH           Override encoder binary. Default: network/script/EncoderAppStatic.
-  --decoder PATH           Override decoder binary. Default: network/script/DecoderAppStatic.
+  --encoder PATH           Override encoder binary. Default: ref_model/bin/dumpPartition/EncoderAppStatic.
+  --decoder PATH           Override decoder binary. Default: ref_model/bin/dumpPartition/DecoderAppStatic.
   --skip-decode            Only run encoder, skip decode and MD5 check.
 
 Sequence list lookup rule:
-  --type train -> network/script/Training_Sequences_<dataset>.txt
-  --type valid -> network/script/Validating_Sequences_<dataset>.txt
-  --type test  -> network/script/Testing_Sequences_<dataset>.txt
+  --type train -> ref_model/script/Training_Sequences_<dataset>.txt
+  --type valid -> ref_model/script/Validating_Sequences_<dataset>.txt
+  --type test  -> ref_model/script/Testing_Sequences_<dataset>.txt
 USAGE
 }
 
@@ -173,7 +174,7 @@ while IFS= read -r line || [[ -n "${line}" ]]; do
   cfg_path="${cfg_root}/${str_name}_intra_vtm.cfg"
   if [[ ! -f "${cfg_path}" ]]; then
     echo "Cfg not found: ${cfg_path}" >&2
-    echo "Please run network/script/gencfg.sh first." >&2
+    echo "Please run ref_model/script/gencfg.sh first." >&2
     exit 1
   fi
 

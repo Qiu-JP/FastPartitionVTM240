@@ -41,6 +41,13 @@ FastPartitionVTM 是一个面向 **VVC 标准参考软件 VTM 24.0** 的快速�
 
 ### `ref_model/`
 
-`ref_model/` 用于保存标准、未改动的 VTM 24.0 最小运行基线副本。该目录的作用不是承载新方法开发，而是用于标准行为复现、训练数据生成、基线性能对比和参考验证。
+`ref_model/` 用于保存 VTM 24.0 参考执行模型、标准配置和基于参考模型的数据生成脚本。该目录的作用不是承载神经网络方法开发，而是用于标准行为复现、训练划分标签生成、基线性能对比和参考验证。
 
-当前 `ref_model/` 采用最小化组织方式，通常只保留运行和对比所需的可执行文件、配置文件和脚本，例如 `build/`、`cfg/` 和 `script/`。在实验过程中，若需要获得标准 VTM 的划分结果、编码时间、码率质量指标或基线输出，应优先基于 `ref_model/` 组织运行，以保证实验方法与标准参考行为之间有清晰边界。
+当前 `ref_model/` 采用最小化组织方式，主要包含：
+
+- `bin/vtm240/`：标准、未改动的 VTM 24.0 可执行文件，用于标准基线运行、编码/解码一致性校验和参考结果对比；
+- `bin/dumpPartition/`：用于生成训练划分标签的一组 VTM 可执行文件，其中编码器负责生成 bitstream，解码器读取划分导出环境变量并输出 `Luma_Partition_Info.txt`、`Chroma_Partition_Info.txt`；
+- `cfg/`：保存 VTM 编码配置模板，例如 `sequence.cfg` 与 `encoder_intra_vtm.cfg`；
+- `script/`：保存标准划分数据生成脚本和基线校验脚本，例如 `gencfg.sh`、`run.sh`、`gentxt.sh` 和 `roundtrip.sh`。
+
+在实验过程中，若需要生成训练用的标准划分标签，应优先使用 `ref_model/script/gencfg.sh` 和 `ref_model/script/run.sh`。生成的编码配置默认保存到 `data/CodecTrainCfg/`，划分信息默认保存到 `data/partition/`，日志与临时编码输出分别保存到 `data/logs/` 和 `data/codec_run/`。若需要验证标准 VTM 编码器和解码器的一致性，应使用 `ref_model/script/roundtrip.sh`，该流程使用 `bin/vtm240/` 中的标准可执行文件，不用于导出训练标签。

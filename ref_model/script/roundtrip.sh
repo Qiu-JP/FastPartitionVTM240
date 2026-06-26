@@ -14,8 +14,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REF_MODEL_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-BUILD_DIR="${REF_MODEL_DIR}/build"
-BIN_DIR="${BUILD_DIR}/bin"
+BIN_DIR="${REF_MODEL_DIR}/bin/vtm240"
 ENCODER="${BIN_DIR}/EncoderAppStatic"
 DECODER="${BIN_DIR}/DecoderAppStatic"
 
