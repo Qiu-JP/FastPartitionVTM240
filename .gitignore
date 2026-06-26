@@ -1,6 +1,9 @@
 data/video/
 data/partition/
 data/dataset/
+data/logs/
+data/codec_run/
+data/CodecTrainCfg/
 network/checkpoints/
 network/logs/
 network/output/
