@@ -47,6 +47,9 @@
 
 #include "EncCfgParam.h"
 
+#include <array>
+#include <sstream>
+
 #if JVET_O0756_CALCULATE_HDRMETRICS
 #include "HDRLib/inc/DistortionMetric.H"
 #ifdef UNDEFINED
@@ -1078,6 +1081,14 @@ protected:
   uint32_t      m_maxNumIBCMergeCand;                 ///< Max number of IBC merge candidates
   ScalingListMode m_useScalingListId;             ///< Using quantization matrix i.e. 0=off, 1=default, 2=file.
   std::string m_scalingListFileName;              ///< quantization matrix file name
+#if FastPartition
+  std::string m_fastPartitionSwinModel;            ///< FastPartition Swin luma TorchScript model file name
+  std::string m_fastPartitionClassifierModel;      ///< FastPartition Classifier_I TorchScript model file name
+  std::string m_fastPartitionPreset;               ///< FastPartition classifier preset
+  double      m_fastPartitionThreshold = -1.0;     ///< FastPartition classifier threshold override
+  std::array<double, 6> m_fastPartitionThresholds = { { 0.1, 0.1, 0.1, 0.1, 0.1, 0.1 } };
+  bool        m_fastPartitionThresholdsEnabled = false;
+#endif
 
   bool      m_disableScalingMatrixForAlternativeColourSpace;
   bool      m_scalingMatrixDesignatedColourSpace;
@@ -3213,6 +3224,45 @@ public:
   ScalingListMode getUseScalingListId    ()                          { return m_useScalingListId;      }
   void         setScalingListFileName       ( const std::string &s ) { m_scalingListFileName = s;      }
   const std::string& getScalingListFileName () const                 { return m_scalingListFileName;   }
+#if FastPartition
+  void         setFastPartitionSwinModel    ( const std::string &s ) { m_fastPartitionSwinModel = s;   }
+  const std::string& getFastPartitionSwinModel() const               { return m_fastPartitionSwinModel;}
+  void         setFastPartitionClassifierModel( const std::string &s ){ m_fastPartitionClassifierModel = s;   }
+  const std::string& getFastPartitionClassifierModel() const          { return m_fastPartitionClassifierModel;}
+  void         setFastPartitionPreset       ( const std::string &s ) { m_fastPartitionPreset = s;      }
+  const std::string& getFastPartitionPreset() const                  { return m_fastPartitionPreset;   }
+  void         setFastPartitionThreshold    ( double d )             { m_fastPartitionThreshold = d;   }
+  double       getFastPartitionThreshold    () const                 { return m_fastPartitionThreshold;}
+  void         setFastPartitionThresholds   ( const std::string& s )
+  {
+    if (s.empty())
+    {
+      m_fastPartitionThresholdsEnabled = false;
+      return;
+    }
+
+    std::string values = s;
+    for (char& c : values)
+    {
+      if (c == '[' || c == ']' || c == ',')
+      {
+        c = ' ';
+      }
+    }
+
+    std::istringstream stream(values);
+    for (double& threshold : m_fastPartitionThresholds)
+    {
+      CHECK(!(stream >> threshold) || threshold < 0.0,
+            "FastPartitionTh must contain six non-negative thresholds");
+    }
+    std::string extra;
+    CHECK(stream >> extra, "FastPartitionTh must contain exactly six thresholds");
+    m_fastPartitionThresholdsEnabled = true;
+  }
+  bool         getFastPartitionThresholdsEnabled() const             { return m_fastPartitionThresholdsEnabled; }
+  const std::array<double, 6>& getFastPartitionThresholds() const    { return m_fastPartitionThresholds; }
+#endif
   void         setDisableScalingMatrixForAlternativeColourSpace(bool b) { m_disableScalingMatrixForAlternativeColourSpace = b; }
   bool         getDisableScalingMatrixForAlternativeColourSpace()    { return m_disableScalingMatrixForAlternativeColourSpace; }
   void         setScalingMatrixDesignatedColourSpace (bool b)        { m_scalingMatrixDesignatedColourSpace = b; }

@@ -44,6 +44,9 @@
 #include "CommonLib/CommonDef.h"
 #include "CommonLib/CodingStructure.h"
 #include "InterSearch.h"
+#if FastPartition
+#include "EncFastPartition.h"
+#endif
 
 #include <typeinfo>
 #include <vector>
@@ -311,6 +314,10 @@ public:
   virtual void initCTUEncoding      ( const Slice &slice )                                                                  = 0;
   virtual void initCULevel          ( Partitioner &partitioner, const CodingStructure& cs )                                 = 0;
   virtual void finishCULevel        ( Partitioner &partitioner )                                                            = 0;
+#if FastPartition
+  virtual void setFastPartitionContext(const FastPartitionCtuCache* ctuCache,
+                                       EncFastPartitionClassifierInfer* classifierInfer) {}
+#endif
 
 protected:
 
@@ -779,6 +786,10 @@ class EncModeCtrlMTnoRQT : public EncModeCtrl, public CacheBlkInfoCtrl
   , public SaveLoadEncInfoSbt
 {
   unsigned m_skipThreshold;
+#if FastPartition
+  const FastPartitionCtuCache*       m_fastPartitionCtuCache = nullptr;
+  EncFastPartitionClassifierInfer*   m_fastPartitionClassifierInfer = nullptr;
+#endif
 #if GDR_ENABLED
   EncCfg m_encCfg;
 #endif
@@ -795,8 +806,20 @@ public:
   virtual bool useModeResult      ( const EncTestMode& encTestmode, CodingStructure*& tempCS,  Partitioner& partitioner );
 
   virtual bool checkSkipOtherLfnst( const EncTestMode& encTestmode, CodingStructure*& tempCS, Partitioner& partitioner );
+#if FastPartition
+  virtual void setFastPartitionContext(const FastPartitionCtuCache* ctuCache,
+                                       EncFastPartitionClassifierInfer* classifierInfer)
+  {
+    m_fastPartitionCtuCache = ctuCache;
+    m_fastPartitionClassifierInfer = classifierInfer;
+  }
+#endif
 
   bool xSkipTreeCandidate(const PartSplit split, const double* splitRdCostBest, const SliceType& sliceType) const;
+#if FastPartition
+  bool xFastPartitionGetAllowedClasses(Partitioner& partitioner, const CodingStructure& cs,
+                                       std::array<bool, 6>& allowedClasses);
+#endif
 };
 
 //! \}

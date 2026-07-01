@@ -52,6 +52,7 @@
 #include <stdio.h>
 #include <cmath>
 #include <algorithm>
+#include <cstdlib>
 
 //! \ingroup EncoderLib
 //! \{
@@ -66,6 +67,111 @@ const MergeIdxPair EncCu::m_geoModeTest[GEO_MAX_NUM_CANDS] = {
   MergeIdxPair{ 0, 5 }, MergeIdxPair{ 1, 5 }, MergeIdxPair{ 2, 5 }, MergeIdxPair{ 3, 5 }, MergeIdxPair{ 4, 5 },
   MergeIdxPair{ 5, 0 }, MergeIdxPair{ 5, 1 }, MergeIdxPair{ 5, 2 }, MergeIdxPair{ 5, 3 }, MergeIdxPair{ 5, 4 }
 };
+
+#if FastPartition
+namespace
+{
+const char* getFastPartitionDumpSplitName(PartSplit split)
+{
+  switch (split)
+  {
+  case CU_DONT_SPLIT: return "NO_SPLIT";
+  case CU_QUAD_SPLIT: return "QT";
+  case CU_HORZ_SPLIT: return "BTH";
+  case CU_VERT_SPLIT: return "BTV";
+  case CU_TRIH_SPLIT: return "TTH";
+  case CU_TRIV_SPLIT: return "TTV";
+  default:            return "OTHER";
+  }
+}
+
+bool fastPartitionDumpFirstLcu()
+{
+  static const bool enabled = [] {
+    const char* value = std::getenv("FASTPARTITION_DUMP_FIRST_LCU");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+  }();
+  return enabled;
+}
+
+bool fastPartitionDumpBoundaryCtu()
+{
+  static const bool enabled = [] {
+    const char* value = std::getenv("FASTPARTITION_DUMP_BOUNDARY_CTU");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+  }();
+  return enabled;
+}
+
+bool isFastPartitionFirstLcuDumpArea(const CodingStructure& cs, const Partitioner& partitioner)
+{
+  const UnitArea& area = partitioner.currArea();
+  if (cs.slice == nullptr || cs.slice->getPOC() != 0 || !isLuma(partitioner.chType))
+  {
+    return false;
+  }
+  const bool firstLcu = fastPartitionDumpFirstLcu() && area.lx() < 128 && area.ly() < 128;
+  const bool boundaryCtu = fastPartitionDumpBoundaryCtu()
+                           && (area.lx() + area.lwidth() > cs.picture->lwidth()
+                               || area.ly() + area.lheight() > cs.picture->lheight());
+  return firstLcu || boundaryCtu;
+}
+
+void dumpFastPartitionFirstLcuGridmaps(const CodingStructure& cs, const FastPartitionCtuCache& ctuCache)
+{
+  if (cs.slice == nullptr || cs.slice->getPOC() != 0)
+  {
+    return;
+  }
+  const bool firstLcu = fastPartitionDumpFirstLcu() && ctuCache.ctuX == 0 && ctuCache.ctuY == 0;
+  const bool boundaryCtu = fastPartitionDumpBoundaryCtu()
+                           && (ctuCache.ctuX + ctuCache.ctuWidth > cs.picture->lwidth()
+                               || ctuCache.ctuY + ctuCache.ctuHeight > cs.picture->lheight());
+  if (!firstLcu && !boundaryCtu)
+  {
+    return;
+  }
+  FILE* statFile = fastPartitionStatFile();
+  if (statFile == nullptr)
+  {
+    return;
+  }
+
+  for (size_t mapIdx = 0; mapIdx < ctuCache.gridmaps.size(); mapIdx++)
+  {
+    const FastPartitionGridmap64& gridmap = ctuCache.gridmaps[mapIdx];
+    const bool isBoundary = gridmap.validWidthUnits < 16 || gridmap.validHeightUnits < 16;
+    if (!gridmap.valid)
+    {
+      std::fprintf(statFile,
+                   "[FastPartitionGridmap] poc=%d ctu=%d,%d block=%zu target=%d,%d valid=0 validGrid=%dx%d boundary=%d\n",
+                   cs.slice->getPOC(), ctuCache.ctuX, ctuCache.ctuY, mapIdx,
+                   gridmap.targetX, gridmap.targetY, gridmap.validWidthUnits, gridmap.validHeightUnits,
+                   isBoundary ? 1 : 0);
+      continue;
+    }
+    for (int channel = 0; channel < 2; channel++)
+    {
+      std::fprintf(statFile,
+                   "[FastPartitionGridmap] poc=%d ctu=%d,%d block=%zu target=%d,%d channel=%d shape=16x16 validGrid=%dx%d boundary=%d\n",
+                   cs.slice->getPOC(), ctuCache.ctuX, ctuCache.ctuY, mapIdx,
+                   gridmap.targetX, gridmap.targetY, channel,
+                   gridmap.validWidthUnits, gridmap.validHeightUnits, isBoundary ? 1 : 0);
+      for (int y = 0; y < 16; y++)
+      {
+        for (int x = 0; x < 16; x++)
+        {
+          const float value = gridmap.values[size_t(channel * 16 * 16 + y * 16 + x)];
+          std::fprintf(statFile, "%s%.6f", x == 0 ? "" : " ", value);
+        }
+        std::fprintf(statFile, "\n");
+      }
+    }
+  }
+  std::fflush(statFile);
+}
+}
+#endif
 
 EncCu::EncCu() {}
 
@@ -132,6 +238,11 @@ void EncCu::create( EncCfg* encCfg )
 
   m_ctxBuffer.resize(maxDepth);
   m_CurrCtx = 0;
+
+#if FastPartition
+  m_fastPartitionSwinInfer.init(encCfg->getFastPartitionSwinModel());
+  m_fastPartitionClassifierInfer.init(encCfg->getFastPartitionClassifierModel());
+#endif
 }
 
 
@@ -202,6 +313,116 @@ EncCu::~EncCu()
 {
 }
 
+#if FastPartition
+void EncCu::xFastPartitionBuildSwinInput96(const CodingStructure& cs, int targetX, int targetY, FastPartitionSwinInput& dst) const{
+  dst.targetX = targetX;
+  dst.targetY = targetY;
+
+  const CPelBuf origLuma = cs.picture->getOrigBuf(COMPONENT_Y);
+  const int picWidth = int(origLuma.width);
+  const int picHeight = int(origLuma.height);
+  const int cropX = targetX - 32;
+  const int cropY = targetY - 32;
+  const int bitDepth = cs.sps->getBitDepth(ChannelType::LUMA);
+  const int shift = std::max(0, bitDepth - 8);
+  const int roundingOffset = shift > 0 ? (1 << (shift - 1)) : 0;
+
+  for (int y = 0; y < 96; y++)
+  {
+    const int srcY = std::min(std::max(cropY + y, 0), picHeight - 1);
+    for (int x = 0; x < 96; x++)
+    {
+      const int srcX = std::min(std::max(cropX + x, 0), picWidth - 1);
+      int pel = int(origLuma.at(srcX, srcY));
+      if (shift > 0)
+      {
+        pel = (pel + roundingOffset) >> shift;
+      }
+      pel = std::min(std::max(pel, 0), 255);
+      dst.luma[size_t(y * 96 + x)] = float(pel);
+    }
+  }
+}
+
+void EncCu::xFastPartitionInferSwinCtu(int qp){
+  m_fastPartitionSwinInfer.inferCtu(m_fastPartitionCtuCache.swinInputs, qp, m_fastPartitionCtuCache.gridmaps);
+}
+
+void EncCu::xFastPartitionPrepareCtu(CodingStructure& cs, const UnitArea& area, int qp)
+{
+  m_fastPartitionCtuCache.reset();
+
+  if (!cs.slice->isIntra())
+  {
+    return;
+  }
+  if (area.lumaSize().width != 128 || area.lumaSize().height != 128)
+  {
+    return;
+  }
+
+  const int ctuX = area.lx();
+  const int ctuY = area.ly();
+
+  m_fastPartitionCtuCache.ctuX = ctuX;
+  m_fastPartitionCtuCache.ctuY = ctuY;
+  m_fastPartitionCtuCache.ctuWidth = int(area.lumaSize().width);
+  m_fastPartitionCtuCache.ctuHeight = int(area.lumaSize().height);
+
+  const int targetOffsetX[4] = { 0, 64, 0, 64 };
+  const int targetOffsetY[4] = { 0, 0, 64, 64 };
+
+  for (int idx = 0; idx < 4; idx++)
+  {
+    xFastPartitionBuildSwinInput96(
+      cs,
+      ctuX + targetOffsetX[idx],
+      ctuY + targetOffsetY[idx],
+      m_fastPartitionCtuCache.swinInputs[size_t(idx)]);
+  }
+
+  xFastPartitionInferSwinCtu(qp);
+
+  const int pictureWidth = cs.picture->lwidth();
+  const int pictureHeight = cs.picture->lheight();
+  bool hasValidGridmap = false;
+  for (FastPartitionGridmap64& gridmap : m_fastPartitionCtuCache.gridmaps)
+  {
+    const int validWidthPixels = std::max(0, std::min(64, pictureWidth - gridmap.targetX));
+    const int validHeightPixels = std::max(0, std::min(64, pictureHeight - gridmap.targetY));
+    gridmap.validWidthUnits = (validWidthPixels + 3) / 4;
+    gridmap.validHeightUnits = (validHeightPixels + 3) / 4;
+
+    if (gridmap.validWidthUnits == 0 || gridmap.validHeightUnits == 0)
+    {
+      gridmap.valid = false;
+      gridmap.values.fill(0.0f);
+      continue;
+    }
+
+    for (int channel = 0; channel < 2; channel++)
+    {
+      for (int y = 0; y < 16; y++)
+      {
+        for (int x = 0; x < 16; x++)
+        {
+          const bool outsidePicture = x >= gridmap.validWidthUnits || y >= gridmap.validHeightUnits;
+          const bool pictureRightEdge = channel == 0 && x == gridmap.validWidthUnits - 1;
+          const bool pictureBottomEdge = channel == 1 && y == gridmap.validHeightUnits - 1;
+          if (outsidePicture || pictureRightEdge || pictureBottomEdge)
+          {
+            gridmap.values[size_t(channel * 16 * 16 + y * 16 + x)] = 0.0f;
+          }
+        }
+      }
+    }
+    hasValidGridmap = true;
+  }
+  m_fastPartitionCtuCache.valid = hasValidGridmap;
+  dumpFastPartitionFirstLcuGridmaps(cs, m_fastPartitionCtuCache);
+}
+#endif
+
 /** \param    pcEncLib      pointer of encoder class
  */
 void EncCu::init( EncLib* pcEncLib, const SPS& sps )
@@ -248,6 +469,9 @@ void EncCu::compressCtu(CodingStructure &cs, const UnitArea &area, const unsigne
   // init the partitioning manager
   QTBTPartitioner partitioner;
   partitioner.initCtu(area, ChannelType::LUMA, *cs.slice);
+#if FastPartition
+  xFastPartitionPrepareCtu(cs, area, currQP[ChannelType::LUMA]);
+#endif
   if (m_pcEncCfg->getIBCMode())
   {
     if (area.lx() == 0 && area.ly() == 0)
@@ -542,6 +766,9 @@ void EncCu::xCompressCU( CodingStructure*& tempCS, CodingStructure*& bestCS, Par
     m_modeCtrl->setCurrCsArea(currCsArea);
     m_modeCtrl->setQpCtu(m_pcSliceEncoder->getQpCtu());
   }
+#if FastPartition
+  m_modeCtrl->setFastPartitionContext(&m_fastPartitionCtuCache, &m_fastPartitionClassifierInfer);
+#endif
   m_modeCtrl->initCULevel( partitioner, *tempCS );
 #if GDR_ENABLED
   if (m_pcEncCfg->getGdrEnabled())
@@ -991,6 +1218,27 @@ void EncCu::xCompressCU( CodingStructure*& tempCS, CodingStructure*& bestCS, Par
   }
   bestCS->picture->getPredBuf(currCsArea).copyFrom(bestCS->getPredBuf(currCsArea));
   bestCS->picture->getRecoBuf( currCsArea ).copyFrom( bestCS->getRecoBuf( currCsArea ) );
+#if FastPartition
+  if (isFastPartitionFirstLcuDumpArea(*bestCS, partitioner))
+  {
+    FILE* statFile = fastPartitionStatFile();
+    if (statFile != nullptr)
+    {
+      PartSplit selectedSplit = CU_DONT_SPLIT;
+      if (!bestCS->cus.empty())
+      {
+        selectedSplit = CU::getSplitAtDepth(*bestCS->cus.front(), partitioner.currDepth);
+      }
+      const UnitArea& area = partitioner.currArea();
+      std::fprintf(statFile,
+                   "[FastPartitionFinal] poc=%d cu=%d,%d,%dx%d depth=%u qt=%u bt=%u selected=%s cost=%.6f cus=%zu\n",
+                   bestCS->slice->getPOC(), area.lx(), area.ly(), area.lwidth(), area.lheight(),
+                   partitioner.currDepth, partitioner.currQtDepth, partitioner.currBtDepth,
+                   getFastPartitionDumpSplitName(selectedSplit), bestCS->cost, bestCS->cus.size());
+      std::fflush(statFile);
+    }
+  }
+#endif
   m_modeCtrl->finishCULevel( partitioner );
   if( m_pcIntraSearch->getSaveCuCostInSCIPU() && bestCS->cus.size() == 1 )
   {

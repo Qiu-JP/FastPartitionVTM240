@@ -43,6 +43,10 @@ endif()
 target_include_directories( ${LIB_NAME} PUBLIC . )
 target_link_libraries( ${LIB_NAME} CommonLib )
 
+if( FAST_PARTITION_ENABLED )
+  target_link_libraries( ${LIB_NAME} ${TORCH_LIBRARIES} )
+endif()
+
 if( CMAKE_COMPILER_IS_GNUCC )
   # this is quite certainly a compiler problem
   set_property( SOURCE "EncCu.cpp" APPEND PROPERTY COMPILE_FLAGS "-Wno-array-bounds" )

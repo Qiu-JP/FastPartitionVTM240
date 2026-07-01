@@ -55,6 +55,9 @@
 #include "InterSearch.h"
 #include "RateCtrl.h"
 #include "EncModeCtrl.h"
+#if FastPartition
+#include "EncFastPartition.h"
+#endif
 //! \ingroup EncoderLib
 //! \{
 
@@ -331,6 +334,16 @@ public:
   ~EncCu();
 
 protected:
+
+#if FastPartition
+  FastPartitionCtuCache m_fastPartitionCtuCache;
+  EncFastPartitionSwinInfer m_fastPartitionSwinInfer;
+  EncFastPartitionClassifierInfer m_fastPartitionClassifierInfer;
+
+  void xFastPartitionPrepareCtu(CodingStructure& cs, const UnitArea& area, int qp);
+  void xFastPartitionBuildSwinInput96(const CodingStructure& cs, int targetX, int targetY, FastPartitionSwinInput& dst) const;
+  void xFastPartitionInferSwinCtu(int qp);
+#endif
 
   void xCalDebCost            ( CodingStructure &cs, Partitioner &partitioner, bool calDist = false );
   Distortion getDistortionDb  ( CodingStructure &cs, CPelBuf org, CPelBuf reco, ComponentID compID, const CompArea& compArea, bool afterDb );

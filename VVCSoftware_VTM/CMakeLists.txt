@@ -29,6 +29,7 @@ endif()
 
 set( EXTENSION_360_VIDEO OFF CACHE BOOL "If EXTENSION_360_VIDEO is on, 360Lib will be added" )
 set( EXTENSION_HDRTOOLS OFF CACHE BOOL "If EXTENSION_HDRTOOLS is on, HDRLib will be added" )
+set( FAST_PARTITION_LIBTORCH_ROOT "$ENV{HOME}/qiujp/libtorch" CACHE PATH "Path to extracted libtorch root" )
 
 if (DEFINED ENABLE_TRACING)
   set( ENABLE_TRACING OFF CACHE BOOL "ENABLE_TRACING will be set to this value" )
@@ -49,6 +50,21 @@ set( CMAKE_CXX_STANDARD_REQUIRED ON )
 
 # compile everything position independent (even static libraries)
 set( CMAKE_POSITION_INDEPENDENT_CODE TRUE )
+
+file( STRINGS "${CMAKE_SOURCE_DIR}/source/Lib/CommonLib/TypeDef.h" FAST_PARTITION_DEFINE
+      REGEX "^[ \t]*#[ \t]*define[ \t]+FastPartition[ \t]+[01]" )
+set( FAST_PARTITION_ENABLED OFF )
+if( FAST_PARTITION_DEFINE MATCHES "^[ \t]*#[ \t]*define[ \t]+FastPartition[ \t]+1" )
+  set( FAST_PARTITION_ENABLED ON )
+endif()
+
+if( FAST_PARTITION_ENABLED )
+  if( FAST_PARTITION_LIBTORCH_ROOT )
+    list( APPEND CMAKE_PREFIX_PATH "${FAST_PARTITION_LIBTORCH_ROOT}" )
+  endif()
+  find_package( Torch REQUIRED )
+  set( CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}" )
+endif()
 
 # set verbose compile options
 #set( CMAKE_VERBOSE_MAKEFILE ON )
