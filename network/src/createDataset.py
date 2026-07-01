@@ -196,16 +196,10 @@ def parse_partition_info_line(line):
     fields = line.split()
     if len(fields) != len(PARTITION_INFO_COLUMNS):
         raise RuntimeError(f"Expected {len(PARTITION_INFO_COLUMNS)} fields, got {len(fields)}: {line[:120]}")
-    return {
-        "sequence_name": fields[0],
-        "qp": int(fields[1]),
-        "frame_id": int(fields[2]),
-        "ctu_id": int(fields[3]),
-        "cu_x": int(fields[4]),
-        "cu_y": int(fields[5]),
-        "cu_width": int(fields[6]),
-        "cu_height": int(fields[7]),
-    }
+    record = {"sequence_name": fields[0]}
+    for column, value in zip(PARTITION_INFO_COLUMNS[1:], fields[1:]):
+        record[column] = int(value)
+    return record
 
 
 def iter_partition_groups(partition_info_path, progress_interval=PROGRESS_INTERVAL):
@@ -291,23 +285,246 @@ def convert_component_partition_to_gridmap(component, partition_info_path, save_
     id_df = id_df.set_index(ID_COLUMNS, drop=False)
     log_progress(f"stack {component} gridmaps: {len(gridmaps):,} samples")
     gridmap_arr = np.stack(gridmaps, axis=0)
+    paths.ensure_dir(save_path.parent)
+    npy_path = save_path.with_suffix(".npy")
+    np.save(npy_path, gridmap_arr)
     payload = {
         "component": component,
         "block_size": block_size,
         "grid_size": block_size // 4,
         "id_columns": ID_COLUMNS,
         "ids": id_df,
-        "gridmap": gridmap_arr,
+        "array_file": npy_path.name,
+        "array_key": "gridmap",
+        "array_shape": tuple(gridmap_arr.shape),
+        "array_dtype": str(gridmap_arr.dtype),
     }
-    paths.ensure_dir(save_path.parent)
     pd.to_pickle(payload, save_path)
-    pd.to_pickle(id_df, save_path.with_name(f"{component}_Ids.pkl"))
-    log_progress(f"saved {component} gridmap to {save_path}")
+    log_progress(f"saved {component} gridmap array to {npy_path}")
+    log_progress(f"saved {component} gridmap metadata to {save_path}")
 
     if show:
         preview_path = paths.ensure_dir(paths.output_root()) / f"{component}_gridmap_preview.png"
         save_gridmap_preview(gridmap_arr, preview_path, block_size, component)
     return save_path
+
+
+def classifier_label_from_part_split(part_split):
+    if part_split == 2000:
+        return 0
+    if part_split in (1, 2, 3, 4, 5):
+        return int(part_split)
+    if part_split == 0:
+        return None
+    raise ValueError(f"Unsupported CU PartSplit value for classifier label: {part_split}")
+
+
+def split_node_children_abs(x, y, w, h, label):
+    if label == 1:
+        w2 = w // 2
+        h2 = h // 2
+        return [
+            (x, y, w2, h2),
+            (x + w2, y, w2, h2),
+            (x, y + h2, w2, h2),
+            (x + w2, y + h2, w2, h2),
+        ]
+    if label == 2:
+        h2 = h // 2
+        return [(x, y, w, h2), (x, y + h2, w, h2)]
+    if label == 3:
+        w2 = w // 2
+        return [(x, y, w2, h), (x + w2, y, w2, h)]
+    if label == 4:
+        h1 = h // 4
+        h2 = h // 2
+        return [(x, y, w, h1), (x, y + h1, w, h2), (x, y + h1 + h2, w, h1)]
+    if label == 5:
+        w1 = w // 4
+        w2 = w // 2
+        return [(x, y, w1, h), (x + w1, y, w2, h), (x + w1 + w2, y, w1, h)]
+    return []
+
+
+def child_contains_leaf(child, leaf):
+    cx, cy, cw, ch = child
+    lx, ly, lw, lh = leaf
+    return lx >= cx and ly >= cy and lx + lw <= cx + cw and ly + lh <= cy + ch
+
+
+def node_contains_node(outer, inner):
+    ox, oy, ow, oh = outer
+    ix, iy, iw, ih = inner
+    return ix >= ox and iy >= oy and ix + iw <= ox + ow and iy + ih <= oy + oh
+
+
+def reconstruct_classifier_nodes_from_records(records, block_size):
+    origin_x = min(record["cu_x"] for record in records) // block_size * block_size
+    origin_y = min(record["cu_y"] for record in records) // block_size * block_size
+    export_node = (origin_x, origin_y, block_size, block_size)
+    partition_root_size = block_size * 2
+    partition_root_x = origin_x // partition_root_size * partition_root_size
+    partition_root_y = origin_y // partition_root_size * partition_root_size
+    node_labels = {}
+    conflicts = []
+
+    for record in records:
+        node = (partition_root_x, partition_root_y, partition_root_size, partition_root_size)
+        leaf = (record["cu_x"], record["cu_y"], record["cu_width"], record["cu_height"])
+        split_values = [record[f"split_{idx}"] for idx in range(8)]
+
+        for depth, part_split in enumerate(split_values):
+            label = classifier_label_from_part_split(part_split)
+            if label is None:
+                continue
+
+            should_record = node_contains_node(export_node, node)
+            if label == 0 and not should_record and child_contains_leaf(node, export_node):
+                should_record = True
+                node = export_node
+
+            if should_record:
+                if node in node_labels and node_labels[node] != label:
+                    conflicts.append((node, node_labels[node], label, record))
+                    break
+                node_labels[node] = label
+
+            if label == 0:
+                break
+
+            children = split_node_children_abs(*node, label)
+            next_node = None
+            for child in children:
+                if child_contains_leaf(child, leaf):
+                    next_node = child
+                    break
+            if next_node is None:
+                raise RuntimeError(
+                    "Cannot follow split path for leaf "
+                    f"{leaf} at node {node} with label {label} in "
+                    f"{record['sequence_name']} qp={record['qp']} "
+                    f"frame={record['frame_id']} ctu={record['ctu_id']}"
+                )
+            node = next_node
+
+    if conflicts:
+        node, old_label, new_label, record = conflicts[0]
+        raise RuntimeError(
+            "Conflicting split labels while reconstructing tree: "
+            f"node={node}, old={old_label}, new={new_label}, "
+            f"sample={(record['sequence_name'], record['qp'], record['frame_id'], record['ctu_id'])}"
+        )
+
+    ordered_nodes = []
+    stack = [(origin_x, origin_y, block_size, block_size, 0)]
+    seen = set()
+    while stack:
+        x, y, w, h, depth = stack.pop()
+        node = (x, y, w, h)
+        if node in seen or node not in node_labels:
+            continue
+        seen.add(node)
+        label = node_labels[node]
+        ordered_nodes.append((x, y, w, h, depth, label))
+        if label != 0:
+            children = split_node_children_abs(x, y, w, h, label)
+            for child in reversed(children):
+                stack.append((*child, depth + 1))
+
+    return origin_x, origin_y, ordered_nodes
+
+
+def convert_component_partition_to_cu_tree(component, partition_info_path, save_path, block_size):
+    require_pandas()
+    log_progress(f"start {component} CU tree labels from {partition_info_path}")
+    sample_rows = []
+    offsets = [0]
+    sample_index = 0
+    total_nodes = 0
+    start_time = time.time()
+    nodes_path = save_path.with_name(f"{component}_CU_Tree_Nodes.i2.bin")
+
+    with open(nodes_path, "wb") as nodes_fp:
+        for key, records in iter_partition_groups(partition_info_path):
+            origin_x, origin_y, nodes = reconstruct_classifier_nodes_from_records(records, block_size)
+            sequence_name, qp, frame_id, ctu_id = key
+            sample_rows.append(
+                {
+                    "sequence_name": sequence_name,
+                    "qp": qp,
+                    "frame_id": frame_id,
+                    "ctu_id": ctu_id,
+                    "sample_index": sample_index,
+                    "node_start": total_nodes,
+                    "node_end": total_nodes + len(nodes),
+                    "node_count": len(nodes),
+                }
+            )
+            node_values = []
+            for x, y, w, h, depth, label in nodes:
+                grid_x = (x - origin_x) // 4
+                grid_y = (y - origin_y) // 4
+                grid_w = w // 4
+                grid_h = h // 4
+                node_values.append((grid_y, grid_x, grid_h, grid_w, label))
+            np.asarray(node_values, dtype=np.int16).tofile(nodes_fp)
+            total_nodes += len(nodes)
+            offsets.append(total_nodes)
+            sample_index += 1
+            if sample_index == 1 or sample_index % 50000 == 0:
+                elapsed = max(time.time() - start_time, 1e-6)
+                log_progress(
+                    f"{component} CU tree {sample_index:,} samples, "
+                    f"{total_nodes:,} nodes, {total_nodes / elapsed:,.0f} nodes/s"
+                )
+
+    if total_nodes == 0:
+        raise RuntimeError(f"No CU tree nodes generated from {partition_info_path}")
+
+    samples_df = pd.DataFrame(sample_rows)
+    samples_df = samples_df.set_index(ID_COLUMNS, drop=False)
+    payload = {
+        "format": "cu_tree_binary_v1",
+        "component": component,
+        "block_size": block_size,
+        "grid_size": block_size // 4,
+        "id_columns": ID_COLUMNS,
+        "samples": samples_df,
+        "node_columns": ["grid_y", "grid_x", "grid_h", "grid_w", "label"],
+        "nodes_file": nodes_path.name,
+        "node_dtype": "int16",
+        "node_shape": (int(total_nodes), 5),
+        "offsets": np.asarray(offsets, dtype=np.int64),
+        "class_order": ["NO_SPLIT", "QT", "BTH", "BTV", "TTH", "TTV"],
+    }
+    paths.ensure_dir(save_path.parent)
+    pd.to_pickle(payload, save_path)
+    log_progress(f"saved {component} CU tree labels to {save_path}")
+    return save_path
+
+
+def convert_partition_to_cu_tree(data_type, block_size_map=None, dataset_name=None, component="both"):
+    dataset_name = resolve_dataset_name(data_type, dataset_name)
+    split_dir = resolve_split_dir(data_type)
+    partition_dir = paths.partition_dataset_root(dataset_name) / split_dir
+    save_dir = paths.ensure_dir(paths.dataset_root() / dataset_name / split_dir)
+    if block_size_map is None:
+        block_size_map = DEFAULT_BLOCK_SIZE_MAP
+    block_size_map = select_block_size_map(block_size_map, component)
+
+    output_paths = []
+    for component, block_size in block_size_map.items():
+        partition_info_path = partition_dir / f"{component}_Partition_Info.txt"
+        save_path = save_dir / f"{component}_CU_Tree.pkl"
+        output_paths.append(
+            convert_component_partition_to_cu_tree(
+                component=component,
+                partition_info_path=partition_info_path,
+                save_path=save_path,
+                block_size=block_size,
+            )
+        )
+    return output_paths
 
 
 def select_block_size_map(block_size_map, component):
@@ -361,13 +578,10 @@ def sequence_info_to_metadata(data_type, dataset_name=None, sequence_list=None):
 def load_component_ids(component, split_dir, dataset_name):
     require_pandas()
     save_dir = paths.dataset_root() / dataset_name / split_dir
-    ids_path = save_dir / f"{component}_Ids.pkl"
-    if ids_path.exists():
-        return pd.read_pickle(ids_path)
     gridmap_path = save_dir / f"{component}_Gridmap.pkl"
     if not gridmap_path.exists():
         raise FileNotFoundError(
-            f"Neither {ids_path} nor {gridmap_path} exists. "
+            f"Gridmap metadata not found: {gridmap_path}. "
             "Run --action gridmap before generating input."
         )
     return pd.read_pickle(gridmap_path)["ids"]
@@ -416,12 +630,28 @@ def block_origin_from_ctu_id(ctu_id, source_width, component):
 
 
 def crop_with_padding(frame, x, y, block_size):
-    block = np.zeros((block_size, block_size), dtype=np.uint8)
-    valid_h = max(0, min(block_size, frame.shape[0] - y))
-    valid_w = max(0, min(block_size, frame.shape[1] - x))
-    if valid_h > 0 and valid_w > 0:
-        block[:valid_h, :valid_w] = frame[y:y + valid_h, x:x + valid_w]
-    return block
+    frame_h, frame_w = frame.shape
+    x0 = max(0, x)
+    y0 = max(0, y)
+    x1 = min(frame_w, x + block_size)
+    y1 = min(frame_h, y + block_size)
+    if x0 >= x1 or y0 >= y1:
+        raise ValueError(
+            f"Crop window ({x}, {y}, {block_size}, {block_size}) does not overlap frame {frame_w}x{frame_h}"
+        )
+
+    block = frame[y0:y1, x0:x1]
+    pad_left = x0 - x
+    pad_top = y0 - y
+    pad_right = x + block_size - x1
+    pad_bottom = y + block_size - y1
+    if pad_left or pad_top or pad_right or pad_bottom:
+        block = np.pad(
+            block,
+            ((pad_top, pad_bottom), (pad_left, pad_right)),
+            mode="edge",
+        )
+    return block.astype(np.uint8, copy=False)
 
 
 def save_component_input(component, ids, metadata, dataset_name, split_dir, block_size):
@@ -467,15 +697,22 @@ def save_component_input(component, ids, metadata, dataset_name, split_dir, bloc
 
     save_dir = paths.ensure_dir(paths.dataset_root() / dataset_name / split_dir)
     save_path = save_dir / f"{component}_Input.pkl"
+    npy_path = save_path.with_suffix(".npy")
+    np.save(npy_path, input_blocks)
     payload = {
         "component": component,
         "block_size": block_size,
+        "padding": "edge",
         "id_columns": ID_COLUMNS,
         "ids": ids.copy(),
-        "input": input_blocks,
+        "array_file": npy_path.name,
+        "array_key": "input",
+        "array_shape": tuple(input_blocks.shape),
+        "array_dtype": str(input_blocks.dtype),
     }
     pd.to_pickle(payload, save_path)
-    log_progress(f"saved {component} input to {save_path}")
+    log_progress(f"saved {component} input array to {npy_path}")
+    log_progress(f"saved {component} input metadata to {save_path}")
     return save_path
 
 
@@ -513,7 +750,11 @@ def build_argparser():
     parser.add_argument('--chroma-block-size', type=int, default=32)
     parser.add_argument('--component', choices=['both', 'luma', 'chroma'], default='both')
     parser.add_argument('--show', action='store_true')
-    parser.add_argument('--action', choices=['gridmap', 'input', 'gridmap-input'], default='gridmap-input')
+    parser.add_argument(
+        '--action',
+        choices=['gridmap', 'input', 'gridmap-input', 'cu-tree', 'gridmap-input-cu-tree'],
+        default='gridmap-input',
+    )
     return parser
 
 
@@ -523,7 +764,7 @@ if __name__ == '__main__':
         "Luma": args.luma_block_size,
         "Chroma": args.chroma_block_size,
     }
-    if args.action in ('gridmap', 'gridmap-input'):
+    if args.action in ('gridmap', 'gridmap-input', 'gridmap-input-cu-tree'):
         convert_partition_to_gridmap(
             args.data_type,
             block_size_map=block_size_map,
@@ -531,11 +772,18 @@ if __name__ == '__main__':
             dataset_name=args.dataset,
             component=args.component,
         )
-    if args.action in ('input', 'gridmap-input'):
+    if args.action in ('input', 'gridmap-input', 'gridmap-input-cu-tree'):
         convert_yuv_to_input(
             args.data_type,
             block_size_map=block_size_map,
             dataset_name=args.dataset,
             sequence_list=args.sequence_list,
+            component=args.component,
+        )
+    if args.action in ('cu-tree', 'gridmap-input-cu-tree'):
+        convert_partition_to_cu_tree(
+            args.data_type,
+            block_size_map=block_size_map,
+            dataset_name=args.dataset,
             component=args.component,
         )

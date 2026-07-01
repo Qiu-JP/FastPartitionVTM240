@@ -87,16 +87,26 @@ class IdAlignedGridmapDataset(Dataset):
         dataset_dir = paths.dataset_root() / dataset_name / split_dir
         self.input_path = dataset_dir / f"{component}_Input.pkl"
         self.gridmap_path = dataset_dir / f"{component}_Gridmap.pkl"
+        self.input_npy_path = dataset_dir / f"{component}_Input.npy"
+        self.gridmap_npy_path = dataset_dir / f"{component}_Gridmap.npy"
 
         if not self.input_path.exists():
-            raise FileNotFoundError(f"Input pkl not found: {self.input_path}")
+            raise FileNotFoundError(f"Input metadata pkl not found: {self.input_path}")
         if not self.gridmap_path.exists():
-            raise FileNotFoundError(f"Gridmap pkl not found: {self.gridmap_path}")
+            raise FileNotFoundError(f"Gridmap metadata pkl not found: {self.gridmap_path}")
+        if not self.input_npy_path.exists():
+            raise FileNotFoundError(f"Input npy array not found: {self.input_npy_path}")
+        if not self.gridmap_npy_path.exists():
+            raise FileNotFoundError(f"Gridmap npy array not found: {self.gridmap_npy_path}")
 
+        print(
+            f"{component} {type}: using mmap arrays "
+            f"{self.input_npy_path.name}, {self.gridmap_npy_path.name}"
+        )
         input_payload = pd.read_pickle(self.input_path)
         gridmap_payload = pd.read_pickle(self.gridmap_path)
-        self.input_array = input_payload["input"]
-        self.gridmap_array = gridmap_payload["gridmap"]
+        self.input_array = np.load(self.input_npy_path, mmap_mode="r")
+        self.gridmap_array = np.load(self.gridmap_npy_path, mmap_mode="r")
         self.input_ids = input_payload["ids"]
         self.gridmap_ids = gridmap_payload["ids"]
 
