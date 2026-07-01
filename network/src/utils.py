@@ -1,27 +1,41 @@
 import sys
-import os
 
-import torch
-from tqdm import tqdm
 import numpy as np
+import pandas as pd
+import paths
+import torch
 import torch.nn as nn
 from torch.utils.data import Dataset
+from tqdm import tqdm
 
-import matplotlib.pyplot as plt
 
-BCE_loss = nn.BCELoss()
-Huber_loss = nn.SmoothL1Loss()
-L1_loss = nn.L1Loss()
-MSE_loss = nn.MSELoss()
-CE_loss = nn.CrossEntropyLoss()
-delta = 1e-1
+ID_COLUMNS = ["sequence_name", "qp", "frame_id", "ctu_id"]
+GRID_ACC_DELTA = 1e-1
+CLASSIFIER_SUPPORTED_SIZES = {
+    (16, 16),
+    (8, 8),
+    (8, 4),
+    (4, 8),
+    (8, 2),
+    (2, 8),
+    (8, 1),
+    (1, 8),
+    (4, 2),
+    (2, 4),
+    (4, 1),
+    (1, 4),
+    (4, 4),
+    (2, 2),
+    (2, 1),
+    (1, 2),
+}
 
 LOSS_FUNCTIONS = {
-    "BCE": BCE_loss,
-    "HUBER": Huber_loss,
-    "L1": L1_loss,
-    "MSE": MSE_loss,
-    "CE": CE_loss,
+    "BCE": nn.BCELoss(),
+    "HUBER": nn.SmoothL1Loss(),
+    "L1": nn.L1Loss(),
+    "MSE": nn.MSELoss(),
+    "CE": nn.CrossEntropyLoss(),
 }
 
 
@@ -35,52 +49,371 @@ def get_loss_function(loss_name):
             )
         )
 
-def train_one_epoch(model, optimizer, data_loader, device, epoch, lossFunction = "L1"):
-    model.train()
 
-    loss_function = get_loss_function(lossFunction)
+def adjust_learning_rate(lr, optimizer, epoch, decay_rate):
+    adj_lr = lr * (0.5 ** (epoch // decay_rate))
+    if adj_lr > 1e-6:
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = adj_lr
 
+
+def split_dir_from_name(type):
+    return type.lower()
+
+
+def collate_gridmap_with_nodes(batch):
+    inputs, qps, gridmaps, nodes = zip(*batch)
+    return (
+        torch.stack(inputs, dim=0),
+        torch.stack(qps, dim=0),
+        torch.stack(gridmaps, dim=0),
+        list(nodes),
+    )
+
+
+class IdAlignedGridmapDataset(Dataset):
+    def __init__(self, dataset_name, type, component="Luma", min_qp=0, max_qp=51):
+        self.dataset_name = dataset_name
+        self.type = type
+        self.component = component
+        self.min_qp = min_qp
+        self.max_qp = max_qp
+        if max_qp <= min_qp:
+            raise ValueError(f"max_qp must be larger than min_qp, got {min_qp} and {max_qp}")
+        split_dir = split_dir_from_name(type)
+        dataset_dir = paths.dataset_root() / dataset_name / split_dir
+        self.input_path = dataset_dir / f"{component}_Input.pkl"
+        self.gridmap_path = dataset_dir / f"{component}_Gridmap.pkl"
+        self.input_npy_path = dataset_dir / f"{component}_Input.npy"
+        self.gridmap_npy_path = dataset_dir / f"{component}_Gridmap.npy"
+
+        if not self.input_path.exists():
+            raise FileNotFoundError(f"Input metadata pkl not found: {self.input_path}")
+        if not self.gridmap_path.exists():
+            raise FileNotFoundError(f"Gridmap metadata pkl not found: {self.gridmap_path}")
+        if not self.input_npy_path.exists():
+            raise FileNotFoundError(f"Input npy array not found: {self.input_npy_path}")
+        if not self.gridmap_npy_path.exists():
+            raise FileNotFoundError(f"Gridmap npy array not found: {self.gridmap_npy_path}")
+
+        print(
+            f"{component} {type}: using mmap arrays "
+            f"{self.input_npy_path.name}, {self.gridmap_npy_path.name}"
+        )
+        input_payload = pd.read_pickle(self.input_path)
+        gridmap_payload = pd.read_pickle(self.gridmap_path)
+        self.input_array = np.load(self.input_npy_path, mmap_mode="r")
+        self.gridmap_array = np.load(self.gridmap_npy_path, mmap_mode="r")
+        self.input_ids = input_payload["ids"]
+        self.gridmap_ids = gridmap_payload["ids"]
+
+        if list(self.input_ids.index.names) != ID_COLUMNS:
+            raise RuntimeError(
+                f"input ids must be indexed by {ID_COLUMNS}. "
+                "Regenerate the pkl files with the current createDataset script."
+            )
+        if list(self.gridmap_ids.index.names) != ID_COLUMNS:
+            raise RuntimeError(
+                f"gridmap ids must be indexed by {ID_COLUMNS}. "
+                "Regenerate the pkl files with the current createDataset script."
+            )
+
+        common_ids = self.input_ids.index.intersection(self.gridmap_ids.index, sort=True)
+        if common_ids.empty:
+            raise RuntimeError(
+                f"No common ids between {self.input_path} and {self.gridmap_path}"
+            )
+        self.common_ids = common_ids
+        self.input_positions = self.input_ids.loc[common_ids, "sample_index"].to_numpy(dtype=np.int64)
+        self.gridmap_positions = self.gridmap_ids.loc[common_ids, "sample_index"].to_numpy(dtype=np.int64)
+        qp_values = common_ids.get_level_values("qp").to_numpy(dtype=np.float32)
+        self.qp_values = (qp_values - float(min_qp)) / float(max_qp - min_qp)
+        missing_input = len(self.gridmap_ids) - len(common_ids)
+        missing_gridmap = len(self.input_ids) - len(common_ids)
+        print(
+            f"{component} {type}: {len(common_ids):,} aligned samples "
+            f"from {self.input_path.name} and {self.gridmap_path.name} "
+            f"(missing input: {missing_input:,}, missing gridmap: {missing_gridmap:,})"
+        )
+        print(
+            f"{component} {type}: input shape {self.input_array.shape}, "
+            f"gridmap shape {self.gridmap_array.shape}"
+        )
+        print(
+            f"{component} {type}: normalized QP range "
+            f"{self.qp_values.min():.4f} to {self.qp_values.max():.4f} "
+            f"(min_qp={min_qp}, max_qp={max_qp})"
+        )
+
+    def __len__(self):
+        return len(self.input_positions)
+
+    def __getitem__(self, idx):
+        input_idx = self.input_positions[idx]
+        gridmap_idx = self.gridmap_positions[idx]
+        input_sample = torch.from_numpy(self.input_array[input_idx].copy()).float()
+        qp_sample = torch.tensor([self.qp_values[idx]], dtype=torch.float32)
+        gridmap_sample = torch.from_numpy(self.gridmap_array[gridmap_idx].copy()).float()
+        return input_sample, qp_sample, gridmap_sample
+
+
+class IdAlignedGridmapCuTreeDataset(IdAlignedGridmapDataset):
+    def __init__(self, dataset_name, type, component="Luma", min_qp=0, max_qp=51):
+        super().__init__(
+            dataset_name=dataset_name,
+            type=type,
+            component=component,
+            min_qp=min_qp,
+            max_qp=max_qp,
+        )
+        split_dir = split_dir_from_name(type)
+        dataset_dir = paths.dataset_root() / dataset_name / split_dir
+        self.cu_tree_path = dataset_dir / f"{component}_CU_Tree.pkl"
+        if not self.cu_tree_path.exists():
+            raise FileNotFoundError(
+                f"CU tree labels not found: {self.cu_tree_path}. "
+                "Generate them first with createDataset.py/createDataset96.py --action cu-tree."
+            )
+
+        payload = pd.read_pickle(self.cu_tree_path)
+        samples = payload["samples"]
+        if list(samples.index.names) != ID_COLUMNS:
+            raise RuntimeError(f"CU tree samples must be indexed by {ID_COLUMNS}")
+        if payload.get("format") != "cu_tree_binary_v1":
+            raise RuntimeError(
+                f"Unsupported CU tree label format in {self.cu_tree_path}. "
+                "Regenerate with the current createDataset.py/createDataset96.py --action cu-tree."
+            )
+
+        common_index = self.common_ids
+        missing = common_index.difference(samples.index)
+        if not missing.empty:
+            raise RuntimeError(
+                f"CU tree labels are missing {len(missing):,} aligned samples. "
+                f"First missing key: {missing[0]}"
+            )
+
+        tree_sample_indices = samples.loc[common_index, "sample_index"].to_numpy(dtype=np.int64)
+        self.tree_sample_indices = tree_sample_indices
+        self.node_offsets = payload["offsets"]
+        nodes_path = self.cu_tree_path.with_name(payload["nodes_file"])
+        if not nodes_path.exists():
+            raise FileNotFoundError(f"CU tree node array not found: {nodes_path}")
+        self.node_memmap = np.memmap(
+            nodes_path,
+            mode="r",
+            dtype=np.dtype(payload["node_dtype"]),
+            shape=tuple(payload["node_shape"]),
+        )
+        print(
+            f"{component} {type}: loaded CU tree labels from {self.cu_tree_path.name}, "
+            f"{len(self.tree_sample_indices):,} aligned samples, "
+            f"{self.node_memmap.shape[0]:,} nodes"
+        )
+
+    def __getitem__(self, idx):
+        input_sample, qp_sample, gridmap_sample = super().__getitem__(idx)
+        sample_index = int(self.tree_sample_indices[idx])
+        start = int(self.node_offsets[sample_index])
+        end = int(self.node_offsets[sample_index + 1])
+        node_sample = torch.from_numpy(np.asarray(self.node_memmap[start:end]).copy()).long()
+        return input_sample, qp_sample, gridmap_sample, node_sample
+
+
+def is_supported_classifier_size(h, w):
+    return (h, w) in CLASSIFIER_SUPPORTED_SIZES
+
+
+def classifier_node_loss(classifier, pred_gridmap, node_batch, ce_loss):
+    node_batches = {}
+    total_nodes = 0
+
+    for batch_idx, nodes in enumerate(node_batch):
+        nodes_iter = nodes.tolist() if torch.is_tensor(nodes) else nodes
+        for node in nodes_iter:
+            grid_y, grid_x, grid_h, grid_w, label = [int(v) for v in node]
+            if not is_supported_classifier_size(grid_h, grid_w):
+                continue
+            key = (grid_h, grid_w)
+            if key not in node_batches:
+                node_batches[key] = {"roi": [], "label": []}
+            node_batches[key]["roi"].append(
+                pred_gridmap[
+                    batch_idx:batch_idx + 1,
+                    :,
+                    grid_y:grid_y + grid_h,
+                    grid_x:grid_x + grid_w,
+                ]
+            )
+            node_batches[key]["label"].append(label)
+            total_nodes += 1
+
+    if total_nodes == 0:
+        zero = pred_gridmap.sum() * 0.0
+        return zero, 0.0, 0
+
+    losses = []
+    correct = 0
+    for payload in node_batches.values():
+        roi = torch.cat(payload["roi"], dim=0)
+        labels = torch.tensor(payload["label"], dtype=torch.long, device=pred_gridmap.device)
+        logits = classifier(roi)
+        losses.append(ce_loss(logits, labels))
+        correct += torch.sum(torch.argmax(logits, dim=1) == labels).item()
+
+    return torch.stack(losses).mean(), correct / float(total_nodes), total_nodes
+
+
+def train_one_epoch(
+    swin_model,
+    classifier,
+    optimizer,
+    data_loader,
+    device,
+    epoch,
+    grid_loss_fn,
+    cls_loss_fn,
+    grid_weight,
+    cls_weight,
+    stage_name="train",
+):
+    swin_model.train()
+    classifier.train()
     optimizer.zero_grad()
+    return _run_joint_epoch(
+        swin_model=swin_model,
+        classifier=classifier,
+        optimizer=optimizer,
+        data_loader=data_loader,
+        device=device,
+        epoch=epoch,
+        grid_loss_fn=grid_loss_fn,
+        cls_loss_fn=cls_loss_fn,
+        grid_weight=grid_weight,
+        cls_weight=cls_weight,
+        stage_name=stage_name,
+        training=True,
+    )
 
-    accu_list = []
+
+@torch.no_grad()
+def evaluate(
+    swin_model,
+    classifier,
+    data_loader,
+    device,
+    epoch,
+    grid_loss_fn,
+    cls_loss_fn,
+    grid_weight,
+    cls_weight,
+    stage_name="valid",
+):
+    swin_model.eval()
+    classifier.eval()
+    return _run_joint_epoch(
+        swin_model=swin_model,
+        classifier=classifier,
+        optimizer=None,
+        data_loader=data_loader,
+        device=device,
+        epoch=epoch,
+        grid_loss_fn=grid_loss_fn,
+        cls_loss_fn=cls_loss_fn,
+        grid_weight=grid_weight,
+        cls_weight=cls_weight,
+        stage_name=stage_name,
+        training=False,
+    )
+
+
+def _run_joint_epoch(
+    swin_model,
+    classifier,
+    optimizer,
+    data_loader,
+    device,
+    epoch,
+    grid_loss_fn,
+    cls_loss_fn,
+    grid_weight,
+    cls_weight,
+    stage_name,
+    training,
+):
     accu_loss = torch.zeros(1).to(device)
-    accu = torch.zeros(1).to(device)
-    data_loader = tqdm(data_loader, file=sys.stdout)
-    
-    for step, data in enumerate(data_loader):
-        input_batch, gridmap_batch = data
+    accu_grid_loss = torch.zeros(1).to(device)
+    accu_cls_loss = torch.zeros(1).to(device)
+    accu_grid_acc = torch.zeros(1).to(device)
+    accu_cls_acc = torch.zeros(1).to(device)
+    total_cls_nodes = 0
+
+    progress = tqdm(data_loader, file=sys.stdout)
+    for step, data in enumerate(progress):
+        input_batch, qp_batch, gridmap_batch, node_batch = data
 
         input_batch = input_batch.to(device)
+        qp_batch = qp_batch.to(device)
         gridmap_batch = gridmap_batch.to(device)
-        #print(input_batch.device)
 
-        gridmap_output_batch = model(input_batch)
+        pred_gridmap = swin_model(input_batch, qp_batch)
+        grid_loss = grid_loss_fn(pred_gridmap, gridmap_batch)
+        cls_loss, cls_acc, cls_nodes = classifier_node_loss(
+            classifier=classifier,
+            pred_gridmap=pred_gridmap,
+            node_batch=node_batch,
+            ce_loss=cls_loss_fn,
+        )
+        loss = grid_weight * grid_loss + cls_weight * cls_loss
 
-        #gridmap_accuracy = torch.sum(torch.round(gridmap_output_batch) == gridmap_batch).item() / float(gridmap_output_batch.numel())
-        gridmap_accuracy = torch.sum(abs(gridmap_output_batch -  gridmap_batch) <= delta).item() / float(gridmap_output_batch.numel())
-        #accu_list.append(gridmap_accuracy)
-        accu += gridmap_accuracy
+        grid_acc = torch.sum(abs(pred_gridmap - gridmap_batch) <= GRID_ACC_DELTA).item() / float(pred_gridmap.numel())
 
-        loss = loss_function(gridmap_output_batch, gridmap_batch)
-        loss.backward()
+        if training:
+            loss.backward()
+            if not torch.isfinite(loss):
+                print("WARNING: non-finite loss, ending training ", loss)
+                sys.exit(1)
+            optimizer.step()
+            optimizer.zero_grad()
+
         accu_loss += loss.detach()
+        accu_grid_loss += grid_loss.detach()
+        accu_cls_loss += cls_loss.detach()
+        accu_grid_acc += grid_acc
+        accu_cls_acc += cls_acc
+        total_cls_nodes += cls_nodes
 
-        data_loader.desc = "[train epoch {}] loss: {:.6f}, acc: {:.6f}".format(epoch,accu_loss.item() / (step + 1),accu.item() / (step + 1))
+        phase = "train" if training else "valid"
+        progress.desc = (
+            "[{} {} epoch {}] loss: {:.6f}, grid: {:.6f}, cls: {:.6f}, "
+            "grid_acc: {:.6f}, cls_acc: {:.6f}, cls_nodes: {:.2f}"
+        ).format(
+            phase,
+            stage_name,
+            epoch,
+            accu_loss.item() / (step + 1),
+            accu_grid_loss.item() / (step + 1),
+            accu_cls_loss.item() / (step + 1),
+            accu_grid_acc.item() / (step + 1),
+            accu_cls_acc.item() / (step + 1),
+            total_cls_nodes / float(step + 1),
+        )
 
-        if not torch.isfinite(loss):
-            print('WARNING: non-finite loss, ending training ', loss)
-            sys.exit(1)
+    step_count = step + 1
+    return (
+        accu_loss.item() / step_count,
+        accu_grid_loss.item() / step_count,
+        accu_cls_loss.item() / step_count,
+        accu_grid_acc.item() / step_count,
+        accu_cls_acc.item() / step_count,
+        total_cls_nodes / float(step_count),
+    )
 
-        optimizer.step()
-        optimizer.zero_grad()
 
-    return accu_loss.item() / (step + 1), accu.item() / (step + 1)
-
-def train_one_epoch_classifier(model, optimizer, data_loaders, device, epoch, lossFunction = "CE"):
+def train_one_epoch_classifier(model, optimizer, data_loaders, device, epoch, lossFunction="CE"):
     model.train()
 
     loss_function = get_loss_function(lossFunction)
-
     optimizer.zero_grad()
 
     accu_loss = torch.zeros(1).to(device)
@@ -88,9 +421,9 @@ def train_one_epoch_classifier(model, optimizer, data_loaders, device, epoch, lo
     total_steps = 0
 
     for loader_name, data_loader in data_loaders:
-        data_loader = tqdm(data_loader, file=sys.stdout)
+        progress = tqdm(data_loader, file=sys.stdout)
 
-        for step, data in enumerate(data_loader):
+        for data in progress:
             input_batch, label_batch = data
 
             input_batch = input_batch.to(device)
@@ -105,7 +438,7 @@ def train_one_epoch_classifier(model, optimizer, data_loaders, device, epoch, lo
             accu_loss += loss.detach()
             total_steps += 1
 
-            data_loader.desc = "[train epoch {}][{}] loss: {:.6f}, acc: {:.6f}".format(
+            progress.desc = "[train epoch {}][{}] loss: {:.6f}, acc: {:.6f}".format(
                 epoch,
                 loader_name,
                 accu_loss.item() / total_steps,
@@ -113,196 +446,10 @@ def train_one_epoch_classifier(model, optimizer, data_loaders, device, epoch, lo
             )
 
             if not torch.isfinite(loss):
-                print('WARNING: non-finite loss, ending training ', loss)
+                print("WARNING: non-finite loss, ending training ", loss)
                 sys.exit(1)
 
             optimizer.step()
             optimizer.zero_grad()
 
     return accu_loss.item() / total_steps, accu.item() / total_steps
-
-def adjust_learning_rate(lr, optimizer, epoch, decay_rate):
-    adj_lr = lr * (0.5 ** (epoch // decay_rate))
-    if adj_lr > 1e-6:
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = adj_lr
-
-
-@torch.no_grad()
-def evaluate(model,data_loader,device,epoch, lossFunction = "L1"):
-    model.eval()
-
-    loss_function = get_loss_function(lossFunction)
-
-    accu_loss = torch.zeros(1).to(device)
-    accu = torch.zeros(1).to(device)
-    accu_list = []
-    data_loader = tqdm(data_loader, file=sys.stdout)
-    
-    for step, data in enumerate(data_loader):
-        input_batch, gridmap_batch = data
-        gridmap_output_batch = model(input_batch.to(device))
-        gridmap_batch = gridmap_batch.to(device)
-        
-        #gridmap_accuracy = torch.sum(torch.round(gridmap_output_batch) == gridmap_batch).item() / float(gridmap_output_batch.numel())
-        gridmap_accuracy = torch.sum(abs(gridmap_output_batch -  gridmap_batch) <= delta).item() / float(gridmap_output_batch.numel())
-        #accu_list.append(gridmap_accuracy)
-        accu += gridmap_accuracy
-
-        loss = loss_function(gridmap_output_batch, gridmap_batch)
-        accu_loss += loss
-
-        data_loader.desc = "[valid epoch {}] loss: {:.6f}, acc: {:.6f}".format(epoch, accu_loss.item() / (step + 1), accu.item() / (step + 1))
-
-    return accu_loss.item() / (step + 1), accu.item() / (step + 1)
-
-def train_one_epoch_multi(model, optimizer, data_loader, device, epoch, lossFunction = "L1"):
-    model.train()
-
-    loss_function = get_loss_function(lossFunction)
-
-    optimizer.zero_grad()
-
-    accu_list = []
-    accu_loss = torch.zeros(1).to(device)
-    accu = torch.zeros(1).to(device)
-    data_loader = tqdm(data_loader, file=sys.stdout)
-    
-    for step, data in enumerate(data_loader):
-        input_batch, qp_batch ,gridmap_batch = data
-
-        input_batch = input_batch.to(device)
-        qp_batch = qp_batch.to(device)
-        gridmap_batch = gridmap_batch.to(device)
-
-        gridmap_output_batch = model(input_batch,qp_batch)
-
-        gridmap_accuracy = torch.sum(abs(gridmap_output_batch -  gridmap_batch) <= delta).item() / float(gridmap_output_batch.numel())
-
-        accu += gridmap_accuracy
-
-        loss = loss_function(gridmap_output_batch, gridmap_batch)
-        loss.backward()
-        accu_loss += loss.detach()
-
-        data_loader.desc = "[train epoch {}] loss: {:.6f}, acc: {:.6f}".format(epoch,accu_loss.item() / (step + 1),accu.item() / (step + 1))
-
-        if not torch.isfinite(loss):
-            print('WARNING: non-finite loss, ending training ', loss)
-            sys.exit(1)
-
-        optimizer.step()
-        optimizer.zero_grad()
-
-    return accu_loss.item() / (step + 1), accu.item() / (step + 1)
-
-@torch.no_grad()
-def evaluate_multi(model,data_loader,device,epoch, lossFunction = "L1"):
-    model.eval()
-
-    loss_function = get_loss_function(lossFunction)
-
-    accu_loss = torch.zeros(1).to(device)
-    accu = torch.zeros(1).to(device)
-    accu_list = []
-    data_loader = tqdm(data_loader, file=sys.stdout)
-    
-    for step, data in enumerate(data_loader):
-        input_batch, qp_batch, gridmap_batch = data
-        gridmap_output_batch = model(input_batch.to(device),qp_batch.to(device))
-        gridmap_batch = gridmap_batch.to(device)
-        
-        gridmap_accuracy = torch.sum(abs(gridmap_output_batch -  gridmap_batch) <= delta).item() / float(gridmap_output_batch.numel())
-        accu += gridmap_accuracy
-
-        loss = loss_function(gridmap_output_batch, gridmap_batch)
-        accu_loss += loss
-
-        data_loader.desc = "[valid epoch {}] loss: {:.6f}, acc: {:.6f}".format(epoch, accu_loss.item() / (step + 1), accu.item() / (step + 1))
-
-    return accu_loss.item() / (step + 1), accu.item() / (step + 1)
-
-class SwinTransUDataset(Dataset):
-    def __init__(self, data_type, path, qp_list, min_qp=0, max_qp=51):
-        """
-        初始化数据集
-        
-        参数:
-            data_type (str): 'Training' 或 'Validating' or 'Testing'
-            path (str): 数据根目录
-            qp_list (list): QP值列表
-            min_qp, max_qp: 用于标准化QP值
-        """
-        self.data_type = data_type
-        self.path = path
-        self.qp_list = qp_list
-        self.min_qp = min_qp
-        self.max_qp = max_qp
-        
-        # 标准化QP值
-        self.qp_standardized_list = [(x - min_qp) / (max_qp - min_qp) for x in qp_list]
-        
-        # 加载YUV数据的形状（不加载完整数据）
-        yuv_path = os.path.join(path, 'YUV96', data_type, f'{data_type}_Y_Block96.npy')
-        with open(yuv_path, 'rb') as f:
-            # 只读取numpy文件的形状信息
-            self.yuv_shape = np.lib.format.read_array(f).shape
-        self.single_qp_count = self.yuv_shape[0]  # 单个QP的样本数量
-        self.total_count = self.single_qp_count * len(qp_list)  # 总样本数量
-        
-        # 存储网格图文件路径，避免重复计算
-        self.gridmap_paths = [
-            os.path.join(path, 'Gridmap', data_type, f'{data_type}_Luma_QP_{qp}_Gridmap16.npy')
-            for qp in qp_list
-        ]
-
-    def __len__(self):
-        return self.total_count
-
-    def __getitem__(self, idx):
-        # 确定当前索引对应的QP索引和内部索引
-        qp_idx = idx // self.single_qp_count
-        inner_idx = idx % self.single_qp_count
-        qp = self.qp_list[qp_idx]
-        qp_standardized = self.qp_standardized_list[qp_idx]
-        
-        # 加载YUV数据（只加载需要的样本）
-        yuv_path = os.path.join(self.path, 'YUV96', self.data_type, f'{self.data_type}_Y_Block96.npy')
-        yuv_data = np.load(yuv_path, mmap_mode='r')  # 使用内存映射，不加载整个文件
-        yuv_sample = torch.FloatTensor(yuv_data[inner_idx].copy())
-        
-        # 准备QP数据
-        qp_sample = torch.FloatTensor([qp_standardized])
-        
-        # 加载网格图数据（只加载需要的样本）
-        gridmap_data = np.load(self.gridmap_paths[qp_idx], mmap_mode='r')  # 使用内存映射
-        gridmap_sample = torch.FloatTensor(gridmap_data[inner_idx].copy())
-        
-        return yuv_sample, qp_sample, gridmap_sample
-    
-class DynamicShapeDataset(Dataset):
-    def __init__(self, data_list, labels=None):
-        """
-        初始化动态形状数据集
-        :param data_list: 包含不同形状数据的列表，如 [data1, data2, data3]
-        :param labels: 对应的标签列表，如果为None则生成随机标签
-        """
-        self.data_list = data_list
-        # 如果没有提供标签，生成随机标签（0-2三类）
-        self.labels = labels if labels is not None else [np.random.randint(0, 3) for _ in range(len(data_list))]
-        
-        # 打印数据集信息
-        print(f"数据集包含 {len(self.data_list)} 个样本")
-        for i, data in enumerate(self.data_list):
-            print(f"样本 {i+1} 形状: {data.shape}, 标签: {self.labels[i]}")
-
-    def __len__(self):
-        return len(self.data_list)
-    
-    def __getitem__(self, idx):
-        # 直接返回原始数据（不做任何形状修改）和对应的标签
-        data = self.data_list[idx]
-        label = self.labels[idx]
-        
-        # 转换为Tensor，保持原始形状
-        return torch.tensor(data, dtype=torch.float32), torch.tensor(label, dtype=torch.long)

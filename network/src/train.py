@@ -12,22 +12,19 @@ try:
     from torch.utils.tensorboard import SummaryWriter
 except ModuleNotFoundError:
     SummaryWriter = None
-from torch.utils.data import DataLoader, Dataset, TensorDataset
-import pandas as pd
+from torch.utils.data import DataLoader, TensorDataset
 
 from utils import (
-    train_one_epoch,
-    evaluate,
     adjust_learning_rate,
+    collate_gridmap_with_nodes,
+    evaluate,
+    IdAlignedGridmapCuTreeDataset,
+    train_one_epoch,
     train_one_epoch_classifier,
-    train_one_epoch_multi,
-    evaluate_multi,
+    get_loss_function,
 )
 from model import SwinTransformer_Unet_Luma as model64
 from model import Classifier_I as classifier_i
-
-
-ID_COLUMNS = ["sequence_name", "qp", "frame_id", "ctu_id"]
 
 
 class Tee:
@@ -70,101 +67,29 @@ def setup_tensorboard(args, log_out_dir):
     return writer
 
 
-def split_dir_from_name(type):
-    return type.lower()
-
-
-class IdAlignedGridmapDataset(Dataset):
-    def __init__(self, dataset_name, type, component="Luma", min_qp=0, max_qp=51):
-        self.dataset_name = dataset_name
-        self.type = type
-        self.component = component
-        self.min_qp = min_qp
-        self.max_qp = max_qp
-        if max_qp <= min_qp:
-            raise ValueError(f"max_qp must be larger than min_qp, got {min_qp} and {max_qp}")
-        split_dir = split_dir_from_name(type)
-        dataset_dir = paths.dataset_root() / dataset_name / split_dir
-        self.input_path = dataset_dir / f"{component}_Input.pkl"
-        self.gridmap_path = dataset_dir / f"{component}_Gridmap.pkl"
-        self.input_npy_path = dataset_dir / f"{component}_Input.npy"
-        self.gridmap_npy_path = dataset_dir / f"{component}_Gridmap.npy"
-
-        if not self.input_path.exists():
-            raise FileNotFoundError(f"Input metadata pkl not found: {self.input_path}")
-        if not self.gridmap_path.exists():
-            raise FileNotFoundError(f"Gridmap metadata pkl not found: {self.gridmap_path}")
-        if not self.input_npy_path.exists():
-            raise FileNotFoundError(f"Input npy array not found: {self.input_npy_path}")
-        if not self.gridmap_npy_path.exists():
-            raise FileNotFoundError(f"Gridmap npy array not found: {self.gridmap_npy_path}")
-
-        print(
-            f"{component} {type}: using mmap arrays "
-            f"{self.input_npy_path.name}, {self.gridmap_npy_path.name}"
-        )
-        input_payload = pd.read_pickle(self.input_path)
-        gridmap_payload = pd.read_pickle(self.gridmap_path)
-        self.input_array = np.load(self.input_npy_path, mmap_mode="r")
-        self.gridmap_array = np.load(self.gridmap_npy_path, mmap_mode="r")
-        self.input_ids = input_payload["ids"]
-        self.gridmap_ids = gridmap_payload["ids"]
-
-        if list(self.input_ids.index.names) != ID_COLUMNS:
-            raise RuntimeError(
-                f"input ids must be indexed by {ID_COLUMNS}. "
-                "Regenerate the pkl files with the current createDataset.py."
-            )
-        if list(self.gridmap_ids.index.names) != ID_COLUMNS:
-            raise RuntimeError(
-                f"gridmap ids must be indexed by {ID_COLUMNS}. "
-                "Regenerate the pkl files with the current createDataset.py."
-            )
-
-        common_ids = self.input_ids.index.intersection(self.gridmap_ids.index, sort=True)
-        if common_ids.empty:
-            raise RuntimeError(
-                f"No common ids between {self.input_path} and {self.gridmap_path}"
-            )
-        self.input_positions = self.input_ids.loc[common_ids, "sample_index"].to_numpy(dtype=np.int64)
-        self.gridmap_positions = self.gridmap_ids.loc[common_ids, "sample_index"].to_numpy(dtype=np.int64)
-        qp_values = common_ids.get_level_values("qp").to_numpy(dtype=np.float32)
-        self.qp_values = (qp_values - float(min_qp)) / float(max_qp - min_qp)
-        missing_input = len(self.gridmap_ids) - len(common_ids)
-        missing_gridmap = len(self.input_ids) - len(common_ids)
-        print(
-            f"{component} {type}: {len(common_ids):,} aligned samples "
-            f"from {self.input_path.name} and {self.gridmap_path.name} "
-            f"(missing input: {missing_input:,}, missing gridmap: {missing_gridmap:,})"
-        )
-        print(
-            f"{component} {type}: input shape {self.input_array.shape}, "
-            f"gridmap shape {self.gridmap_array.shape}"
-        )
-        print(
-            f"{component} {type}: normalized QP range "
-            f"{self.qp_values.min():.4f} to {self.qp_values.max():.4f} "
-            f"(min_qp={min_qp}, max_qp={max_qp})"
-        )
-
-    def __len__(self):
-        return len(self.input_positions)
-
-    def __getitem__(self, idx):
-        input_idx = self.input_positions[idx]
-        gridmap_idx = self.gridmap_positions[idx]
-        input_sample = torch.from_numpy(self.input_array[input_idx].copy()).float()
-        qp_sample = torch.tensor([self.qp_values[idx]], dtype=torch.float32)
-        gridmap_sample = torch.from_numpy(self.gridmap_array[gridmap_idx].copy()).float()
-        return input_sample, qp_sample, gridmap_sample
+def load_model_weights(model, checkpoint_path, device, model_name):
+    if checkpoint_path is None:
+        return
+    checkpoint_path = os.path.expanduser(checkpoint_path)
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"{model_name} checkpoint not found: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    if isinstance(checkpoint, dict):
+        for key in ("model", "state_dict", "model_state_dict"):
+            if key in checkpoint:
+                checkpoint = checkpoint[key]
+                break
+    model.load_state_dict(checkpoint)
+    print(f"Loaded {model_name} checkpoint:", checkpoint_path)
 
 
 def train_SwinTransU(args):
-
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
-    Net = model64()
-    Net = Net.to(device)
+    Net = model64().to(device)
+    Classifier = classifier_i().to(device)
+
+    load_model_weights(Classifier, args.classifierCkpt, device, "Classifier_I")
 
     log_out_dir = os.path.join(str(paths.output_root()), args.outDir, args.jobID)
     ckpt_out_dir = os.path.join(str(paths.checkpoints_root()), args.outDir, args.jobID)
@@ -176,80 +101,161 @@ def train_SwinTransU(args):
     tb_writer = setup_tensorboard(args, log_out_dir)
     log_dir = os.path.join(log_out_dir, 'loss.txt')
     with open(log_dir, 'a') as f:
-        s = "epoch_num, epoch_loss, epoch_accu, val_loss, val_accu\n"
+        s = (
+            "epoch_num, stage, grid_weight, cls_weight, lr, epoch_loss, grid_loss, cls_loss, "
+            "grid_accu, cls_accu, avg_cls_nodes, val_loss, val_grid_loss, val_cls_loss, "
+            "val_grid_accu, val_cls_accu, val_avg_cls_nodes\n"
+        )
         f.write(s)
-        for s in [args.lr,args.dr, args.batchSize]:
+        for s in [
+            args.lr,
+            args.dr,
+            args.batchSize,
+            args.stage1Lr if args.stage1Lr is not None else args.lr,
+            args.stage2Lr if args.stage2Lr is not None else args.lr,
+            args.gridLossType,
+            args.jointStage1Epoch,
+            args.stage1GridLossWeight,
+            args.stage1ClsLossWeight,
+            args.stage2GridLossWeight,
+            args.stage2ClsLossWeight,
+        ]:
             f.write(str(s))
             f.write(',')
         f.write('\n')
 
     print("Creating data loader...")
-    train_dataset = IdAlignedGridmapDataset(
+    train_dataset = IdAlignedGridmapCuTreeDataset(
         dataset_name=args.dataset,
         type=args.trainSplit,
         component=args.component,
-
     )
-    train_dataLoader = DataLoader(dataset=train_dataset, num_workers=2, batch_size=args.batchSize, pin_memory=True, shuffle=True)
-    val_dataset = IdAlignedGridmapDataset(
+    train_dataLoader = DataLoader(
+        dataset=train_dataset,
+        num_workers=2,
+        batch_size=args.batchSize,
+        pin_memory=True,
+        shuffle=True,
+        collate_fn=collate_gridmap_with_nodes,
+    )
+    val_dataset = IdAlignedGridmapCuTreeDataset(
         dataset_name=args.dataset,
         type=args.valSplit,
         component=args.component,
     )
-    val_dataLoader = DataLoader(dataset=val_dataset, num_workers=2, batch_size=args.batchSize, pin_memory=True, shuffle=False)
+    val_dataLoader = DataLoader(
+        dataset=val_dataset,
+        num_workers=2,
+        batch_size=args.batchSize,
+        pin_memory=True,
+        shuffle=False,
+        collate_fn=collate_gridmap_with_nodes,
+    )
 
-    pg = [p for p in Net.parameters() if p.requires_grad]
+    pg = [p for p in list(Net.parameters()) + list(Classifier.parameters()) if p.requires_grad]
     optimizer = optim.AdamW(pg, lr=args.lr, weight_decay=5E-2)
+    grid_loss_fn = get_loss_function(args.gridLossType)
+    cls_loss_fn = nn.CrossEntropyLoss()
 
-    print('Start Training ...')
+    def stage_config(epoch):
+        if epoch < args.jointStage1Epoch:
+            stage_lr = args.stage1Lr if args.stage1Lr is not None else args.lr
+            return "stage1_grid_first", args.stage1GridLossWeight, args.stage1ClsLossWeight, stage_lr, epoch
+        stage_lr = args.stage2Lr if args.stage2Lr is not None else args.lr
+        return "stage2_joint", args.stage2GridLossWeight, args.stage2ClsLossWeight, stage_lr, epoch - args.jointStage1Epoch
+
+    print('Start Joint Swin + Classifier Training ...')
     for epoch in range(args.epoch):
-        #train
-        adjust_learning_rate(args.lr, optimizer, epoch, args.dr)
+        stage_name, grid_weight, cls_weight, stage_lr, stage_epoch = stage_config(epoch)
+        adjust_learning_rate(stage_lr, optimizer, stage_epoch, args.dr)
 
-        train_loss, train_acc = train_one_epoch_multi(model=Net,
-                                                      optimizer=optimizer,
-                                                      data_loader=train_dataLoader,
-                                                      device=device,
-                                                      epoch=epoch,
-                                                      lossFunction="BCE")
-
-        # validate
-        val_loss, val_acc = evaluate_multi(model=Net,
-                                           data_loader=val_dataLoader,
-                                           device=device,
-                                           epoch=epoch,
-                                           lossFunction="BCE")
+        train_metrics = train_one_epoch(
+            swin_model=Net,
+            classifier=Classifier,
+            optimizer=optimizer,
+            data_loader=train_dataLoader,
+            device=device,
+            epoch=epoch,
+            grid_loss_fn=grid_loss_fn,
+            cls_loss_fn=cls_loss_fn,
+            grid_weight=grid_weight,
+            cls_weight=cls_weight,
+            stage_name=stage_name,
+        )
+        val_metrics = evaluate(
+            swin_model=Net,
+            classifier=Classifier,
+            data_loader=val_dataLoader,
+            device=device,
+            epoch=epoch,
+            grid_loss_fn=grid_loss_fn,
+            cls_loss_fn=cls_loss_fn,
+            grid_weight=grid_weight,
+            cls_weight=cls_weight,
+            stage_name=stage_name,
+        )
 
         if tb_writer is not None:
-            tb_writer.add_scalar("Loss/train", train_loss, epoch)
-            tb_writer.add_scalar("Loss/val", val_loss, epoch)
-            tb_writer.add_scalar("Accu/train", train_acc, epoch)
-            tb_writer.add_scalar("Accu/val", val_acc, epoch)
+            tb_writer.add_scalar("Loss/train_total", train_metrics[0], epoch)
+            tb_writer.add_scalar("Loss/train_grid", train_metrics[1], epoch)
+            tb_writer.add_scalar("Loss/train_cls", train_metrics[2], epoch)
+            tb_writer.add_scalar("Accu/train_grid", train_metrics[3], epoch)
+            tb_writer.add_scalar("Accu/train_cls", train_metrics[4], epoch)
+            tb_writer.add_scalar("Loss/val_total", val_metrics[0], epoch)
+            tb_writer.add_scalar("Loss/val_grid", val_metrics[1], epoch)
+            tb_writer.add_scalar("Loss/val_cls", val_metrics[2], epoch)
+            tb_writer.add_scalar("Accu/val_grid", val_metrics[3], epoch)
+            tb_writer.add_scalar("Accu/val_cls", val_metrics[4], epoch)
+            tb_writer.add_scalar("Weight/grid", grid_weight, epoch)
+            tb_writer.add_scalar("Weight/cls", cls_weight, epoch)
             tb_writer.add_scalar("LR", optimizer.param_groups[0]["lr"], epoch)
             tb_writer.flush()
 
         if (epoch + 1) % 10 == 0:
-            torch.save(Net.state_dict(), os.path.join(ckpt_out_dir, "model-{}.pth".format(epoch)))
+            torch.save(Net.state_dict(), os.path.join(ckpt_out_dir, "swin-{}.pth".format(epoch)))
+            torch.save(Classifier.state_dict(), os.path.join(ckpt_out_dir, "classifier-{}.pth".format(epoch)))
 
         print('***********************************************************************'
               '***********************************************************************')
-        print("Epoch: %d  Loss: %.6f " % (epoch, train_loss))
-        print("Val: Loss: %.6f  Acc: %.6f" % (val_loss, val_acc))
-        #print("Test: Loss: %.6f  Acc: %.6f" % (test_out_info_list[0], test_out_info_list[1]))
+        print(
+            "Epoch: {} Stage: {} GridW: {:.6f} ClsW: {:.6f} "
+            "Loss: {:.6f} Grid: {:.6f} Cls: {:.6f} GridAcc: {:.6f} ClsAcc: {:.6f}".format(
+                epoch,
+                stage_name,
+                grid_weight,
+                cls_weight,
+                train_metrics[0],
+                train_metrics[1],
+                train_metrics[2],
+                train_metrics[3],
+                train_metrics[4],
+            )
+        )
+        print(
+            "Val: Loss: {:.6f} Grid: {:.6f} Cls: {:.6f} GridAcc: {:.6f} ClsAcc: {:.6f}".format(
+                val_metrics[0],
+                val_metrics[1],
+                val_metrics[2],
+                val_metrics[3],
+                val_metrics[4],
+            )
+        )
         print('***********************************************************************'
               '***********************************************************************')
 
         with open(log_dir, 'a') as f:
-            for s in [epoch,train_loss, train_acc, val_loss, val_acc]:
+            for s in [epoch, stage_name, grid_weight, cls_weight, optimizer.param_groups[0]["lr"], *train_metrics, *val_metrics]:
                 f.write(str(s))
                 f.write(',')
             f.write('\n')
-        
+
         print('Epoch ' + str(epoch) + ' done.')
 
-    torch.save(Net.state_dict(), os.path.join(ckpt_out_dir, "model-final.pth"))
+    torch.save(Net.state_dict(), os.path.join(ckpt_out_dir, "swin-final.pth"))
+    torch.save(Classifier.state_dict(), os.path.join(ckpt_out_dir, "classifier-final.pth"))
     if tb_writer is not None:
         tb_writer.close()
+
 
 def pretrain_Classifier(args):
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -352,9 +358,9 @@ if __name__ == '__main__':
     parser.add_argument('--batchSize', type=int, default=256)
     parser.add_argument('--lr', type=float, default=0.0001)
     parser.add_argument('--device', default='cuda:0', help='device id (i.e. 0 or 0,1 or cpu)')
-    parser.add_argument('--outDir', type=str, default='classifier_i_pretrain')
+    parser.add_argument('--outDir', type=str, default='swin_luma64_joint')
     parser.add_argument('--task', type=str, default='swin_luma',
-                        choices=['classifier_pretrain_logical', 'swin_luma'])
+                        choices=['pretrain_classifier_logical', 'swin_luma'])
     parser.add_argument('--logFile', type=str, default='train.log')
     parser.add_argument('--dr', default=20, type=int, help='decay rate of lr')
     parser.add_argument('--dataset', type=str, default='DIV2K')
@@ -362,6 +368,15 @@ if __name__ == '__main__':
     parser.add_argument('--valSplit', type=str, default='validating')
     parser.add_argument('--component', type=str, choices=['Luma'], default='Luma')
     parser.add_argument('--tbLogDir', type=str, default=None, help='TensorBoard log directory')
+    parser.add_argument('--classifierCkpt', type=str, default=None, help='Optional Classifier_I checkpoint to resume from')
+    parser.add_argument('--gridLossType', type=str, default='BCE', choices=['BCE', 'L1', 'HUBER', 'MSE'], help='Loss function for Swin gridmap supervision')
+    parser.add_argument('--jointStage1Epoch', type=int, default=50, help='Epoch threshold for joint training stage 1')
+    parser.add_argument('--stage1Lr', type=float, default=None, help='Joint stage 1 base learning rate, default uses --lr')
+    parser.add_argument('--stage2Lr', type=float, default=None, help='Joint stage 2 base learning rate, default uses --lr')
+    parser.add_argument('--stage1GridLossWeight', type=float, default=1.0, help='Joint stage 1 gridmap loss weight')
+    parser.add_argument('--stage1ClsLossWeight', type=float, default=0.02, help='Joint stage 1 classifier loss weight')
+    parser.add_argument('--stage2GridLossWeight', type=float, default=1.0, help='Joint stage 2 gridmap loss weight')
+    parser.add_argument('--stage2ClsLossWeight', type=float, default=1.0, help='Joint stage 2 classifier loss weight')
 
     args = parser.parse_args()
 
@@ -369,7 +384,7 @@ if __name__ == '__main__':
 
     if args.task == 'swin_luma':
         train_SwinTransU(args)
-    elif args.task == 'classifier_pretrain_logical':
+    elif args.task == 'pretrain_classifier_logical':
         pretrain_Classifier(args)
 
 
@@ -377,4 +392,4 @@ if __name__ == '__main__':
 #CUDA_VISIBLE_DEVICES=0 nohup python train.py --outDir ./Train_Loss/ --lr 2e-4 --dr 30 --batchSize 256 --epoch 300 --jobID 0000 --device cuda:0 > ./Train_Loss/0000/train_result.log 2>&1 &
 #nohup python train.py --outDir ./Train_Loss/ --lr 1e-4 --dr 30 --batchSize 256 --epoch 300 --jobID 0000 --device cuda:0 > ./Train_Loss/0000/train_result.log 2>&1 &
 
-#nohup python train.py --task classifier_pretrain_logical --outDir classifier_i_pretrain --jobID logical_v1 --epoch 50 --batchSize 128 --lr 1e-3 --dr 20 --device cuda:0 &
+#nohup python train.py --task pretrain_classifier_logical --outDir classifier_i_pretrain --jobID logical_v1 --epoch 50 --batchSize 128 --lr 1e-3 --dr 20 --device cuda:0 &
