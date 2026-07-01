@@ -9,7 +9,6 @@ import torch.nn.functional as F
 import paths
 from model import Classifier_I
 from model import SwinTransformer_Unet_Luma
-from model96 import SwinTransformer_Unet_Luma96
 
 
 CLASSIFIER_I_GRID_SIZES = (
@@ -174,25 +173,13 @@ class ClassifierIExportWrapper(nn.Module):
         return logits
 
 
-def export_classifier_i_script(checkpoint_path, output_path, device):
+def export_classifier(checkpoint_path, output_path, device):
     model = Classifier_I()
     missing, unexpected = load_model_weights(model, checkpoint_path, device)
     model.eval()
     wrapper = ClassifierIExportWrapper(model).eval()
     scripted = torch.jit.script(wrapper)
     scripted.save(str(output_path))
-    return missing, unexpected
-
-
-def export_classifier_i_traces(checkpoint_path, output_dir, device):
-    model = Classifier_I()
-    missing, unexpected = load_model_weights(model, checkpoint_path, device)
-    model.eval()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    for grid_h, grid_w in CLASSIFIER_I_GRID_SIZES:
-        dummy_input = torch.randn(1, 2, grid_h, grid_w, device=device)
-        traced = torch.jit.trace(model, dummy_input, strict=False)
-        traced.save(str(output_dir / "classifier_i_{}x{}.pt".format(grid_h, grid_w)))
     return missing, unexpected
 
 
@@ -207,24 +194,12 @@ def export_swin_luma(checkpoint_path, output_path, device):
     return missing, unexpected
 
 
-def export_swin_luma96(checkpoint_path, output_path, device, use_context_mask):
-    model = SwinTransformer_Unet_Luma96(use_context_mask=use_context_mask)
-    missing, unexpected = load_model_weights(model, checkpoint_path, device)
-    model.eval()
-    dummy_input = torch.randn(1, 1, 96, 96, device=device)
-    dummy_qp = torch.randn(1, 1, device=device)
-    traced = torch.jit.trace(model, (dummy_input, dummy_qp), strict=False)
-    traced.save(str(output_path))
-    return missing, unexpected
-
-
 def parse_args():
-    parser = argparse.ArgumentParser(description="Export trained checkpoints for C++ deployment.")
-    parser.add_argument("--task", choices=("classifier_i_script", "classifier_i_traces", "swin_luma", "swin_luma96"), required=True)
+    parser = argparse.ArgumentParser(description="Export 64x64 trained checkpoints for C++ deployment.")
+    parser.add_argument("--task", choices=("export_classifier", "swin_luma"), required=True)
     parser.add_argument("--checkpoint", required=True, help="Path to a .pth checkpoint under network/checkpoints.")
-    parser.add_argument("--output", required=True, help="Output .pt path, or output directory for classifier_i_traces.")
+    parser.add_argument("--output", required=True, help="Output .pt path.")
     parser.add_argument("--device", default="cpu")
-    parser.add_argument("--useContextMask", action="store_true", help="Use the context-mask variant for SwinTransformer_Unet_Luma96.")
     return parser.parse_args()
 
 
@@ -239,14 +214,10 @@ if __name__ == "__main__":
         output_path = paths.project_root() / output_path
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    if args.task == "classifier_i_script":
-        missing, unexpected = export_classifier_i_script(checkpoint_path, output_path, device)
-    elif args.task == "classifier_i_traces":
-        missing, unexpected = export_classifier_i_traces(checkpoint_path, output_path, device)
+    if args.task == "export_classifier":
+        missing, unexpected = export_classifier(checkpoint_path, output_path, device)
     elif args.task == "swin_luma":
         missing, unexpected = export_swin_luma(checkpoint_path, output_path, device)
-    else:
-        missing, unexpected = export_swin_luma96(checkpoint_path, output_path, device, args.useContextMask)
 
     print("Saved:", output_path)
     if missing:
