@@ -1,53 +1,53 @@
 # FastPartitionVTM
 
-## 1. 项目作用与功能
+FastPartitionVTM 是一个面向 **VVC 标准参考软件 VTM 24.0** 的神经网络快速划分研究与开发仓库。
 
-FastPartitionVTM 是一个面向 **VVC 标准参考软件 VTM 24.0** 的快速编码划分研究与实现仓库。该项目的核心目标是在保持 VTM 参考编码流程可对照、可复现的基础上，引入基于深度学习的编码单元划分预测方法，从而减少编码器在 CU/PU/TU 等划分搜索过程中的计算开销，提升编码速度。
+本仓库按职责拆分为几个相互独立的部分：
 
-在标准 VTM 编码器中，块划分决策通常需要遍历多种划分模式并进行率失真代价比较，包括不划分、四叉树划分、二叉树水平/垂直划分、三叉树水平/垂直划分等候选。该过程计算复杂度较高，也是 VVC 编码耗时的重要来源之一。本仓库围绕这一瓶颈，构建了从训练数据生成、神经网络模型训练、划分结果预测，到 VTM 编码器集成验证的一套实验流程。
+```text
+ref_model/        标准 VTM 基线与划分标签生成
+data/             视频、生成的 cfg、划分标签、训练数据集和日志
+network/          模型代码、数据转换、训练、推理和模型导出
+VVCSoftware_VTM/  实验性 VTM 集成与编码器侧验证
+docs/             原理说明、模型细节和集成文档
+```
 
-本项目当前重点支持基于亮度信息和 grid map 表示的划分预测方法，并包含分类器与分割/预测网络等相关训练流程。网络模型用于学习标准 VTM 中的划分行为或近似划分决策，在编码阶段辅助或替代部分传统搜索流程，以实现快速划分。项目同时保留标准 VTM 24.0 基线运行环境，用于生成训练标签、进行性能对比，并评估快速划分方案对编码复杂度、BD-rate、划分一致性和编码质量的影响。
+## 目录入口
 
-因此，本仓库不仅包含神经网络训练代码，也包含与 VTM 24.0 集成相关的工程代码、标准参考模型的最小运行副本、实验脚本和后续性能评测基础设施。其定位是一个用于研究和实现 **“深度学习辅助 VTM 24.0 快速划分”** 的完整实验代码库。
+| 目录 | 作用 | 继续阅读 |
+| --- | --- | --- |
+| `data/` | 存放外部输入数据与实验生成数据，主要被 `ref_model/` 和 `network/` 使用。 | [data/README.md](data/README.md) |
+| `network/` | 存放 Python 模型定义、数据集转换、训练、推理、可视化和模型导出工具。 | [network/README.md](network/README.md) |
+| `ref_model/` | 存放最小化标准 VTM 24.0 可执行基线、cfg 模板、序列清单和标签生成脚本。 | [ref_model/README.md](ref_model/README.md) |
+| `VVCSoftware_VTM/` | 用于快速划分方法接入和验证的 VTM 主开发目录。 | [VVCSoftware_VTM/README.md](VVCSoftware_VTM/README.md) |
+| `docs/` | 存放更详细的数据流、模型设计、分类器说明、VTM 集成和实现细节。 | [docs/README.md](docs/README.md) |
 
-## 2. 仓库组成
+## 主流程
 
-本仓库的主体由 `network/`、`VVCSoftware_VTM/`、`ref_model/` 和 `data/` 组成。其中，前三者分别对应网络模型、实验性 VTM 工程代码和标准基线参考模型，`data/` 用于组织训练、编码和实验过程中产生或依赖的数据资源。各目录职责相互分离，避免将源码、模型、标准基线和大体积数据混放。
+本仓库的完整使用流程可以按“标准标签生成 -> 数据集创建 -> 模型训练 -> 模型导出 -> VTM 集成验证”理解。
 
-### `network/`
+1. 使用 `ref_model/` 生成标准 VTM 划分标签
 
-`network/` 用于存放深度学习模型相关内容，是本项目中网络训练、数据处理、推理实验和模型结果管理的主要目录。该目录可包含模型结构定义、训练脚本、数据生成脚本、数据索引、实验配置、推理脚本、模型导出脚本、训练日志、结果摘要和模型版本说明等内容。
+   `ref_model/` 保存标准 VTM 24.0 的最小可运行基线和标签生成脚本。使用时先根据序列清单和 cfg 模板生成逐序列编码配置，再调用 `dumpPartition` 版本的 VTM 编码器/解码器运行标准编码流程。该步骤的输入是 `data/video/` 中的原始 YUV 序列和 `ref_model/script/` 中的序列清单；输出主要为标准 VTM 编码得到的 CU 划分文本，保存到 `data/partition/` 下，运行日志与临时产物分别保存到 `data/logs/` 和 `data/codec_run/` 下。
 
-当前项目中的划分预测网络、分类器预训练流程、亮度 Swin-UNet grid map 预测流程，以及相关训练输出和检查点，均应优先在该目录下组织。与训练数据、模型输入输出、损失函数、实验记录和网络推理相关的改动，也应主要放在 `network/` 中维护。
+2. 使用 `network/src/createDataset.py` 创建网络训练数据集
 
-### `data/`
+   标准划分文本生成后，进入 `network/` 侧的数据处理流程。`createDataset.py` 会把 `data/video/` 中的原始亮度像素和 `data/partition/` 中的 VTM 划分记录整理成两个网络需要的训练数据：一部分是 Swin gridmap 预测网络使用的 64x64 亮度 input 及其 2 通道、16x16 gridmap 标签；另一部分是 `Classifier_I` 使用的局部 gridmap ROI 及其对应的 CU 划分类型标签。生成 input 时需要根据序列清单读取原始 YUV 的文件名、宽高和帧数等元信息；生成 gridmap 和划分类型标签时主要依赖标准 VTM 导出的划分记录。最终数据统一保存到 `data/dataset/`，供后续训练、验证和推理读取。
 
-`data/` 用于存放本项目实验过程中使用或生成的数据资源，包括训练/测试视频、编码配置、编码运行输出和日志等内容。
+3. 使用 `network/src/train.py` 训练划分预测模型
 
-当前 `data/` 下主要包含以下类型内容：
+   当前网络侧流程主要围绕 64x64 亮度块的 gridmap 预测和 CU 划分分类。`SwinTransformer_Unet` 预测 2 通道、16x16 的 gridmap；`Classifier_I` 将局部 gridmap ROI 映射为划分类别：
 
-- `video/`：用于实验的视频序列或由图像数据转换得到的 YUV 序列，例如 DIV2K、HEVC CTC 等数据来源；
-- `partition/`：由 VTM 编码过程导出的划分信息，通常按数据集和训练/验证集合组织，例如 `training`、`validating`，其中包含 `Luma_Partition_Info.txt`、`Chroma_Partition_Info.txt` 等亮度/色度划分记录；
-- `dataset/`：由原始视频和划分信息进一步整理得到的模型训练数据，例如亮度/色度输入、grid map 标签、样本索引、CU tree 结构数据，以及 `Classifier` 逻辑训练所需的 `gridmap.npy` 和 `label.npy`；
-- `CodecTrainCfg/`：面向不同数据集和 QP 设置生成的编码配置；
-- `codec_run/`：编码器运行过程中产生的输出文件或中间结果；
-- `logs/`：数据生成、编码运行或实验过程中的日志文件。
+```text
+[NO_SPLIT, QT, BTH, BTV, TTH, TTV]
+```
 
-### `VVCSoftware_VTM/`
+   训练入口位于 `network/src/train.py`。训练脚本从 `data/dataset/` 读取数据，将训练日志、loss 记录和可视化/评估输出写入 `network/output/<outDir>/<jobID>/`，将模型权重保存到 `network/checkpoints/<outDir>/<jobID>/`。
 
-`VVCSoftware_VTM/` 是用于集成和开发快速划分方案的 VTM 工程主目录。该目录基于 VVC 标准参考软件 VTM 24.0，用于承载与编码器/解码器实现、快速划分逻辑接入、工程构建配置、实验性编码流程调整等相关的代码改动。
+4. 导出 VTM 可加载的模型文件
 
-当需要将训练好的深度学习模型接入 VTM 编码流程，或者修改 VTM 中的划分搜索、编码控制、特征导出、推理调用和实验开关时，应优先在该目录中完成。该目录是快速划分方法与 VTM 参考软件结合的主要开发位置。
+   训练得到的 `.pth` checkpoint 是 PyTorch 训练权重，主要用于继续训练、推理测试或模型分析。若要在 VTM C++ 侧加载模型，需要使用 `network/src/saveModel.py` 将 checkpoint 导出为 TorchScript `.pt` 文件。导出的 `.pt` 模型通常继续保存在对应的 `network/checkpoints/<outDir>/<jobID>/` 目录中，作为后续 VTM 集成的部署输入。
 
-### `ref_model/`
+5. 在 `VVCSoftware_VTM/` 中加载模型并执行快速划分
 
-`ref_model/` 用于保存 VTM 24.0 参考执行模型、标准配置和基于参考模型的数据生成脚本。该目录的作用不是承载神经网络方法开发，而是用于标准行为复现、训练划分标签生成、基线性能对比和参考验证。
-
-当前 `ref_model/` 采用最小化组织方式，主要包含：
-
-- `bin/vtm240/`：标准、未改动的 VTM 24.0 可执行文件，用于标准基线运行、编码/解码一致性校验和参考结果对比；
-- `bin/dumpPartition/`：用于生成训练划分标签的一组 VTM 可执行文件，其中编码器负责生成 bitstream，解码器读取划分导出环境变量并输出 `Luma_Partition_Info.txt`、`Chroma_Partition_Info.txt`；
-- `cfg/`：保存 VTM 编码配置模板，例如 `sequence.cfg` 与 `encoder_intra_vtm.cfg`；
-- `script/`：保存标准划分数据生成脚本和基线校验脚本，例如 `gencfg.sh`、`run.sh`、`gentxt.sh` 和 `roundtrip.sh`。
-
-在实验过程中，若需要生成训练用的标准划分标签，应优先使用 `ref_model/script/gencfg.sh` 和 `ref_model/script/run.sh`。生成的编码配置默认保存到 `data/CodecTrainCfg/`，划分信息默认保存到 `data/partition/`，日志与临时编码输出分别保存到 `data/logs/` 和 `data/codec_run/`。若需要验证标准 VTM 编码器和解码器的一致性，应使用 `ref_model/script/roundtrip.sh`，该流程使用 `bin/vtm240/` 中的标准可执行文件，不用于导出训练标签。
+   `VVCSoftware_VTM/` 是实验性 VTM 主开发目录。集成流程中，VTM 编码器通过 libtorch 加载 `network/checkpoints/` 中导出的 TorchScript 模型，在编码过程中对当前 CTU/CU 提取亮度输入，先由 Swin 网络预测 gridmap，再由 `Classifier_I` 给出当前 CU 的划分模式概率。VTM 侧仍以 RDO 流程为主，网络输出用于辅助判断进行剪枝，根据阈值决策模式跳过部分候选划分模式。最终使用 `VVCSoftware_VTM/script/` 中的评测脚本对 anchor 和快速划分版本进行编码时间、码率失真和 BD-rate 等指标对比。
