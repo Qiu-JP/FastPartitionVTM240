@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 
 ID_COLUMNS = ["sequence_name", "qp", "frame_id", "ctu_id"]
-GRID_ACC_DELTA = 1e-1
+GRID_POSITIVE_THRESHOLD = 0.5
 CLASSIFIER_SUPPORTED_SIZES = {
     (16, 16),
     (8, 8),
@@ -179,7 +179,8 @@ class IdAlignedGridmapCuTreeDataset(IdAlignedGridmapDataset):
         samples = payload["samples"]
         if list(samples.index.names) != ID_COLUMNS:
             raise RuntimeError(f"CU tree samples must be indexed by {ID_COLUMNS}")
-        if payload.get("format") != "cu_tree_binary_v1":
+        label_format = payload.get("format")
+        if label_format != "cu_tree_numpy":
             raise RuntimeError(
                 f"Unsupported CU tree label format in {self.cu_tree_path}. "
                 "Regenerate with the current createDataset.py/createDataset96.py --action cu-tree."
@@ -196,15 +197,15 @@ class IdAlignedGridmapCuTreeDataset(IdAlignedGridmapDataset):
         tree_sample_indices = samples.loc[common_index, "sample_index"].to_numpy(dtype=np.int64)
         self.tree_sample_indices = tree_sample_indices
         self.node_offsets = payload["offsets"]
-        nodes_path = self.cu_tree_path.with_name(payload["nodes_file"])
+        nodes_path = self.cu_tree_path.with_name(payload["array_file"])
         if not nodes_path.exists():
             raise FileNotFoundError(f"CU tree node array not found: {nodes_path}")
-        self.node_memmap = np.memmap(
-            nodes_path,
-            mode="r",
-            dtype=np.dtype(payload["node_dtype"]),
-            shape=tuple(payload["node_shape"]),
-        )
+        self.node_memmap = np.load(nodes_path, mmap_mode="r")
+        expected_shape = tuple(payload["array_shape"])
+        if tuple(self.node_memmap.shape) != expected_shape:
+            raise RuntimeError(
+                f"CU tree node array shape mismatch: {self.node_memmap.shape} != {expected_shape}"
+            )
         print(
             f"{component} {type}: loaded CU tree labels from {self.cu_tree_path.name}, "
             f"{len(self.tree_sample_indices):,} aligned samples, "
@@ -262,6 +263,23 @@ def classifier_node_loss(classifier, pred_gridmap, node_batch, ce_loss):
         correct += torch.sum(torch.argmax(logits, dim=1) == labels).item()
 
     return torch.stack(losses).mean(), correct / float(total_nodes), total_nodes
+
+
+def grid_positive_counts(pred_gridmap, label_gridmap, threshold=GRID_POSITIVE_THRESHOLD):
+    pred_positive = pred_gridmap >= threshold
+    label_positive = label_gridmap >= threshold
+    true_positive = torch.logical_and(pred_positive, label_positive).sum().item()
+    false_positive = torch.logical_and(pred_positive, ~label_positive).sum().item()
+    false_negative = torch.logical_and(~pred_positive, label_positive).sum().item()
+    return true_positive, false_positive, false_negative
+
+
+def precision_recall(true_positive, false_positive, false_negative):
+    precision_den = true_positive + false_positive
+    recall_den = true_positive + false_negative
+    precision = true_positive / float(precision_den) if precision_den > 0 else 0.0
+    recall = true_positive / float(recall_den) if recall_den > 0 else 0.0
+    return precision, recall
 
 
 def train_one_epoch(
@@ -344,8 +362,10 @@ def _run_joint_epoch(
     accu_loss = torch.zeros(1).to(device)
     accu_grid_loss = torch.zeros(1).to(device)
     accu_cls_loss = torch.zeros(1).to(device)
-    accu_grid_acc = torch.zeros(1).to(device)
     accu_cls_acc = torch.zeros(1).to(device)
+    grid_tp = 0
+    grid_fp = 0
+    grid_fn = 0
     total_cls_nodes = 0
 
     progress = tqdm(data_loader, file=sys.stdout)
@@ -366,7 +386,11 @@ def _run_joint_epoch(
         )
         loss = grid_weight * grid_loss + cls_weight * cls_loss
 
-        grid_acc = torch.sum(abs(pred_gridmap - gridmap_batch) <= GRID_ACC_DELTA).item() / float(pred_gridmap.numel())
+        tp, fp, fn = grid_positive_counts(pred_gridmap, gridmap_batch)
+        grid_tp += tp
+        grid_fp += fp
+        grid_fn += fn
+        grid_precision, grid_recall = precision_recall(grid_tp, grid_fp, grid_fn)
 
         if training:
             loss.backward()
@@ -379,14 +403,13 @@ def _run_joint_epoch(
         accu_loss += loss.detach()
         accu_grid_loss += grid_loss.detach()
         accu_cls_loss += cls_loss.detach()
-        accu_grid_acc += grid_acc
         accu_cls_acc += cls_acc
         total_cls_nodes += cls_nodes
 
         phase = "train" if training else "valid"
         progress.desc = (
             "[{} {} epoch {}] loss: {:.6f}, grid: {:.6f}, cls: {:.6f}, "
-            "grid_acc: {:.6f}, cls_acc: {:.6f}, cls_nodes: {:.2f}"
+            "grid_precision: {:.6f}, grid_recall: {:.6f}, cls_acc: {:.6f}, cls_nodes: {:.2f}"
         ).format(
             phase,
             stage_name,
@@ -394,17 +417,20 @@ def _run_joint_epoch(
             accu_loss.item() / (step + 1),
             accu_grid_loss.item() / (step + 1),
             accu_cls_loss.item() / (step + 1),
-            accu_grid_acc.item() / (step + 1),
+            grid_precision,
+            grid_recall,
             accu_cls_acc.item() / (step + 1),
             total_cls_nodes / float(step + 1),
         )
 
     step_count = step + 1
+    grid_precision, grid_recall = precision_recall(grid_tp, grid_fp, grid_fn)
     return (
         accu_loss.item() / step_count,
         accu_grid_loss.item() / step_count,
         accu_cls_loss.item() / step_count,
-        accu_grid_acc.item() / step_count,
+        grid_precision,
+        grid_recall,
         accu_cls_acc.item() / step_count,
         total_cls_nodes / float(step_count),
     )
