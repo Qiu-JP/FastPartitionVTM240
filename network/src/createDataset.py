@@ -437,14 +437,16 @@ def reconstruct_classifier_nodes_from_records(records, block_size):
 def convert_component_partition_to_cu_tree(component, partition_info_path, save_path, block_size):
     require_pandas()
     log_progress(f"start {component} CU tree labels from {partition_info_path}")
+    paths.ensure_dir(save_path.parent)
     sample_rows = []
     offsets = [0]
     sample_index = 0
     total_nodes = 0
     start_time = time.time()
-    nodes_path = save_path.with_name(f"{component}_CU_Tree_Nodes.i2.bin")
+    nodes_path = save_path.with_suffix(".npy")
+    raw_nodes_path = save_path.with_name(f"{component}_CU_Tree_Nodes.tmp.i2.bin")
 
-    with open(nodes_path, "wb") as nodes_fp:
+    with open(raw_nodes_path, "wb") as nodes_fp:
         for key, records in iter_partition_groups(partition_info_path):
             origin_x, origin_y, nodes = reconstruct_classifier_nodes_from_records(records, block_size)
             sequence_name, qp, frame_id, ctu_id = key
@@ -481,24 +483,41 @@ def convert_component_partition_to_cu_tree(component, partition_info_path, save_
     if total_nodes == 0:
         raise RuntimeError(f"No CU tree nodes generated from {partition_info_path}")
 
+    raw_nodes = np.memmap(raw_nodes_path, mode="r", dtype=np.int16, shape=(int(total_nodes), 5))
+    node_array = np.lib.format.open_memmap(
+        nodes_path,
+        mode="w+",
+        dtype=np.int16,
+        shape=(int(total_nodes), 5),
+    )
+    chunk_size = 1_000_000
+    for start in range(0, int(total_nodes), chunk_size):
+        end = min(start + chunk_size, int(total_nodes))
+        node_array[start:end] = raw_nodes[start:end]
+    node_array.flush()
+    del node_array
+    del raw_nodes
+    raw_nodes_path.unlink()
+
     samples_df = pd.DataFrame(sample_rows)
     samples_df = samples_df.set_index(ID_COLUMNS, drop=False)
     payload = {
-        "format": "cu_tree_binary_v1",
+        "format": "cu_tree_numpy",
         "component": component,
         "block_size": block_size,
         "grid_size": block_size // 4,
         "id_columns": ID_COLUMNS,
         "samples": samples_df,
         "node_columns": ["grid_y", "grid_x", "grid_h", "grid_w", "label"],
-        "nodes_file": nodes_path.name,
-        "node_dtype": "int16",
-        "node_shape": (int(total_nodes), 5),
+        "array_file": nodes_path.name,
+        "array_key": "cu_tree_nodes",
+        "array_shape": (int(total_nodes), 5),
+        "array_dtype": "int16",
         "offsets": np.asarray(offsets, dtype=np.int64),
         "class_order": ["NO_SPLIT", "QT", "BTH", "BTV", "TTH", "TTV"],
     }
-    paths.ensure_dir(save_path.parent)
     pd.to_pickle(payload, save_path)
+    log_progress(f"saved {component} CU tree node array to {nodes_path}")
     log_progress(f"saved {component} CU tree labels to {save_path}")
     return save_path
 
