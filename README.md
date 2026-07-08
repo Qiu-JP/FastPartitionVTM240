@@ -32,7 +32,7 @@ docs/             原理说明、模型细节和集成文档
 
 2. 使用 `network/src/createDataset.py` 创建网络训练数据集
 
-   标准划分文本生成后，进入 `network/` 侧的数据处理流程。`createDataset.py` 会把 `data/video/` 中的原始亮度像素和 `data/partition/` 中的 VTM 划分记录整理成两个网络需要的训练数据：一部分是 Swin gridmap 预测网络使用的 64x64 亮度 input 及其 2 通道、16x16 gridmap 标签；另一部分是 `Classifier_I` 使用的局部 gridmap ROI 及其对应的 CU 划分类型标签。生成 input 时需要根据序列清单读取原始 YUV 的文件名、宽高和帧数等元信息；生成 gridmap 和划分类型标签时主要依赖标准 VTM 导出的划分记录。最终数据统一保存到 `data/dataset/`，供后续训练、验证和推理读取。
+   标准划分文本生成后，进入 `network/` 侧的数据处理流程。`createDataset.py` 会把 `data/video/` 中的原始 YUV 像素和 `data/partition/` 中的 VTM 划分记录整理成两个网络需要的训练数据：一部分是 Swin gridmap 预测网络使用的 Luma/Chroma input 及其 gridmap 标签，其中 Luma 为 64x64 input 和 2 通道、16x16 gridmap，Chroma 为 32x32 input 和 2 通道、8x8 gridmap；另一部分是 `Classifier_I` 使用的局部 gridmap ROI 及其对应的 CU 划分类型标签。生成 input 时需要根据序列清单读取原始 YUV 的文件名、宽高和帧数等元信息；生成 gridmap 和划分类型标签时主要依赖标准 VTM 导出的划分记录。最终数据统一保存到 `data/dataset/`，供后续训练、验证和推理读取。
 
 3. 使用 `network/src/train.py` 训练划分预测模型
 
