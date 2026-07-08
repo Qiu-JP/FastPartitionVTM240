@@ -18,6 +18,7 @@ from utils import (
     adjust_learning_rate,
     collate_gridmap_with_nodes,
     evaluate,
+    add_gridmap_prediction_image,
     IdAlignedGridmapCuTreeDataset,
     train_one_epoch,
     train_one_epoch_classifier,
@@ -67,6 +68,52 @@ def setup_tensorboard(args, log_out_dir):
     return writer
 
 
+def add_classifier_shape_scalars(tb_writer, phase, shape_stats, epoch):
+    for shape_name, stats in shape_stats.items():
+        tb_writer.add_scalar(f"Classifier/{phase}/{shape_name}/loss", stats["loss"], epoch)
+        tb_writer.add_scalar(f"Classifier/{phase}/{shape_name}/acc", stats["acc"], epoch)
+
+
+def parse_tb_image_sample_spec(spec):
+    samples = []
+    for item in spec.split(','):
+        item = item.strip()
+        if not item:
+            continue
+        if ':' in item:
+            name, index = item.split(':', 1)
+        else:
+            index = item
+            name = f"sample_{len(samples)}"
+        samples.append((name.strip(), int(index)))
+    if not samples:
+        raise ValueError("TensorBoard image sample spec is empty")
+    return samples
+
+
+def resolve_tb_image_samples(args):
+    if args.tbImageSampleIndex is not None:
+        sample = [("sample", args.tbImageSampleIndex)]
+        return sample, sample
+    return (
+        parse_tb_image_sample_spec(args.tbTrainImageSamples),
+        parse_tb_image_sample_spec(args.tbValImageSamples),
+    )
+
+
+def add_gridmap_sample_set(tb_writer, phase, model, dataset, samples, device, epoch):
+    for sample_name, sample_index in samples:
+        add_gridmap_prediction_image(
+            tb_writer=tb_writer,
+            tag=f"Gridmap/{phase}/{sample_name}",
+            model=model,
+            dataset=dataset,
+            sample_index=sample_index,
+            device=device,
+            epoch=epoch,
+        )
+
+
 def load_model_weights(model, checkpoint_path, device, model_name):
     if checkpoint_path is None:
         return
@@ -89,6 +136,7 @@ def train_SwinTransU(args):
     Net = model64().to(device)
     Classifier = classifier_i().to(device)
 
+    load_model_weights(Net, args.swinCkpt, device, "SwinTransformer_Unet_Luma")
     load_model_weights(Classifier, args.classifierCkpt, device, "Classifier_I")
 
     log_out_dir = os.path.join(str(paths.output_root()), args.outDir, args.jobID)
@@ -103,8 +151,8 @@ def train_SwinTransU(args):
     with open(log_dir, 'a') as f:
         s = (
             "epoch_num, stage, grid_weight, cls_weight, lr, epoch_loss, grid_loss, cls_loss, "
-            "grid_accu, cls_accu, avg_cls_nodes, val_loss, val_grid_loss, val_cls_loss, "
-            "val_grid_accu, val_cls_accu, val_avg_cls_nodes\n"
+            "grid_precision, grid_recall, cls_accu, avg_cls_nodes, val_loss, val_grid_loss, val_cls_loss, "
+            "val_grid_precision, val_grid_recall, val_cls_accu, val_avg_cls_nodes\n"
         )
         f.write(s)
         for s in [
@@ -156,6 +204,7 @@ def train_SwinTransU(args):
     optimizer = optim.AdamW(pg, lr=args.lr, weight_decay=5E-2)
     grid_loss_fn = get_loss_function(args.gridLossType)
     cls_loss_fn = nn.CrossEntropyLoss()
+    tb_train_samples, tb_val_samples = resolve_tb_image_samples(args)
 
     def stage_config(epoch):
         if epoch < args.jointStage1Epoch:
@@ -199,16 +248,22 @@ def train_SwinTransU(args):
             tb_writer.add_scalar("Loss/train_total", train_metrics[0], epoch)
             tb_writer.add_scalar("Loss/train_grid", train_metrics[1], epoch)
             tb_writer.add_scalar("Loss/train_cls", train_metrics[2], epoch)
-            tb_writer.add_scalar("Accu/train_grid", train_metrics[3], epoch)
-            tb_writer.add_scalar("Accu/train_cls", train_metrics[4], epoch)
+            tb_writer.add_scalar("Grid/train_precision", train_metrics[3], epoch)
+            tb_writer.add_scalar("Grid/train_recall", train_metrics[4], epoch)
+            tb_writer.add_scalar("Accu/train_cls", train_metrics[5], epoch)
             tb_writer.add_scalar("Loss/val_total", val_metrics[0], epoch)
             tb_writer.add_scalar("Loss/val_grid", val_metrics[1], epoch)
             tb_writer.add_scalar("Loss/val_cls", val_metrics[2], epoch)
-            tb_writer.add_scalar("Accu/val_grid", val_metrics[3], epoch)
-            tb_writer.add_scalar("Accu/val_cls", val_metrics[4], epoch)
+            tb_writer.add_scalar("Grid/val_precision", val_metrics[3], epoch)
+            tb_writer.add_scalar("Grid/val_recall", val_metrics[4], epoch)
+            tb_writer.add_scalar("Accu/val_cls", val_metrics[5], epoch)
             tb_writer.add_scalar("Weight/grid", grid_weight, epoch)
             tb_writer.add_scalar("Weight/cls", cls_weight, epoch)
             tb_writer.add_scalar("LR", optimizer.param_groups[0]["lr"], epoch)
+            add_classifier_shape_scalars(tb_writer, "train", train_metrics[7], epoch)
+            add_classifier_shape_scalars(tb_writer, "val", val_metrics[7], epoch)
+            add_gridmap_sample_set(tb_writer, "train", Net, train_dataset, tb_train_samples, device, epoch)
+            add_gridmap_sample_set(tb_writer, "val", Net, val_dataset, tb_val_samples, device, epoch)
             tb_writer.flush()
 
         if (epoch + 1) % 10 == 0:
@@ -219,7 +274,7 @@ def train_SwinTransU(args):
               '***********************************************************************')
         print(
             "Epoch: {} Stage: {} GridW: {:.6f} ClsW: {:.6f} "
-            "Loss: {:.6f} Grid: {:.6f} Cls: {:.6f} GridAcc: {:.6f} ClsAcc: {:.6f}".format(
+            "Loss: {:.6f} Grid: {:.6f} Cls: {:.6f} GridPrecision: {:.6f} GridRecall: {:.6f} ClsAcc: {:.6f}".format(
                 epoch,
                 stage_name,
                 grid_weight,
@@ -229,22 +284,32 @@ def train_SwinTransU(args):
                 train_metrics[2],
                 train_metrics[3],
                 train_metrics[4],
+                train_metrics[5],
             )
         )
         print(
-            "Val: Loss: {:.6f} Grid: {:.6f} Cls: {:.6f} GridAcc: {:.6f} ClsAcc: {:.6f}".format(
+            "Val: Loss: {:.6f} Grid: {:.6f} Cls: {:.6f} GridPrecision: {:.6f} GridRecall: {:.6f} ClsAcc: {:.6f}".format(
                 val_metrics[0],
                 val_metrics[1],
                 val_metrics[2],
                 val_metrics[3],
                 val_metrics[4],
+                val_metrics[5],
             )
         )
         print('***********************************************************************'
               '***********************************************************************')
 
         with open(log_dir, 'a') as f:
-            for s in [epoch, stage_name, grid_weight, cls_weight, optimizer.param_groups[0]["lr"], *train_metrics, *val_metrics]:
+            for s in [
+                epoch,
+                stage_name,
+                grid_weight,
+                cls_weight,
+                optimizer.param_groups[0]["lr"],
+                *train_metrics[:7],
+                *val_metrics[:7],
+            ]:
                 f.write(str(s))
                 f.write(',')
             f.write('\n')
@@ -265,8 +330,8 @@ def pretrain_Classifier(args):
 
     Net = Net.to(device)
 
-    path = paths.dataset_root() / 'Classifier_I' / 'pretrain_logical'
-    
+    path = paths.dataset_root() / 'pretrain' / 'Classifier_I' / 'logical'
+
     log_out_dir = os.path.join(str(paths.output_root()), args.outDir, args.jobID)
     ckpt_out_dir = os.path.join(str(paths.checkpoints_root()), args.outDir, args.jobID)
 
@@ -316,17 +381,18 @@ def pretrain_Classifier(args):
         adjust_learning_rate(args.lr, optimizer, epoch, args.dr)
 
         random.shuffle(train_dataLoaders)
-        train_loss, train_acc = train_one_epoch_classifier(model=Net,
-                                                           optimizer=optimizer,
-                                                           data_loaders=train_dataLoaders,
-                                                           device=device,
-                                                           epoch=epoch,
-                                                           lossFunction="CE")
+        train_loss, train_acc, shape_stats = train_one_epoch_classifier(model=Net,
+                                                                        optimizer=optimizer,
+                                                                        data_loaders=train_dataLoaders,
+                                                                        device=device,
+                                                                        epoch=epoch,
+                                                                        lossFunction="CE")
 
         if tb_writer is not None:
             tb_writer.add_scalar("Loss/train", train_loss, epoch)
             tb_writer.add_scalar("Accu/train", train_acc, epoch)
             tb_writer.add_scalar("LR", optimizer.param_groups[0]["lr"], epoch)
+            add_classifier_shape_scalars(tb_writer, "pretrain", shape_stats, epoch)
             tb_writer.flush()
 
         if (epoch + 1) % 10 == 0:
@@ -343,7 +409,7 @@ def pretrain_Classifier(args):
                 f.write(str(s))
                 f.write(',')
             f.write('\n')
-        
+
         print('Epoch ' + str(epoch) + ' done.')
 
     torch.save(Net.state_dict(), os.path.join(ckpt_out_dir, "model-final.pth"))
@@ -368,6 +434,10 @@ if __name__ == '__main__':
     parser.add_argument('--valSplit', type=str, default='validating')
     parser.add_argument('--component', type=str, choices=['Luma'], default='Luma')
     parser.add_argument('--tbLogDir', type=str, default=None, help='TensorBoard log directory')
+    parser.add_argument('--tbImageSampleIndex', type=int, default=None, help='Optional fixed sample index for both train and val TensorBoard gridmap images')
+    parser.add_argument('--tbTrainImageSamples', type=str, default='simple:1989496,medium:819088,complex:320136', help='Comma-separated training TensorBoard gridmap samples, e.g. simple:0,medium:1,complex:2')
+    parser.add_argument('--tbValImageSamples', type=str, default='simple:116602,medium:54490,complex:121714', help='Comma-separated validation TensorBoard gridmap samples, e.g. simple:0,medium:1,complex:2')
+    parser.add_argument('--swinCkpt', type=str, default=None, help='Optional Swin checkpoint to resume from')
     parser.add_argument('--classifierCkpt', type=str, default=None, help='Optional Classifier_I checkpoint to resume from')
     parser.add_argument('--gridLossType', type=str, default='BCE', choices=['BCE', 'L1', 'HUBER', 'MSE'], help='Loss function for Swin gridmap supervision')
     parser.add_argument('--jointStage1Epoch', type=int, default=50, help='Epoch threshold for joint training stage 1')
