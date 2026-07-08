@@ -1448,6 +1448,13 @@ void EncApp::xInitLibCfg( int layerIdx )
   m_cEncLib.setSliceLevelAlf                                     ( m_sliceLevelAlf  );
   m_cEncLib.setUseScalingListId                                  ( m_useScalingListId  );
   m_cEncLib.setScalingListFileName                               ( m_scalingListFileName );
+#if FastPartition
+  m_cEncLib.setFastPartitionSwinModel                            ( m_fastPartitionSwinModel );
+  m_cEncLib.setFastPartitionClassifierModel                      ( m_fastPartitionClassifierModel );
+  m_cEncLib.setFastPartitionPreset                               ( m_fastPartitionPreset );
+  m_cEncLib.setFastPartitionThreshold                            ( m_fastPartitionThreshold );
+  m_cEncLib.setFastPartitionThresholds                           ( m_fastPartitionTh );
+#endif
   m_cEncLib.setDisableScalingMatrixForLfnstBlks                  ( m_disableScalingMatrixForLfnstBlks);
   m_cEncLib.setDisableScalingMatrixForAlternativeColourSpace(m_disableScalingMatrixForAlternativeColourSpace);
 

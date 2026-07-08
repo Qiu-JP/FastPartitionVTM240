@@ -1928,7 +1928,6 @@ void EncModeCtrlMTnoRQT::finishCULevel( Partitioner &partitioner )
   m_ComprCUCtxList.pop_back();
 }
 
-
 bool EncModeCtrlMTnoRQT::tryMode( const EncTestMode& encTestmode, const CodingStructure &cs, Partitioner& partitioner )
 {
   ComprCUCtx& cuECtx = m_ComprCUCtxList.back();
@@ -2777,4 +2776,3 @@ bool EncModeCtrlMTnoRQT::useModeResult( const EncTestMode& encTestmode, CodingSt
     return false;
   }
 }
-

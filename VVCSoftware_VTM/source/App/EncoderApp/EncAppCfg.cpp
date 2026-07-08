@@ -1429,6 +1429,13 @@ bool EncAppCfg::parseCfg( int argc, char* argv[] )
   ("EntryPointsPresent",                              m_entryPointPresentFlag,                           true, "0: entry points is not present; 1 entry points may be present in slice header")
   ("ScalingList",                                     m_useScalingListId,                    SCALING_LIST_OFF, "0/off: no scaling list, 1/default: default scaling lists, 2/file: scaling lists specified in ScalingListFile")
   ("ScalingListFile",                                 m_scalingListFileName,                       std::string(""), "Scaling list file name. Use an empty string to produce help.")
+#if FastPartition
+  ("FastPartitionSwinModel",                          m_fastPartitionSwinModel,                    std::string(""), "FastPartition SwinTransformer_Unet_Luma96 TorchScript model file name")
+  ("FastPartitionClassifierModel",                    m_fastPartitionClassifierModel,              std::string(""), "FastPartition Classifier_I TorchScript model file name")
+  ("FastPartitionPreset",                             m_fastPartitionPreset,                       std::string("all"), "FastPartition classifier preset: all, fast, or middle")
+  ("FastPartitionThreshold",                          m_fastPartitionThreshold,                    -1.0, "FastPartition classifier threshold override. Negative values use FastPartitionPreset.")
+  ("FastPartitionTh",                                 m_fastPartitionTh,                            std::string(""), "FastPartition thresholds [NO_SPLIT,QT,BTH,BTV,TTH,TTV]")
+#endif
   ("DisableScalingMatrixForLFNST",                    m_disableScalingMatrixForLfnstBlks,                true, "Disable scaling matrices, when enabled, for LFNST-coded blocks")
   ("DisableScalingMatrixForAlternativeColourSpace",   m_disableScalingMatrixForAlternativeColourSpace,  false, "Disable scaling matrices when the colour space is not equal to the designated colour space of scaling matrix")
   ("ScalingMatrixDesignatedColourSpace",              m_scalingMatrixDesignatedColourSpace,              true, "Indicates if the designated colour space of scaling matrices is equal to the original colour space")

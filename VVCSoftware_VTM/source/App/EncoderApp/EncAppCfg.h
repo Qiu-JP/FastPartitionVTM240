@@ -965,6 +965,13 @@ protected:
 
   ScalingListMode m_useScalingListId;                         ///< using quantization matrix
   std::string m_scalingListFileName;                          ///< quantization matrix file name
+#if FastPartition
+  std::string m_fastPartitionSwinModel;                        ///< FastPartition Swin luma TorchScript model file name
+  std::string m_fastPartitionClassifierModel;                  ///< FastPartition Classifier_I TorchScript model file name
+  std::string m_fastPartitionPreset;                           ///< FastPartition classifier preset
+  double      m_fastPartitionThreshold;                        ///< FastPartition classifier threshold override
+  std::string m_fastPartitionTh;                               ///< FastPartition per-class thresholds
+#endif
   bool      m_disableScalingMatrixForLfnstBlks;
   bool      m_disableScalingMatrixForAlternativeColourSpace;
   bool      m_scalingMatrixDesignatedColourSpace;
@@ -1315,4 +1322,3 @@ public:
 //! \}
 
 #endif // __ENCAPPCFG__
-
