@@ -11,6 +11,9 @@ except ImportError:
 
 import paths
 
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
+
 
 DATA_TYPE_TO_NAME = {
     1: "Training",
@@ -70,6 +73,36 @@ COMPONENT_ALIASES = {
     "luma": ("Luma",),
     "chroma": ("Chroma",),
 }
+
+CLASSIFIER_I_CLASS_NAMES = {
+    0: "NO_SPLIT",
+    1: "QT",
+    2: "BTH",
+    3: "BTV",
+    4: "TTH",
+    5: "TTV",
+}
+
+CLASSIFIER_I_GRID_SPECS = {
+    (16, 16): [0, 1],
+    (8, 8): [0, 1, 2, 3, 4, 5],
+    (8, 4): [0, 2, 3, 4, 5],
+    (4, 8): [0, 2, 3, 4, 5],
+    (8, 2): [0, 2, 3, 4],
+    (2, 8): [0, 2, 3, 5],
+    (8, 1): [0, 2, 4],
+    (1, 8): [0, 3, 5],
+    (4, 2): [0, 2, 3, 4],
+    (2, 4): [0, 2, 3, 5],
+    (4, 1): [0, 2, 4],
+    (1, 4): [0, 3, 5],
+    (4, 4): [0, 1, 2, 3, 4, 5],
+    (2, 2): [0, 2, 3],
+    (2, 1): [0, 2],
+    (1, 2): [0, 3],
+}
+
+CLASSIFIER_I_PRETRAIN_SAMPLES_PER_CLASS = 256
 
 PROGRESS_INTERVAL = 500000
 
@@ -238,37 +271,208 @@ def iter_partition_groups(partition_info_path, progress_interval=PROGRESS_INTERV
     )
 
 
-def save_gridmap_preview(gridmaps, output_path, block_size, title):
-    require_matplotlib()
-    if gridmaps.size == 0:
-        return
-    edge_counts = gridmaps[:, 0].sum(axis=(1, 2)) + gridmaps[:, 1].sum(axis=(1, 2))
-    block_idx = int(np.argmax(edge_counts))
-    arr = gridmaps[block_idx]
-    grid_size = arr.shape[1]
+def normalize_preview_image(image):
+    image = image.astype(np.float32)
+    if image.ndim == 3:
+        if np.max(image) > 1.0:
+            image = image / 255.0
+        return np.clip(image, 0.0, 1.0)
+    min_val = float(np.min(image))
+    max_val = float(np.max(image))
+    if max_val <= min_val:
+        return np.zeros_like(image, dtype=np.float32)
+    return (image - min_val) / (max_val - min_val)
 
-    fig, ax = plt.subplots()
-    for i in range(grid_size):
-        for j in range(grid_size):
-            ax.add_line(mlines.Line2D([(j + 1) * 4, (j + 1) * 4], [i * 4, (i + 1) * 4], color='black', linewidth=0.6, linestyle=':'))
-            ax.add_line(mlines.Line2D([j * 4, (j + 1) * 4], [(i + 1) * 4, (i + 1) * 4], color='black', linewidth=0.6, linestyle=':'))
-    for i in range(grid_size):
-        for j in range(grid_size):
-            ax.add_line(mlines.Line2D([(j + 1) * 4, (j + 1) * 4], [i * 4, (i + 1) * 4], color='orange', linewidth=2, alpha=arr[0, i, j]))
-            ax.add_line(mlines.Line2D([j * 4, (j + 1) * 4], [(i + 1) * 4, (i + 1) * 4], color=(0 / 255, 47 / 255, 167 / 255), linewidth=2, alpha=arr[1, i, j]))
-    ax.set_xlim(0, block_size)
-    ax.set_ylim(0, block_size)
-    ax.invert_yaxis()
+
+def yuv_to_rgb(yuv):
+    yuv = yuv.astype(np.float32)
+    y = yuv[..., 0]
+    u = yuv[..., 1] - 128.0
+    v = yuv[..., 2] - 128.0
+    rgb = np.stack(
+        (
+            y + 1.402 * v,
+            y - 0.344136 * u - 0.714136 * v,
+            y + 1.772 * u,
+        ),
+        axis=-1,
+    )
+    return np.clip(rgb, 0.0, 255.0)
+
+
+def upsample_nearest(channel, target_shape):
+    y_scale = target_shape[0] // channel.shape[0]
+    x_scale = target_shape[1] // channel.shape[1]
+    if y_scale <= 0 or x_scale <= 0:
+        raise ValueError(f"Cannot upsample {channel.shape} to {target_shape}")
+    return np.repeat(np.repeat(channel, y_scale, axis=0), x_scale, axis=1)[:target_shape[0], :target_shape[1]]
+
+
+def read_payload_array(dataset_dir, component, kind):
+    pkl_path = dataset_dir / f"{component}_{kind}.pkl"
+    if not pkl_path.exists():
+        raise FileNotFoundError(f"{pkl_path} not found")
+    payload = pd.read_pickle(pkl_path)
+    if not isinstance(payload, dict) or "array_file" not in payload:
+        raise RuntimeError(f"{pkl_path} is not in the current metadata format")
+    array_path = dataset_dir / payload["array_file"]
+    if not array_path.exists():
+        raise FileNotFoundError(f"{array_path} not found")
+    return payload, np.load(array_path, mmap_mode="r")
+
+
+def sample_position(ids, sample_id=None, sample_index=None):
+    if sample_id is not None:
+        if sample_id not in ids.index:
+            raise KeyError(f"Sample id not found: {sample_id}")
+        return int(ids.loc[sample_id, "sample_index"])
+    if sample_index is None:
+        raise ValueError("Either sample_id or sample_index must be provided")
+    if sample_index < 0 or sample_index >= len(ids):
+        raise IndexError(f"sample_index {sample_index} out of range [0, {len(ids)})")
+    return int(sample_index)
+
+
+def select_preview_sample(gridmap_payload, gridmap_array, sample_id=None, sample_index=None):
+    ids = gridmap_payload["ids"]
+    if sample_id is not None or sample_index is not None:
+        pos = sample_position(ids, sample_id=sample_id, sample_index=sample_index)
+    else:
+        edge_counts = gridmap_array[:, 0].sum(axis=(1, 2)) + gridmap_array[:, 1].sum(axis=(1, 2))
+        pos = int(np.argmax(edge_counts))
+    row = ids.iloc[pos]
+    resolved_id = tuple(row[column] for column in ID_COLUMNS)
+    return resolved_id, pos
+
+
+def build_preview_background(dataset_dir, sample_id, fallback_component):
+    luma_payload, luma_array = read_payload_array(dataset_dir, "Luma", "Input")
+    chroma_payload, chroma_array = read_payload_array(dataset_dir, "Chroma", "Input")
+    luma_ids = luma_payload["ids"]
+    chroma_ids = chroma_payload["ids"]
+    if sample_id not in luma_ids.index:
+        raise KeyError(f"Sample id not found in Luma input: {sample_id}")
+    if sample_id not in chroma_ids.index:
+        raise KeyError(f"Sample id not found in Chroma input: {sample_id}")
+
+    luma = luma_array[sample_position(luma_ids, sample_id=sample_id)][0]
+    chroma = chroma_array[sample_position(chroma_ids, sample_id=sample_id)]
+    u = upsample_nearest(chroma[0], luma.shape)
+    v = upsample_nearest(chroma[1], luma.shape)
+    return yuv_to_rgb(np.stack((luma, u, v), axis=-1))
+
+
+def format_gridmap_values(gridmap):
+    vertical = np.array2string(
+        np.asarray(gridmap[0]),
+        precision=2,
+        suppress_small=True,
+        max_line_width=120,
+        separator=" ",
+    )
+    horizontal = np.array2string(
+        np.asarray(gridmap[1]),
+        precision=2,
+        suppress_small=True,
+        max_line_width=120,
+        separator=" ",
+    )
+    return "gridmap[0] vertical\n{}\n\ngridmap[1] horizontal\n{}".format(vertical, horizontal)
+
+
+def draw_gridmap_panel(ax, value_ax, image, gridmap, title=None):
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Rectangle
+
+    grid_h, grid_w = gridmap.shape[-2:]
+    target_h, target_w = image.shape[:2] if image.ndim == 3 else image.shape[-2:]
+    unit_y = target_h / float(grid_h)
+    unit_x = target_w / float(grid_w)
+    image = normalize_preview_image(image)
+
+    if image.ndim == 3:
+        ax.imshow(image, extent=[0, target_w, target_h, 0])
+    else:
+        ax.imshow(image, cmap="gray", vmin=0, vmax=1, extent=[0, target_w, target_h, 0])
+
+    for y in range(grid_h):
+        for x in range(grid_w):
+            x_left = x * unit_x
+            x_right = (x + 1) * unit_x
+            y_top = y * unit_y
+            y_bottom = (y + 1) * unit_y
+            ax.add_line(Line2D([x_right, x_right], [y_top, y_bottom], color="black", linewidth=0.45, alpha=0.65, linestyle=":"))
+            ax.add_line(Line2D([x_left, x_right], [y_bottom, y_bottom], color="black", linewidth=0.45, alpha=0.65, linestyle=":"))
+            ax.add_line(Line2D([x_right, x_right], [y_top, y_bottom], color="orange", linewidth=2.0, alpha=float(np.clip(gridmap[0, y, x], 0.0, 1.0))))
+            ax.add_line(Line2D([x_left, x_right], [y_bottom, y_bottom], color=(0 / 255, 160 / 255, 255 / 255), linewidth=2.0, alpha=float(np.clip(gridmap[1, y, x], 0.0, 1.0))))
+
+    ax.add_patch(Rectangle((0, 0), target_w, target_h, fill=False, edgecolor="black", linewidth=1.0))
+    if title:
+        ax.set_title(title)
+    ax.set_xlim(0, target_w)
+    ax.set_ylim(target_h, 0)
+    ax.set_aspect("equal")
     ax.xaxis.tick_top()
-    tick_values = list(range(0, block_size + 1, 16))
-    ax.set_xticks(tick_values)
-    ax.set_yticks(tick_values)
-    plt.title(f'{title} block {block_idx}')
-    plt.savefig(output_path)
+    ax.tick_params(axis="both", which="both", direction="out", length=3)
+    ax.set_xticks(list(range(0, int(target_w) + 1, 16)))
+    ax.set_yticks(list(range(0, int(target_h) + 1, 16)))
+
+    value_ax.axis("off")
+    value_ax.text(
+        0.0,
+        1.0,
+        format_gridmap_values(gridmap),
+        transform=value_ax.transAxes,
+        va="top",
+        ha="left",
+        family="monospace",
+        fontsize=5.6,
+    )
+
+
+def visualize_dataset_gridmap(data_type, dataset_name=None, component="luma", sample_id=None, sample_index=None, output_name=None):
+    require_pandas()
+    require_matplotlib()
+    dataset_name = resolve_dataset_name(data_type, dataset_name)
+    split_dir = resolve_split_dir(data_type)
+    component_name = COMPONENT_ALIASES[component][0]
+    dataset_dir = paths.dataset_root() / dataset_name / split_dir
+    gridmap_payload, gridmap_array = read_payload_array(dataset_dir, component_name, "Gridmap")
+
+    resolved_id, gridmap_pos = select_preview_sample(
+        gridmap_payload=gridmap_payload,
+        gridmap_array=gridmap_array,
+        sample_id=sample_id,
+        sample_index=sample_index,
+    )
+    image = build_preview_background(dataset_dir, resolved_id, component_name)
+    gridmap = gridmap_array[gridmap_pos]
+
+    if output_name is None:
+        seq, qp, frame_id, ctu_id = resolved_id
+        output_name = f"{dataset_name}_{split_dir}_{component_name}_{seq}_qp{qp}_f{frame_id}_ctu{ctu_id}_gridmap.png"
+    output_path = paths.ensure_dir(paths.network_root() / "figures") / Path(output_name).name
+
+    fig, (ax, value_ax) = plt.subplots(
+        1,
+        2,
+        figsize=(8.0, 4.0),
+        gridspec_kw={"width_ratios": [1.0, 1.25]},
+    )
+    draw_gridmap_panel(
+        ax,
+        value_ax,
+        image=image,
+        gridmap=gridmap,
+        title=f"{dataset_name} {split_dir} {component_name} {resolved_id}",
+    )
+    fig.savefig(output_path, dpi=120)
     plt.close(fig)
+    log_progress(f"saved {component_name} gridmap preview to {output_path}")
+    return output_path
 
 
-def convert_component_partition_to_gridmap(component, partition_info_path, save_path, block_size, show=False):
+def convert_component_partition_to_gridmap(component, partition_info_path, save_path, block_size):
     require_pandas()
     log_progress(f"start {component} gridmap from {partition_info_path}")
     ids = []
@@ -303,9 +507,6 @@ def convert_component_partition_to_gridmap(component, partition_info_path, save_
     log_progress(f"saved {component} gridmap array to {npy_path}")
     log_progress(f"saved {component} gridmap metadata to {save_path}")
 
-    if show:
-        preview_path = paths.ensure_dir(paths.output_root()) / f"{component}_gridmap_preview.png"
-        save_gridmap_preview(gridmap_arr, preview_path, block_size, component)
     return save_path
 
 
@@ -546,6 +747,65 @@ def convert_partition_to_cu_tree(data_type, block_size_map=None, dataset_name=No
     return output_paths
 
 
+def classifier_i_logical_gridmap(grid_h, grid_w, class_id):
+    gridmap = np.zeros((2, grid_h, grid_w), dtype=np.float32)
+
+    if class_id == 0:
+        return gridmap
+    if class_id == 1:
+        gridmap[0, :, grid_w // 2 - 1] = 1
+        gridmap[1, grid_h // 2 - 1, :] = 1
+        return gridmap
+    if class_id == 2:
+        gridmap[1, grid_h // 2 - 1, :] = 1
+        return gridmap
+    if class_id == 3:
+        gridmap[0, :, grid_w // 2 - 1] = 1
+        return gridmap
+    if class_id == 4:
+        gridmap[1, grid_h // 4 - 1, :] = 1
+        gridmap[1, (3 * grid_h) // 4 - 1, :] = 1
+        return gridmap
+    if class_id == 5:
+        gridmap[0, :, grid_w // 4 - 1] = 1
+        gridmap[0, :, (3 * grid_w) // 4 - 1] = 1
+        return gridmap
+
+    raise ValueError(f"Unsupported Classifier_I class id: {class_id}")
+
+
+def create_classifier_i_pretrain_logical_dataset():
+    save_root = paths.ensure_dir(paths.dataset_root() / "pretrain" / "Classifier_I" / "logical")
+    output_paths = []
+
+    for (grid_h, grid_w), allowed_classes in CLASSIFIER_I_GRID_SPECS.items():
+        gridmaps = []
+        labels = []
+
+        for class_id in allowed_classes:
+            minimal = classifier_i_logical_gridmap(grid_h, grid_w, class_id)
+            for _ in range(CLASSIFIER_I_PRETRAIN_SAMPLES_PER_CLASS):
+                gridmaps.append(minimal.copy())
+                labels.append(class_id)
+
+        gridmaps = np.stack(gridmaps, axis=0).astype(np.float32)
+        labels = np.asarray(labels, dtype=np.int64)
+
+        save_dir = paths.ensure_dir(save_root / f"{grid_h}x{grid_w}")
+        gridmap_path = save_dir / "gridmap.npy"
+        label_path = save_dir / "label.npy"
+        np.save(gridmap_path, gridmaps)
+        np.save(label_path, labels)
+        output_paths.append((gridmap_path, label_path))
+        class_names = ", ".join(CLASSIFIER_I_CLASS_NAMES[class_id] for class_id in allowed_classes)
+        log_progress(
+            f"saved Classifier_I logical pretrain {grid_h}x{grid_w}: "
+            f"{len(labels)} samples, classes [{class_names}]"
+        )
+
+    return output_paths
+
+
 def select_block_size_map(block_size_map, component):
     selected_components = COMPONENT_ALIASES[component]
     return {name: block_size_map[name] for name in selected_components}
@@ -570,7 +830,6 @@ def convert_partition_to_gridmap(data_type, block_size_map=None, show=False, dat
                 partition_info_path=partition_info_path,
                 save_path=save_path,
                 block_size=block_size,
-                show=show,
             )
         )
     return output_paths
@@ -769,9 +1028,23 @@ def build_argparser():
     parser.add_argument('--chroma-block-size', type=int, default=32)
     parser.add_argument('--component', choices=['both', 'luma', 'chroma'], default='both')
     parser.add_argument('--show', action='store_true')
+    parser.add_argument('--show-output', type=str, default=None)
+    parser.add_argument('--show-sample-index', type=int, default=None)
+    parser.add_argument('--show-sequence', type=str, default=None)
+    parser.add_argument('--show-qp', type=int, default=None)
+    parser.add_argument('--show-frame-id', type=int, default=None)
+    parser.add_argument('--show-ctu-id', type=int, default=None)
     parser.add_argument(
         '--action',
-        choices=['gridmap', 'input', 'gridmap-input', 'cu-tree', 'gridmap-input-cu-tree'],
+        choices=[
+            'gridmap',
+            'input',
+            'gridmap-input',
+            'cu-tree',
+            'gridmap-input-cu-tree',
+            'preview',
+            'classifier-pretrain',
+        ],
         default='gridmap-input',
     )
     return parser
@@ -787,7 +1060,6 @@ if __name__ == '__main__':
         convert_partition_to_gridmap(
             args.data_type,
             block_size_map=block_size_map,
-            show=args.show,
             dataset_name=args.dataset,
             component=args.component,
         )
@@ -805,4 +1077,25 @@ if __name__ == '__main__':
             block_size_map=block_size_map,
             dataset_name=args.dataset,
             component=args.component,
+        )
+    if args.action == 'classifier-pretrain':
+        create_classifier_i_pretrain_logical_dataset()
+    if args.show or args.action == 'preview':
+        show_id_fields = (args.show_sequence, args.show_qp, args.show_frame_id, args.show_ctu_id)
+        show_id_values = [value is not None for value in show_id_fields]
+        if any(show_id_values) and not all(show_id_values):
+            raise ValueError("--show-sequence, --show-qp, --show-frame-id, and --show-ctu-id must be provided together")
+        sample_id = None
+        if all(show_id_values):
+            sample_id = (args.show_sequence, args.show_qp, args.show_frame_id, args.show_ctu_id)
+        preview_component = args.component
+        if preview_component == "both":
+            preview_component = "luma"
+        visualize_dataset_gridmap(
+            data_type=args.data_type,
+            dataset_name=args.dataset,
+            component=preview_component,
+            sample_id=sample_id,
+            sample_index=args.show_sample_index,
+            output_name=args.show_output,
         )
