@@ -53,10 +53,6 @@ def checkpoints_root() -> Path:
     return network_root() / "checkpoints"
 
 
-def logs_root() -> Path:
-    return network_root() / "logs"
-
-
 def output_root() -> Path:
     return network_root() / "output"
 

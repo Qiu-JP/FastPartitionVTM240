@@ -7,8 +7,6 @@ data/**
 !data/CodecTrainCfg/.gitkeep
 !data/dataset/
 !data/dataset/.gitkeep
-!data/logs/
-!data/logs/.gitkeep
 !data/partition/
 !data/partition/.gitkeep
 !data/video/
