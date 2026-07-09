@@ -29,7 +29,7 @@ endif()
 
 set( EXTENSION_360_VIDEO OFF CACHE BOOL "If EXTENSION_360_VIDEO is on, 360Lib will be added" )
 set( EXTENSION_HDRTOOLS OFF CACHE BOOL "If EXTENSION_HDRTOOLS is on, HDRLib will be added" )
-set( FAST_PARTITION_LIBTORCH_ROOT "${CMAKE_SOURCE_DIR}/../libtorch" CACHE PATH "Path to bundled libtorch root" FORCE )
+set( FAST_PARTITION_LIBTORCH_ROOT "$ENV{HOME}/qiujp/libtorch" CACHE PATH "Path to libtorch root" )
 
 if (DEFINED ENABLE_TRACING)
   set( ENABLE_TRACING OFF CACHE BOOL "ENABLE_TRACING will be set to this value" )
