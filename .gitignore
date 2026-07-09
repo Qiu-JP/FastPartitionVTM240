@@ -11,10 +11,6 @@ data/**
 !data/partition/.gitkeep
 !data/video/
 !data/video/.gitkeep
-network/checkpoints/**
-!network/checkpoints/.gitkeep
-network/logs/**
-!network/logs/.gitkeep
 network/output/**
 !network/output/.gitkeep
 network/figures/**
