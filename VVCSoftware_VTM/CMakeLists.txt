@@ -64,7 +64,7 @@ if( FAST_PARTITION_ENABLED )
   endif()
   find_package( Torch REQUIRED )
   set( CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}" )
-  set( CMAKE_BUILD_RPATH "${FAST_PARTITION_LIBTORCH_ROOT}/lib" )
+  list(APPEND CMAKE_BUILD_RPATH "${FAST_PARTITION_LIBTORCH_ROOT}/lib")
 endif()
 
 # set verbose compile options
