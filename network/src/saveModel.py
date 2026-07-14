@@ -198,7 +198,10 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Export 64x64 trained checkpoints for C++ deployment.")
     parser.add_argument("--task", choices=("export_classifier", "swin_luma"), required=True)
     parser.add_argument("--checkpoint", required=True, help="Path to a .pth checkpoint under network/checkpoints.")
-    parser.add_argument("--output", required=True, help="Output .pt path.")
+    parser.add_argument(
+        "--output",
+        help="Output .pt path. Defaults to the checkpoint path with its suffix replaced by .pt.",
+    )
     parser.add_argument("--device", default="cpu")
     return parser.parse_args()
 
@@ -207,11 +210,15 @@ if __name__ == "__main__":
     args = parse_args()
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
     checkpoint_path = Path(args.checkpoint)
-    output_path = Path(args.output)
     if not checkpoint_path.is_absolute():
         checkpoint_path = paths.project_root() / checkpoint_path
-    if not output_path.is_absolute():
-        output_path = paths.project_root() / output_path
+
+    if args.output:
+        output_path = Path(args.output)
+        if not output_path.is_absolute():
+            output_path = paths.project_root() / output_path
+    else:
+        output_path = checkpoint_path.with_suffix(".pt")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if args.task == "export_classifier":
