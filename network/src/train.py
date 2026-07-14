@@ -447,7 +447,7 @@ if __name__ == '__main__':
     parser.add_argument('--stage2Lr', type=float, default=None, help='Joint stage 2 base learning rate, default uses --lr')
     parser.add_argument('--stage1GridLossWeight', type=float, default=1.0, help='Joint stage 1 gridmap loss weight')
     parser.add_argument('--stage1ClsLossWeight', type=float, default=0.02, help='Joint stage 1 classifier loss weight')
-    parser.add_argument('--stage2GridLossWeight', type=float, default=1.0, help='Joint stage 2 gridmap loss weight')
+    parser.add_argument('--stage2GridLossWeight', type=float, default=0.5, help='Joint stage 2 gridmap loss weight')
     parser.add_argument('--stage2ClsLossWeight', type=float, default=1.0, help='Joint stage 2 classifier loss weight')
 
     args = parser.parse_args()
