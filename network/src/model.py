@@ -1,19 +1,9 @@
-""" Swin Transformer
-A PyTorch impl of : `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows`
-    - https://arxiv.org/pdf/2103.14030
-
-Code/weights from https://github.com/microsoft/Swin-Transformer
-
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 import numpy as np
 from typing import Optional
-#from einops import rearrange
-
 
 def drop_path_f(x, drop_prob: float = 0., training: bool = False):
     """Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks).
@@ -102,7 +92,7 @@ class PatchEmbed(nn.Module):
         # padding
         # 如果输入图片的H，W不是patch_size的整数倍，需要进行padding
         pad_input = (torch.tensor(H) % self.patch_size[0] != 0) or (torch.tensor(W) % self.patch_size[1] != 0)
-        # padding在推理时遭遇非64整数倍图像边界可能会需要，训练过程中剔除了这一数据
+        # padding在推理时遭遇非patch_size整数倍图像边界可能会需要，训练过程中剔除了这一数据
         if pad_input:
             # to pad the last 3 dimensions,
             # (W_left, W_right, H_top,H_bottom, C_front, C_back)  在右下角padding
@@ -380,7 +370,6 @@ class SwinTransformerBlock(nn.Module):
             shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
         else:
             shifted_x = x
-            attn_mask = None
 
         # partition windows
         x_windows = window_partition(shifted_x, self.window_size)  # [nW*B, Mh, Mw, C]
@@ -495,10 +484,51 @@ class BasicLayer(nn.Module):
 
         return attn_mask
 
-    def forward(self, x, H, W, return_before_downsample=False):
-        attn_mask = self.create_mask(x, H, W)  # [nW, Mh*Mw, Mh*Mw]
+    def create_context_mask(self, H, W, target_resolution, shift_size):
+        target_h, target_w = target_resolution
+        Hp:int = int(np.ceil(H / self.window_size)) * self.window_size
+        Wp:int = int(np.ceil(W / self.window_size)) * self.window_size
+        device = next(self.parameters()).device
+
+        row_ids = torch.arange(Hp, device=device).view(Hp, 1).expand(Hp, Wp)
+        col_ids = torch.arange(Wp, device=device).view(1, Wp).expand(Hp, Wp)
+        valid = (row_ids < H) & (col_ids < W)
+        ctu = valid & (row_ids >= H - target_h) & (col_ids >= W - target_w)
+
+        # 0: neighbor, 1: target CTU, 2: pad.
+        region = torch.full((Hp, Wp), 2, dtype=torch.long, device=device)
+        region[valid] = 0
+        region[ctu] = 1
+        region = region.view(1, Hp, Wp, 1)
+
+        if shift_size > 0:
+            region = torch.roll(region, shifts=(-shift_size, -shift_size), dims=(1, 2))
+
+        region_windows = window_partition(region, self.window_size)
+        region_windows = region_windows.view(-1, self.window_size * self.window_size)
+        query_region = region_windows.unsqueeze(2)
+        key_region = region_windows.unsqueeze(1)
+
+        neighbor_query_ctu_key = (query_region == 0) & (key_region == 1)
+        real_query_pad_key = (query_region != 2) & (key_region == 2)
+        pad_query_real_key = (query_region == 2) & (key_region != 2)
+        mask = neighbor_query_ctu_key | real_query_pad_key | pad_query_real_key
+
+        context_mask = torch.zeros(
+            (region_windows.shape[0], self.window_size * self.window_size, self.window_size * self.window_size),
+            device=device,
+        )
+        context_mask = context_mask.masked_fill(mask, float(-100.0))
+        return context_mask
+
+    def forward(self, x, H, W, return_before_downsample=False, context_target_resolution=None):
+        shift_attn_mask = self.create_mask(x, H, W)  # [nW, Mh*Mw, Mh*Mw]
         for blk in self.blocks:
             blk.H, blk.W = H, W
+            attn_mask = shift_attn_mask if blk.shift_size > 0 else None
+            if context_target_resolution is not None:
+                context_mask = self.create_context_mask(H, W, context_target_resolution, blk.shift_size)
+                attn_mask = context_mask if attn_mask is None else attn_mask + context_mask
             if not torch.jit.is_scripting() and self.use_checkpoint:
                 x = checkpoint.checkpoint(blk, x, attn_mask)
             else:
@@ -525,7 +555,7 @@ class BasicLayer(nn.Module):
             flops += self.upsample.flops()
         return flops
 
-class SwinTransformer_Unet_Luma(nn.Module):
+class SwinTransformer_Unet_Luma96(nn.Module):
     r""" Swin Transformer
         A PyTorch impl of : `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows`  -
           https://arxiv.org/pdf/2103.14030
@@ -553,14 +583,26 @@ class SwinTransformer_Unet_Luma(nn.Module):
                  window_size=4, mlp_ratio=4., qkv_bias=True,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
                  norm_layer=nn.LayerNorm, patch_norm=True,
-                 use_checkpoint=False, **kwargs):
+                 use_checkpoint=False, input_size=96, target_size=64,
+                 use_context_mask=False, **kwargs):
         super().__init__()
+
+        if not isinstance(patch_size, int):
+            raise ValueError("SwinTransformer_Unet_Luma96 expects integer patch_size")
+        if target_size % patch_size != 0:
+            raise ValueError("target_size must be divisible by patch_size")
+        if (target_size // patch_size) % (2 ** len(depths_decoder)) != 0:
+            raise ValueError("target patch grid must be divisible by decoder upsample ratio")
 
         self.num_classes = num_classes
         self.num_layers = len(depths)
         self.num_layers_up = len(depths_decoder)
         self.embed_dim = embed_dim
         self.patch_norm = patch_norm
+        self.patch_size = patch_size
+        self.input_size = input_size
+        self.target_size = target_size
+        self.use_context_mask = use_context_mask
         # stage4输出特征矩阵的channels
         self.num_features = int(embed_dim * 2 ** (self.num_layers - 1))
         # 上采样完最终的channnels
@@ -661,6 +703,31 @@ class SwinTransformer_Unet_Luma(nn.Module):
         scale = 1.0 + torch.tanh(gamma)
         return x * scale.unsqueeze(1)
 
+    def target_resolution_at_level(self, level):
+        downsample_ratio = self.patch_size * (2 ** level)
+        if self.target_size % downsample_ratio != 0:
+            raise RuntimeError(
+                "target_size {} cannot map to level {} with ratio {}".format(
+                    self.target_size, level, downsample_ratio
+                )
+            )
+        return self.target_size // downsample_ratio, self.target_size // downsample_ratio
+
+    @staticmethod
+    def crop_bottom_right_tokens(x, H, W, target_h, target_w):
+        B, L, C = x.shape
+        if L != H * W:
+            raise RuntimeError("input feature has wrong size")
+        if target_h > H or target_w > W:
+            raise RuntimeError(
+                "target crop {}x{} exceeds feature size {}x{}".format(
+                    target_h, target_w, H, W
+                )
+            )
+        x = x.view(B, H, W, C)
+        x = x[:, H - target_h:H, W - target_w:W, :].contiguous()
+        return x.view(B, target_h * target_w, C), target_h, target_w
+
     def forward_features(self, x, qp=None):
         
         x, H, W = self.patch_embed(x)
@@ -670,7 +737,16 @@ class SwinTransformer_Unet_Luma(nn.Module):
         x_resolution = []
 
         for i_layer, layer in enumerate(self.layers):
-            x, H, W, skip, skip_h, skip_w = layer(x, H, W, return_before_downsample=True)
+            context_target_resolution = None
+            if self.use_context_mask:
+                context_target_resolution = self.target_resolution_at_level(i_layer)
+            x, H, W, skip, skip_h, skip_w = layer(
+                x,
+                H,
+                W,
+                return_before_downsample=True,
+                context_target_resolution=context_target_resolution,
+            )
             if i_layer < self.num_layers - 1:
                 x_downsample.append(skip)
                 x_resolution.append((skip_h, skip_w))
@@ -679,18 +755,25 @@ class SwinTransformer_Unet_Luma(nn.Module):
         return x, H, W, x_downsample, x_resolution
 
     def forward_up_features(self, x, H, W, x_downsample, x_resolution):
+        target_h, target_w = self.target_resolution_at_level(self.num_layers - 1)
+        x, H, W = self.crop_bottom_right_tokens(x, H, W, target_h, target_w)
+
         x = self.patch_expand_first(x, H, W)
         H, W = H * 2, W * 2
         for inx, layer_up in enumerate(self.layers_up):
             skip_index = self.num_layers_up - 1 - inx
             skip_h, skip_w = x_resolution[skip_index]
+            target_h, target_w = self.target_resolution_at_level(skip_index)
+            skip, skip_h, skip_w = self.crop_bottom_right_tokens(
+                x_downsample[skip_index], skip_h, skip_w, target_h, target_w
+            )
             if (H, W) != (skip_h, skip_w):
                 raise RuntimeError(
                     "Decoder feature size {}x{} does not match skip feature size {}x{}".format(
                         H, W, skip_h, skip_w
                     )
                 )
-            x = torch.cat([x, x_downsample[skip_index]], -1)
+            x = torch.cat([x, skip], -1)
             x = self.concat_back_dim[inx](x)
             x,H,W = layer_up(x,H,W)
  
@@ -700,6 +783,12 @@ class SwinTransformer_Unet_Luma(nn.Module):
 
     def forward(self, x, qp=None):
         # x: [B, L, C]
+        if x.shape[-2:] != (self.input_size, self.input_size):
+            raise ValueError(
+                "SwinTransformer_Unet_Luma96 expects input spatial size {}x{}, got {}x{}".format(
+                    self.input_size, self.input_size, x.shape[-2], x.shape[-1]
+                )
+            )
         x, H, W, x_downsample, x_resolution = self.forward_features(x, qp)
         x, H, W = self.forward_up_features(x, H, W, x_downsample, x_resolution)
         B, L, C = x.shape
@@ -710,7 +799,6 @@ class SwinTransformer_Unet_Luma(nn.Module):
         x = torch.sigmoid(x)
  
         return x
-    
     
 
 class Classifier_I(nn.Module):
@@ -767,7 +855,7 @@ class Classifier_I(nn.Module):
                 nn.Linear(hidden_channel, num_classes),
             )
 
-        # Static intra masks derived from network/vtm_split_mask_notes.md.
+        # Static intra masks derived from docs/network/vtm_split_mask_notes.md.
         # Order: [NO_SPLIT, QT, BTH, BTV, TTH, TTV].
         static_masks = {
             (16, 16): [1, 1, 0, 0, 0, 0],
@@ -846,20 +934,9 @@ class Classifier_I(nn.Module):
 
 if __name__ == "__main__":
     # 创建模型
-    model = SwinTransformer_Unet_Luma()
-    dummy_input = torch.randn(2, 1, 64, 64)
+    model = SwinTransformer_Unet_Luma96()
+    dummy_input = torch.randn(2, 1, 96, 96)
     dummy_qp = torch.tensor([[32.0 / 51.0], [37.0 / 51.0]], dtype=torch.float32)
-
-    dummy = torch.randn(2,2,16,16)
-    model2 = Classifier_I()
-    
-    output = model2(dummy)
-    output_probs = F.softmax(output,dim=1)
-
-    print(f"输入形状: {dummy.shape}")      # torch.Size([32, 2, 32, 32])
-    print(f"输出形状: {output_probs.shape}")    # torch.Size([32, 6])
-    print(f"概率示例:\n{output_probs[:2]}")     # 显示前两个样本的概率
-    print(f"概率和验证: {output_probs[:2].sum(dim=1)}")  # 应接近1.0
  
     print(f"Swin-Unet输入形状: {dummy_input.shape}")
     print(f"归一化QP形状: {dummy_qp.shape}")

@@ -27,6 +27,12 @@ DATA_TYPE_TO_SPLIT_DIR = {
     3: "validating",
 }
 
+DATA_TYPE_TO_OUTPUT_SPLIT_DIR = {
+    1: "training96",
+    2: "testing96",
+    3: "validating96",
+}
+
 DATA_TYPE_TO_DATASET = {
     1: "DIV2K",
     2: "HEVC_CTC",
@@ -61,6 +67,11 @@ ID_COLUMNS = ["sequence_name", "qp", "frame_id", "ctu_id"]
 DEFAULT_BLOCK_SIZE_MAP = {
     "Luma": 64,
     "Chroma": 32,
+}
+
+DEFAULT_INPUT_SIZE_MAP = {
+    "Luma": 96,
+    "Chroma": 48,
 }
 
 YUV420_COMPONENTS = {
@@ -124,6 +135,12 @@ def resolve_split_dir(data_type):
     if data_type not in DATA_TYPE_TO_SPLIT_DIR:
         raise ValueError(f"Unsupported data_type: {data_type}")
     return DATA_TYPE_TO_SPLIT_DIR[data_type]
+
+
+def resolve_output_split_dir(data_type):
+    if data_type not in DATA_TYPE_TO_OUTPUT_SPLIT_DIR:
+        raise ValueError(f"Unsupported data_type: {data_type}")
+    return DATA_TYPE_TO_OUTPUT_SPLIT_DIR[data_type]
 
 
 def resolve_dataset_name(data_type, dataset_name=None):
@@ -300,6 +317,15 @@ def yuv_to_rgb(yuv):
     return np.clip(rgb, 0.0, 255.0)
 
 
+def center_crop(image, crop_size):
+    h, w = image.shape[:2]
+    if h < crop_size or w < crop_size:
+        raise ValueError(f"Cannot crop {crop_size}x{crop_size} from image {image.shape}")
+    y0 = (h - crop_size) // 2
+    x0 = (w - crop_size) // 2
+    return image[y0:y0 + crop_size, x0:x0 + crop_size, ...]
+
+
 def upsample_nearest(channel, target_shape):
     y_scale = target_shape[0] // channel.shape[0]
     x_scale = target_shape[1] // channel.shape[1]
@@ -345,7 +371,7 @@ def select_preview_sample(gridmap_payload, gridmap_array, sample_id=None, sample
     return resolved_id, pos
 
 
-def build_preview_background(dataset_dir, sample_id, fallback_component):
+def build_preview_background(dataset_dir, sample_id):
     luma_payload, luma_array = read_payload_array(dataset_dir, "Luma", "Input")
     chroma_payload, chroma_array = read_payload_array(dataset_dir, "Chroma", "Input")
     luma_ids = luma_payload["ids"]
@@ -356,10 +382,18 @@ def build_preview_background(dataset_dir, sample_id, fallback_component):
         raise KeyError(f"Sample id not found in Chroma input: {sample_id}")
 
     luma = luma_array[sample_position(luma_ids, sample_id=sample_id)][0]
+    luma_lcu = center_crop(luma, DEFAULT_BLOCK_SIZE_MAP["Luma"])
     chroma = chroma_array[sample_position(chroma_ids, sample_id=sample_id)]
-    u = upsample_nearest(chroma[0], luma.shape)
-    v = upsample_nearest(chroma[1], luma.shape)
-    return yuv_to_rgb(np.stack((luma, u, v), axis=-1))
+    chroma_lcu = np.stack(
+        (
+            center_crop(chroma[0], DEFAULT_BLOCK_SIZE_MAP["Chroma"]),
+            center_crop(chroma[1], DEFAULT_BLOCK_SIZE_MAP["Chroma"]),
+        ),
+        axis=0,
+    )
+    u = upsample_nearest(chroma_lcu[0], luma_lcu.shape)
+    v = upsample_nearest(chroma_lcu[1], luma_lcu.shape)
+    return yuv_to_rgb(np.stack((luma_lcu, u, v), axis=-1))
 
 
 def format_gridmap_values(gridmap):
@@ -434,18 +468,17 @@ def visualize_dataset_gridmap(data_type, dataset_name=None, component="luma", sa
     require_pandas()
     require_matplotlib()
     dataset_name = resolve_dataset_name(data_type, dataset_name)
-    split_dir = resolve_split_dir(data_type)
+    split_dir = resolve_output_split_dir(data_type)
     component_name = COMPONENT_ALIASES[component][0]
     dataset_dir = paths.dataset_root() / dataset_name / split_dir
     gridmap_payload, gridmap_array = read_payload_array(dataset_dir, component_name, "Gridmap")
-
     resolved_id, gridmap_pos = select_preview_sample(
         gridmap_payload=gridmap_payload,
         gridmap_array=gridmap_array,
         sample_id=sample_id,
         sample_index=sample_index,
     )
-    image = build_preview_background(dataset_dir, resolved_id, component_name)
+    image = build_preview_background(dataset_dir, resolved_id)
     gridmap = gridmap_array[gridmap_pos]
 
     if output_name is None:
@@ -725,9 +758,10 @@ def convert_component_partition_to_cu_tree(component, partition_info_path, save_
 
 def convert_partition_to_cu_tree(data_type, block_size_map=None, dataset_name=None, component="both"):
     dataset_name = resolve_dataset_name(data_type, dataset_name)
-    split_dir = resolve_split_dir(data_type)
-    partition_dir = paths.partition_dataset_root(dataset_name) / split_dir
-    save_dir = paths.ensure_dir(paths.dataset_root() / dataset_name / split_dir)
+    partition_split_dir = resolve_split_dir(data_type)
+    output_split_dir = resolve_output_split_dir(data_type)
+    partition_dir = paths.partition_dataset_root(dataset_name) / partition_split_dir
+    save_dir = paths.ensure_dir(paths.dataset_root() / dataset_name / output_split_dir)
     if block_size_map is None:
         block_size_map = DEFAULT_BLOCK_SIZE_MAP
     block_size_map = select_block_size_map(block_size_map, component)
@@ -811,11 +845,12 @@ def select_block_size_map(block_size_map, component):
     return {name: block_size_map[name] for name in selected_components}
 
 
-def convert_partition_to_gridmap(data_type, block_size_map=None, show=False, dataset_name=None, component="both"):
+def convert_partition_to_gridmap(data_type, block_size_map=None, dataset_name=None, component="both"):
     dataset_name = resolve_dataset_name(data_type, dataset_name)
-    split_dir = resolve_split_dir(data_type)
-    partition_dir = paths.partition_dataset_root(dataset_name) / split_dir
-    save_dir = paths.ensure_dir(paths.dataset_root() / dataset_name / split_dir)
+    partition_split_dir = resolve_split_dir(data_type)
+    output_split_dir = resolve_output_split_dir(data_type)
+    partition_dir = paths.partition_dataset_root(dataset_name) / partition_split_dir
+    save_dir = paths.ensure_dir(paths.dataset_root() / dataset_name / output_split_dir)
     if block_size_map is None:
         block_size_map = DEFAULT_BLOCK_SIZE_MAP
     block_size_map = select_block_size_map(block_size_map, component)
@@ -908,21 +943,30 @@ def block_origin_from_ctu_id(ctu_id, source_width, component):
 
 
 def crop_with_padding(frame, x, y, block_size):
+    block = np.zeros((block_size, block_size), dtype=np.uint8)
+    valid_h = max(0, min(block_size, frame.shape[0] - y))
+    valid_w = max(0, min(block_size, frame.shape[1] - x))
+    if valid_h > 0 and valid_w > 0:
+        block[:valid_h, :valid_w] = frame[y:y + valid_h, x:x + valid_w]
+    return block
+
+
+def crop_with_edge_padding(frame, x, y, crop_size):
     frame_h, frame_w = frame.shape
     x0 = max(0, x)
     y0 = max(0, y)
-    x1 = min(frame_w, x + block_size)
-    y1 = min(frame_h, y + block_size)
+    x1 = min(frame_w, x + crop_size)
+    y1 = min(frame_h, y + crop_size)
     if x0 >= x1 or y0 >= y1:
         raise ValueError(
-            f"Crop window ({x}, {y}, {block_size}, {block_size}) does not overlap frame {frame_w}x{frame_h}"
+            f"Crop window ({x}, {y}, {crop_size}, {crop_size}) does not overlap frame {frame_w}x{frame_h}"
         )
 
     block = frame[y0:y1, x0:x1]
     pad_left = x0 - x
     pad_top = y0 - y
-    pad_right = x + block_size - x1
-    pad_bottom = y + block_size - y1
+    pad_right = x + crop_size - x1
+    pad_bottom = y + crop_size - y1
     if pad_left or pad_top or pad_right or pad_bottom:
         block = np.pad(
             block,
@@ -932,9 +976,13 @@ def crop_with_padding(frame, x, y, block_size):
     return block.astype(np.uint8, copy=False)
 
 
-def save_component_input(component, ids, metadata, dataset_name, split_dir, block_size):
+def save_component_input(component, ids, metadata, dataset_name, split_dir, block_size, input_size):
     components = YUV420_COMPONENTS[component]
-    input_shape = (len(ids), len(components), block_size, block_size)
+    context_margin = input_size - block_size
+    if context_margin < 0:
+        raise ValueError(f"input_size {input_size} must be >= block_size {block_size}")
+
+    input_shape = (len(ids), len(components), input_size, input_size)
     log_progress(f"start {component} input: allocate array shape={input_shape}")
     input_blocks = np.zeros(input_shape, dtype=np.uint8)
     video_root = paths.video_dataset_root(dataset_name)
@@ -963,8 +1011,15 @@ def save_component_input(component, ids, metadata, dataset_name, split_dir, bloc
         for row in group.itertuples(index=False):
             sample_index = int(row.sample_index)
             x, y = block_origin_from_ctu_id(int(row.ctu_id), seq_meta["width"], component)
+            crop_x = x - context_margin
+            crop_y = y - context_margin
             for channel_idx, frame in enumerate(source_frames):
-                input_blocks[sample_index, channel_idx] = crop_with_padding(frame, x, y, block_size)
+                input_blocks[sample_index, channel_idx] = crop_with_edge_padding(
+                    frame,
+                    crop_x,
+                    crop_y,
+                    input_size,
+                )
             processed_samples += 1
         if processed_groups == 1 or processed_groups % 50 == 0 or processed_groups == total_groups:
             elapsed = max(time.time() - start_time, 1e-6)
@@ -980,6 +1035,8 @@ def save_component_input(component, ids, metadata, dataset_name, split_dir, bloc
     payload = {
         "component": component,
         "block_size": block_size,
+        "input_size": input_size,
+        "context_margin": context_margin,
         "padding": "edge",
         "id_columns": ID_COLUMNS,
         "ids": ids.copy(),
@@ -994,13 +1051,16 @@ def save_component_input(component, ids, metadata, dataset_name, split_dir, bloc
     return save_path
 
 
-def convert_yuv_to_input(data_type, block_size_map=None, dataset_name=None, sequence_list=None, component="both"):
+def convert_yuv_to_input(data_type, block_size_map=None, input_size_map=None, dataset_name=None, sequence_list=None, component="both"):
     require_pandas()
     dataset_name = resolve_dataset_name(data_type, dataset_name)
-    split_dir = resolve_split_dir(data_type)
+    split_dir = resolve_output_split_dir(data_type)
     if block_size_map is None:
         block_size_map = DEFAULT_BLOCK_SIZE_MAP
+    if input_size_map is None:
+        input_size_map = DEFAULT_INPUT_SIZE_MAP
     block_size_map = select_block_size_map(block_size_map, component)
+    input_size_map = select_block_size_map(input_size_map, component)
     metadata = sequence_info_to_metadata(data_type, dataset_name, sequence_list)
 
     output_paths = []
@@ -1014,6 +1074,7 @@ def convert_yuv_to_input(data_type, block_size_map=None, dataset_name=None, sequ
                 dataset_name=dataset_name,
                 split_dir=split_dir,
                 block_size=block_size,
+                input_size=input_size_map[component],
             )
         )
     return output_paths
@@ -1026,6 +1087,8 @@ def build_argparser():
     parser.add_argument('--sequence-list', type=str, default=None)
     parser.add_argument('--luma-block-size', type=int, default=64)
     parser.add_argument('--chroma-block-size', type=int, default=32)
+    parser.add_argument('--luma-input-size', type=int, default=96)
+    parser.add_argument('--chroma-input-size', type=int, default=48)
     parser.add_argument('--component', choices=['both', 'luma', 'chroma'], default='both')
     parser.add_argument('--show', action='store_true')
     parser.add_argument('--show-output', type=str, default=None)
@@ -1056,6 +1119,10 @@ if __name__ == '__main__':
         "Luma": args.luma_block_size,
         "Chroma": args.chroma_block_size,
     }
+    input_size_map = {
+        "Luma": args.luma_input_size,
+        "Chroma": args.chroma_input_size,
+    }
     if args.action in ('gridmap', 'gridmap-input', 'gridmap-input-cu-tree'):
         convert_partition_to_gridmap(
             args.data_type,
@@ -1067,6 +1134,7 @@ if __name__ == '__main__':
         convert_yuv_to_input(
             args.data_type,
             block_size_map=block_size_map,
+            input_size_map=input_size_map,
             dataset_name=args.dataset,
             sequence_list=args.sequence_list,
             component=args.component,

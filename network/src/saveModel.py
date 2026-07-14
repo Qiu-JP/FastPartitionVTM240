@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 import paths
 from model import Classifier_I
-from model import SwinTransformer_Unet_Luma
+from model import SwinTransformer_Unet_Luma96
 
 
 CLASSIFIER_I_GRID_SIZES = (
@@ -58,6 +58,21 @@ def load_model_weights(model, checkpoint_path, device):
     unexpected = sorted(set(source_dict.keys()) - set(dest_dict.keys()))
     model.load_state_dict({**dest_dict, **trained_dict})
     return missing, unexpected
+
+
+def serve_netron(model_path, host, port):
+    try:
+        import netron
+    except ImportError as exc:
+        raise ImportError(
+            "netron is required for --viewNetron. "
+            "Install it in the FastPartitionVTM environment first."
+        ) from exc
+    address = (host, port)
+    print(f"Netron: http://{host}:{port}")
+    print("Press Ctrl+C to stop the Netron server.")
+    netron.start(str(model_path), address=address, browse=False)
+    netron.wait()
 
 
 class ClassifierIExportWrapper(nn.Module):
@@ -183,11 +198,11 @@ def export_classifier(checkpoint_path, output_path, device):
     return missing, unexpected
 
 
-def export_swin_luma(checkpoint_path, output_path, device):
-    model = SwinTransformer_Unet_Luma()
+def export_swin_luma(checkpoint_path, output_path, device, use_context_mask):
+    model = SwinTransformer_Unet_Luma96(use_context_mask=use_context_mask)
     missing, unexpected = load_model_weights(model, checkpoint_path, device)
     model.eval()
-    dummy_input = torch.randn(1, 1, 64, 64, device=device)
+    dummy_input = torch.randn(1, 1, 96, 96, device=device)
     dummy_qp = torch.randn(1, 1, device=device)
     traced = torch.jit.trace(model, (dummy_input, dummy_qp), strict=False)
     traced.save(str(output_path))
@@ -195,14 +210,15 @@ def export_swin_luma(checkpoint_path, output_path, device):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Export 64x64 trained checkpoints for C++ deployment.")
+    parser = argparse.ArgumentParser(description="Export 96x96 trained checkpoints for C++ deployment.")
     parser.add_argument("--task", choices=("export_classifier", "swin_luma"), required=True)
     parser.add_argument("--checkpoint", required=True, help="Path to a .pth checkpoint under network/checkpoints.")
-    parser.add_argument(
-        "--output",
-        help="Output .pt path. Defaults to the checkpoint path with its suffix replaced by .pt.",
-    )
+    parser.add_argument("--output", required=True, help="Output .pt path.")
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--useContextMask", action="store_true", help="Use the context-mask variant for SwinTransformer_Unet_Luma96.")
+    parser.add_argument("--viewNetron", action="store_true", help="Start a Netron server for the exported .pt model.")
+    parser.add_argument("--netronHost", default="127.0.0.1", help="Host address for --viewNetron.")
+    parser.add_argument("--netronPort", type=int, default=8080, help="Port for --viewNetron.")
     return parser.parse_args()
 
 
@@ -210,24 +226,22 @@ if __name__ == "__main__":
     args = parse_args()
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
     checkpoint_path = Path(args.checkpoint)
+    output_path = Path(args.output)
     if not checkpoint_path.is_absolute():
         checkpoint_path = paths.project_root() / checkpoint_path
-
-    if args.output:
-        output_path = Path(args.output)
-        if not output_path.is_absolute():
-            output_path = paths.project_root() / output_path
-    else:
-        output_path = checkpoint_path.with_suffix(".pt")
+    if not output_path.is_absolute():
+        output_path = paths.project_root() / output_path
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if args.task == "export_classifier":
         missing, unexpected = export_classifier(checkpoint_path, output_path, device)
     elif args.task == "swin_luma":
-        missing, unexpected = export_swin_luma(checkpoint_path, output_path, device)
+        missing, unexpected = export_swin_luma(checkpoint_path, output_path, device, args.useContextMask)
 
     print("Saved:", output_path)
     if missing:
         print("Missing checkpoint tensors:", len(missing))
     if unexpected:
         print("Unexpected checkpoint tensors:", len(unexpected))
+    if args.viewNetron:
+        serve_netron(output_path, args.netronHost, args.netronPort)

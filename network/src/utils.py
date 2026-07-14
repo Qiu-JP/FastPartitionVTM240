@@ -1,3 +1,4 @@
+import os
 import sys
 
 import numpy as np
@@ -9,8 +10,13 @@ from torch.utils.data import Dataset
 from tqdm import tqdm
 
 
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
+
 ID_COLUMNS = ["sequence_name", "qp", "frame_id", "ctu_id"]
 GRID_POSITIVE_THRESHOLD = 0.5
+LUMA_LCU_SIZE = 64
+CHROMA_LCU_SIZE = 32
 CLASSIFIER_SUPPORTED_SIZES = {
     (16, 16),
     (8, 8),
@@ -71,6 +77,233 @@ def collate_gridmap_with_nodes(batch):
     )
 
 
+def normalize_preview_image(image):
+    image = image.astype(np.float32)
+    if image.ndim == 3:
+        if np.max(image) > 1.0:
+            image = image / 255.0
+        return np.clip(image, 0.0, 1.0)
+    min_val = float(np.min(image))
+    max_val = float(np.max(image))
+    if max_val <= min_val:
+        return np.zeros_like(image, dtype=np.float32)
+    return (image - min_val) / (max_val - min_val)
+
+
+def yuv_to_rgb(yuv):
+    yuv = yuv.astype(np.float32)
+    y = yuv[..., 0]
+    u = yuv[..., 1] - 128.0
+    v = yuv[..., 2] - 128.0
+    rgb = np.stack(
+        (
+            y + 1.402 * v,
+            y - 0.344136 * u - 0.714136 * v,
+            y + 1.772 * u,
+        ),
+        axis=-1,
+    )
+    return np.clip(rgb, 0.0, 255.0)
+
+
+def center_crop_array(image, crop_size):
+    h, w = image.shape[:2]
+    if h < crop_size or w < crop_size:
+        raise ValueError(f"Cannot crop {crop_size}x{crop_size} from image {image.shape}")
+    y0 = (h - crop_size) // 2
+    x0 = (w - crop_size) // 2
+    return image[y0:y0 + crop_size, x0:x0 + crop_size, ...]
+
+
+def upsample_nearest(channel, target_shape):
+    y_scale = target_shape[0] // channel.shape[0]
+    x_scale = target_shape[1] // channel.shape[1]
+    if y_scale <= 0 or x_scale <= 0:
+        raise ValueError(f"Cannot upsample {channel.shape} to {target_shape}")
+    return np.repeat(np.repeat(channel, y_scale, axis=0), x_scale, axis=1)[:target_shape[0], :target_shape[1]]
+
+
+def load_chroma_input_for_preview(dataset):
+    if hasattr(dataset, "_preview_chroma_ids") and hasattr(dataset, "_preview_chroma_array"):
+        return dataset._preview_chroma_ids, dataset._preview_chroma_array
+    chroma_pkl_path = dataset.dataset_dir / "Chroma_Input.pkl"
+    if not chroma_pkl_path.exists():
+        raise FileNotFoundError(f"Chroma input metadata pkl not found: {chroma_pkl_path}")
+    chroma_payload = pd.read_pickle(chroma_pkl_path)
+    if not isinstance(chroma_payload, dict) or "array_file" not in chroma_payload:
+        raise RuntimeError(f"{chroma_pkl_path} is not in the current metadata format")
+    chroma_npy_path = dataset.dataset_dir / chroma_payload["array_file"]
+    if not chroma_npy_path.exists():
+        raise FileNotFoundError(f"Chroma input npy array not found: {chroma_npy_path}")
+    dataset._preview_chroma_ids = chroma_payload["ids"]
+    dataset._preview_chroma_array = np.load(chroma_npy_path, mmap_mode="r")
+    return dataset._preview_chroma_ids, dataset._preview_chroma_array
+
+
+def build_tensorboard_preview_background(dataset, sample_index):
+    if sample_index < 0 or sample_index >= len(dataset):
+        raise IndexError(f"tbImageSampleIndex {sample_index} out of range [0, {len(dataset)})")
+    sample_id = dataset.common_ids[sample_index]
+    luma = dataset.input_array[dataset.input_positions[sample_index]][0]
+    luma_lcu = center_crop_array(luma, LUMA_LCU_SIZE)
+
+    chroma_ids, chroma_array = load_chroma_input_for_preview(dataset)
+    if sample_id not in chroma_ids.index:
+        raise KeyError(f"Sample id not found in Chroma input: {sample_id}")
+    chroma_pos = int(chroma_ids.loc[sample_id, "sample_index"])
+    chroma = chroma_array[chroma_pos]
+    chroma_lcu = np.stack(
+        (
+            center_crop_array(chroma[0], CHROMA_LCU_SIZE),
+            center_crop_array(chroma[1], CHROMA_LCU_SIZE),
+        ),
+        axis=0,
+    )
+    u = upsample_nearest(chroma_lcu[0], luma_lcu.shape)
+    v = upsample_nearest(chroma_lcu[1], luma_lcu.shape)
+    return yuv_to_rgb(np.stack((luma_lcu, u, v), axis=-1))
+
+
+def draw_gridmap_overlay(ax, image, gridmap, title=None):
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Rectangle
+
+    grid_h, grid_w = gridmap.shape[-2:]
+    target_h, target_w = image.shape[:2] if image.ndim == 3 else image.shape[-2:]
+    unit_y = target_h / float(grid_h)
+    unit_x = target_w / float(grid_w)
+    image = normalize_preview_image(image)
+
+    if image.ndim == 3:
+        ax.imshow(image, extent=[0, target_w, target_h, 0])
+    else:
+        ax.imshow(image, cmap="gray", vmin=0, vmax=1, extent=[0, target_w, target_h, 0])
+
+    for y in range(grid_h):
+        for x in range(grid_w):
+            x_left = x * unit_x
+            x_right = (x + 1) * unit_x
+            y_top = y * unit_y
+            y_bottom = (y + 1) * unit_y
+            ax.add_line(Line2D([x_right, x_right], [y_top, y_bottom], color="black", linewidth=0.45, alpha=0.65, linestyle=":"))
+            ax.add_line(Line2D([x_left, x_right], [y_bottom, y_bottom], color="black", linewidth=0.45, alpha=0.65, linestyle=":"))
+            ax.add_line(Line2D([x_right, x_right], [y_top, y_bottom], color="orange", linewidth=2.0, alpha=float(np.clip(gridmap[0, y, x], 0.0, 1.0))))
+            ax.add_line(Line2D([x_left, x_right], [y_bottom, y_bottom], color=(0 / 255, 160 / 255, 255 / 255), linewidth=2.0, alpha=float(np.clip(gridmap[1, y, x], 0.0, 1.0))))
+
+    ax.add_patch(Rectangle((0, 0), target_w, target_h, fill=False, edgecolor="black", linewidth=1.0))
+    if title:
+        ax.set_title(title)
+    ax.set_xlim(0, target_w)
+    ax.set_ylim(target_h, 0)
+    ax.set_aspect("equal")
+    ax.xaxis.tick_top()
+    ax.tick_params(axis="both", which="both", direction="out", length=3)
+    ax.set_xticks(list(range(0, int(target_w) + 1, 16)))
+    ax.set_yticks(list(range(0, int(target_h) + 1, 16)))
+
+
+def format_gridmap_values(gridmap):
+    vertical = np.array2string(
+        np.asarray(gridmap[0]),
+        precision=2,
+        suppress_small=True,
+        max_line_width=120,
+        separator=" ",
+    )
+    horizontal = np.array2string(
+        np.asarray(gridmap[1]),
+        precision=2,
+        suppress_small=True,
+        max_line_width=120,
+        separator=" ",
+    )
+    return "gridmap[0] vertical\n{}\n\ngridmap[1] horizontal\n{}".format(vertical, horizontal)
+
+
+def draw_gridmap_values(ax, gridmap, title=None):
+    ax.axis("off")
+    if title:
+        ax.set_title(title)
+    ax.text(
+        0.0,
+        1.0,
+        format_gridmap_values(gridmap),
+        transform=ax.transAxes,
+        va="top",
+        ha="left",
+        family="monospace",
+        fontsize=5.6,
+    )
+
+
+def gridmap_comparison_image(background, label_gridmap, pred_gridmap, title=None):
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+    fig, axes = plt.subplots(
+        1,
+        4,
+        figsize=(12.0, 3.8),
+        gridspec_kw={"width_ratios": [1.0, 1.25, 1.0, 1.25]},
+    )
+    if title:
+        fig.suptitle(title, fontsize=10)
+    draw_gridmap_overlay(axes[0], background, label_gridmap, title="label")
+    draw_gridmap_values(axes[1], label_gridmap, title="label values")
+    draw_gridmap_overlay(axes[2], background, pred_gridmap, title="prediction")
+    draw_gridmap_values(axes[3], pred_gridmap, title="prediction values")
+    fig.tight_layout()
+    canvas = FigureCanvasAgg(fig)
+    canvas.draw()
+    w, h = canvas.get_width_height()
+    image = np.frombuffer(canvas.tostring_rgb(), dtype=np.uint8).reshape(h, w, 3)
+    plt.close(fig)
+    return image
+
+
+def ensure_pillow_antialias_compat():
+    try:
+        from PIL import Image
+    except ImportError:
+        return
+    if hasattr(Image, "ANTIALIAS"):
+        return
+    if hasattr(Image, "Resampling"):
+        Image.ANTIALIAS = Image.Resampling.LANCZOS
+    elif hasattr(Image, "LANCZOS"):
+        Image.ANTIALIAS = Image.LANCZOS
+
+
+@torch.no_grad()
+def add_gridmap_prediction_image(tb_writer, tag, model, dataset, sample_index, device, epoch):
+    if tb_writer is None:
+        return
+    was_training = model.training
+    model.eval()
+    input_sample, qp_sample, label_gridmap, _ = dataset[sample_index]
+    pred_gridmap = model(
+        input_sample.unsqueeze(0).to(device),
+        qp_sample.unsqueeze(0).to(device),
+    )[0].detach().cpu().numpy()
+    label_gridmap = label_gridmap.detach().cpu().numpy()
+    background = build_tensorboard_preview_background(dataset, sample_index)
+    sample_id = dataset.common_ids[sample_index]
+    image = gridmap_comparison_image(
+        background=background,
+        label_gridmap=label_gridmap,
+        pred_gridmap=pred_gridmap,
+        title=f"{dataset.type} sample {sample_index} {sample_id}",
+    )
+    ensure_pillow_antialias_compat()
+    tb_writer.add_image(tag, image, epoch, dataformats="HWC")
+    if was_training:
+        model.train()
+
+
 class IdAlignedGridmapDataset(Dataset):
     def __init__(self, dataset_name, type, component="Luma", min_qp=0, max_qp=51):
         self.dataset_name = dataset_name
@@ -82,6 +315,7 @@ class IdAlignedGridmapDataset(Dataset):
             raise ValueError(f"max_qp must be larger than min_qp, got {min_qp} and {max_qp}")
         split_dir = split_dir_from_name(type)
         dataset_dir = paths.dataset_root() / dataset_name / split_dir
+        self.dataset_dir = dataset_dir
         self.input_path = dataset_dir / f"{component}_Input.pkl"
         self.gridmap_path = dataset_dir / f"{component}_Gridmap.pkl"
         self.input_npy_path = dataset_dir / f"{component}_Input.npy"
@@ -118,7 +352,7 @@ class IdAlignedGridmapDataset(Dataset):
                 "Regenerate the pkl files with the current createDataset script."
             )
 
-        common_ids = self.input_ids.index.intersection(self.gridmap_ids.index, sort=True)
+        common_ids = self.input_ids.index.intersection(self.gridmap_ids.index, sort=False)
         if common_ids.empty:
             raise RuntimeError(
                 f"No common ids between {self.input_path} and {self.gridmap_path}"
@@ -172,7 +406,7 @@ class IdAlignedGridmapCuTreeDataset(IdAlignedGridmapDataset):
         if not self.cu_tree_path.exists():
             raise FileNotFoundError(
                 f"CU tree labels not found: {self.cu_tree_path}. "
-                "Generate them first with createDataset.py/createDataset96.py --action cu-tree."
+                "Generate them first with createDataset.py --action cu-tree."
             )
 
         payload = pd.read_pickle(self.cu_tree_path)
@@ -183,7 +417,7 @@ class IdAlignedGridmapCuTreeDataset(IdAlignedGridmapDataset):
         if label_format != "cu_tree_numpy":
             raise RuntimeError(
                 f"Unsupported CU tree label format in {self.cu_tree_path}. "
-                "Regenerate with the current createDataset.py/createDataset96.py --action cu-tree."
+                "Regenerate with the current createDataset.py --action cu-tree."
             )
 
         common_index = self.common_ids
@@ -225,6 +459,40 @@ def is_supported_classifier_size(h, w):
     return (h, w) in CLASSIFIER_SUPPORTED_SIZES
 
 
+def classifier_shape_name(grid_h, grid_w):
+    return "{}x{}".format(int(grid_h), int(grid_w))
+
+
+def empty_classifier_shape_stats():
+    return {}
+
+
+def update_classifier_shape_stats(stats, shape_name, loss_value, correct, count):
+    if shape_name not in stats:
+        stats[shape_name] = {
+            "loss_sum": 0.0,
+            "correct": 0,
+            "count": 0,
+        }
+    payload = stats[shape_name]
+    payload["loss_sum"] += float(loss_value) * int(count)
+    payload["correct"] += int(correct)
+    payload["count"] += int(count)
+
+
+def finalize_classifier_shape_stats(stats):
+    finalized = {}
+    for shape_name, payload in sorted(stats.items()):
+        count = int(payload["count"])
+        if count <= 0:
+            continue
+        finalized[shape_name] = {
+            "loss": payload["loss_sum"] / float(count),
+            "acc": payload["correct"] / float(count),
+        }
+    return finalized
+
+
 def classifier_node_loss(classifier, pred_gridmap, node_batch, ce_loss):
     node_batches = {}
     total_nodes = 0
@@ -251,18 +519,30 @@ def classifier_node_loss(classifier, pred_gridmap, node_batch, ce_loss):
 
     if total_nodes == 0:
         zero = pred_gridmap.sum() * 0.0
-        return zero, 0.0, 0
+        return zero, 0.0, 0, {}
 
     losses = []
     correct = 0
-    for payload in node_batches.values():
+    shape_stats = empty_classifier_shape_stats()
+    for (grid_h, grid_w), payload in node_batches.items():
         roi = torch.cat(payload["roi"], dim=0)
         labels = torch.tensor(payload["label"], dtype=torch.long, device=pred_gridmap.device)
         logits = classifier(roi)
-        losses.append(ce_loss(logits, labels))
-        correct += torch.sum(torch.argmax(logits, dim=1) == labels).item()
+        shape_loss = ce_loss(logits, labels)
+        losses.append(shape_loss)
+        pred_labels = torch.argmax(logits, dim=1)
+        shape_correct = torch.sum(pred_labels == labels).item()
+        correct += shape_correct
 
-    return torch.stack(losses).mean(), correct / float(total_nodes), total_nodes
+        update_classifier_shape_stats(
+            shape_stats,
+            classifier_shape_name(grid_h, grid_w),
+            shape_loss.detach().item(),
+            shape_correct,
+            labels.numel(),
+        )
+
+    return torch.stack(losses).mean(), correct / float(total_nodes), total_nodes, shape_stats
 
 
 def grid_positive_counts(pred_gridmap, label_gridmap, threshold=GRID_POSITIVE_THRESHOLD):
@@ -367,6 +647,7 @@ def _run_joint_epoch(
     grid_fp = 0
     grid_fn = 0
     total_cls_nodes = 0
+    classifier_shape_stats = empty_classifier_shape_stats()
 
     progress = tqdm(data_loader, file=sys.stdout)
     for step, data in enumerate(progress):
@@ -378,7 +659,7 @@ def _run_joint_epoch(
 
         pred_gridmap = swin_model(input_batch, qp_batch)
         grid_loss = grid_loss_fn(pred_gridmap, gridmap_batch)
-        cls_loss, cls_acc, cls_nodes = classifier_node_loss(
+        cls_loss, cls_acc, cls_nodes, batch_shape_stats = classifier_node_loss(
             classifier=classifier,
             pred_gridmap=pred_gridmap,
             node_batch=node_batch,
@@ -405,6 +686,14 @@ def _run_joint_epoch(
         accu_cls_loss += cls_loss.detach()
         accu_cls_acc += cls_acc
         total_cls_nodes += cls_nodes
+        for shape_name, payload in batch_shape_stats.items():
+            update_classifier_shape_stats(
+                classifier_shape_stats,
+                shape_name,
+                payload["loss_sum"] / float(payload["count"]),
+                payload["correct"],
+                payload["count"],
+            )
 
         phase = "train" if training else "valid"
         progress.desc = (
@@ -433,6 +722,7 @@ def _run_joint_epoch(
         grid_recall,
         accu_cls_acc.item() / step_count,
         total_cls_nodes / float(step_count),
+        finalize_classifier_shape_stats(classifier_shape_stats),
     )
 
 
@@ -445,6 +735,7 @@ def train_one_epoch_classifier(model, optimizer, data_loaders, device, epoch, lo
     accu_loss = torch.zeros(1).to(device)
     accu = torch.zeros(1).to(device)
     total_steps = 0
+    classifier_shape_stats = empty_classifier_shape_stats()
 
     for loader_name, data_loader in data_loaders:
         progress = tqdm(data_loader, file=sys.stdout)
@@ -459,7 +750,16 @@ def train_one_epoch_classifier(model, optimizer, data_loaders, device, epoch, lo
             loss = loss_function(logits, label_batch)
             loss.backward()
 
-            batch_acc = torch.sum(torch.argmax(logits, dim=1) == label_batch).item() / float(label_batch.numel())
+            pred_labels = torch.argmax(logits, dim=1)
+            batch_correct = torch.sum(pred_labels == label_batch).item()
+            batch_acc = batch_correct / float(label_batch.numel())
+            update_classifier_shape_stats(
+                classifier_shape_stats,
+                loader_name,
+                loss.detach().item(),
+                batch_correct,
+                label_batch.numel(),
+            )
             accu += batch_acc
             accu_loss += loss.detach()
             total_steps += 1
@@ -478,4 +778,8 @@ def train_one_epoch_classifier(model, optimizer, data_loaders, device, epoch, lo
             optimizer.step()
             optimizer.zero_grad()
 
-    return accu_loss.item() / total_steps, accu.item() / total_steps
+    return (
+        accu_loss.item() / total_steps,
+        accu.item() / total_steps,
+        finalize_classifier_shape_stats(classifier_shape_stats),
+    )

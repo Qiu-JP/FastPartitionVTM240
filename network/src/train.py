@@ -24,7 +24,7 @@ from utils import (
     train_one_epoch_classifier,
     get_loss_function,
 )
-from model import SwinTransformer_Unet_Luma as model64
+from model import SwinTransformer_Unet_Luma96 as model96
 from model import Classifier_I as classifier_i
 
 
@@ -133,10 +133,11 @@ def load_model_weights(model, checkpoint_path, device, model_name):
 def train_SwinTransU(args):
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
-    Net = model64().to(device)
+    Net = model96(use_context_mask=args.useContextMask).to(device)
     Classifier = classifier_i().to(device)
+    print("Swin context mask:", args.useContextMask)
 
-    load_model_weights(Net, args.swinCkpt, device, "SwinTransformer_Unet_Luma")
+    load_model_weights(Net, args.swinCkpt, device, "SwinTransformer_Unet_Luma96")
     load_model_weights(Classifier, args.classifierCkpt, device, "Classifier_I")
 
     log_out_dir = os.path.join(str(paths.output_root()), args.outDir, args.jobID)
@@ -424,19 +425,20 @@ if __name__ == '__main__':
     parser.add_argument('--batchSize', type=int, default=256)
     parser.add_argument('--lr', type=float, default=0.0001)
     parser.add_argument('--device', default='cuda:0', help='device id (i.e. 0 or 0,1 or cpu)')
-    parser.add_argument('--outDir', type=str, default='swin_luma64_joint')
+    parser.add_argument('--outDir', type=str, default='swin_luma96_joint')
     parser.add_argument('--task', type=str, default='swin_luma',
                         choices=['pretrain_classifier_logical', 'swin_luma'])
     parser.add_argument('--logFile', type=str, default='train.log')
     parser.add_argument('--dr', default=20, type=int, help='decay rate of lr')
     parser.add_argument('--dataset', type=str, default='DIV2K')
-    parser.add_argument('--trainSplit', type=str, default='training')
-    parser.add_argument('--valSplit', type=str, default='validating')
+    parser.add_argument('--trainSplit', type=str, default='training96')
+    parser.add_argument('--valSplit', type=str, default='validating96')
     parser.add_argument('--component', type=str, choices=['Luma'], default='Luma')
     parser.add_argument('--tbLogDir', type=str, default=None, help='TensorBoard log directory')
     parser.add_argument('--tbImageSampleIndex', type=int, default=None, help='Optional fixed sample index for both train and val TensorBoard gridmap images')
     parser.add_argument('--tbTrainImageSamples', type=str, default='simple:1989496,medium:819088,complex:320136', help='Comma-separated training TensorBoard gridmap samples, e.g. simple:0,medium:1,complex:2')
     parser.add_argument('--tbValImageSamples', type=str, default='simple:116602,medium:54490,complex:121714', help='Comma-separated validation TensorBoard gridmap samples, e.g. simple:0,medium:1,complex:2')
+    parser.add_argument('--useContextMask', action='store_true', help='Enable 96x96 context attention mask in SwinTransformer_Unet_Luma96')
     parser.add_argument('--swinCkpt', type=str, default=None, help='Optional Swin checkpoint to resume from')
     parser.add_argument('--classifierCkpt', type=str, default=None, help='Optional Classifier_I checkpoint to resume from')
     parser.add_argument('--gridLossType', type=str, default='BCE', choices=['BCE', 'L1', 'HUBER', 'MSE'], help='Loss function for Swin gridmap supervision')

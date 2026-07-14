@@ -5,7 +5,7 @@ import numpy as np
 import torch
 
 import paths
-from model import SwinTransformer_Unet_Luma
+from model import SwinTransformer_Unet_Luma96
 from utils import (
     build_tensorboard_preview_background,
     gridmap_comparison_image,
@@ -108,7 +108,7 @@ def run_inference(args):
     sample_index, sample_id = select_sample(dataset, args)
     input_sample, qp_sample, label_gridmap = dataset[sample_index]
 
-    model = SwinTransformer_Unet_Luma().to(device)
+    model = SwinTransformer_Unet_Luma96(use_context_mask=args.useContextMask).to(device)
     missing, unexpected = load_model_weights(model, checkpoint_path, device)
     model.eval()
 
@@ -141,20 +141,21 @@ def run_inference(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Run 64x64 Swin gridmap inference for one dataset sample.")
+    parser = argparse.ArgumentParser(description="Run 96x96 Swin gridmap inference for one dataset sample.")
     parser.add_argument("--checkpoint", required=True, help="Swin checkpoint path.")
     parser.add_argument("--dataset", default="DIV2K")
-    parser.add_argument("--split", default="validating")
+    parser.add_argument("--split", default="validating96")
     parser.add_argument("--component", choices=("Luma",), default="Luma")
     parser.add_argument("--sequence", default=None)
     parser.add_argument("--qp", type=int, default=None)
     parser.add_argument("--frameID", type=int, default=None)
     parser.add_argument("--ctuID", type=int, default=None)
-    parser.add_argument("--sampleIndex", type=int, default=116602)
+    parser.add_argument("--sampleIndex", type=int, default=None)
     parser.add_argument("--randomSample", action="store_true")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--visualizeOutput", default="inference_gridmap.png", help="Preview image name under network/figures/.")
+    parser.add_argument("--useContextMask", action="store_true")
+    parser.add_argument("--visualizeOutput", default="inference96_gridmap.png", help="Preview image name under network/figures/.")
     return parser.parse_args()
 
 
