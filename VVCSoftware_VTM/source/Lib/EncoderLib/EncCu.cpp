@@ -242,6 +242,12 @@ void EncCu::create( EncCfg* encCfg )
 #if FastPartition
   m_fastPartitionSwinInfer.init(encCfg->getFastPartitionSwinModel());
   m_fastPartitionClassifierInfer.init(encCfg->getFastPartitionClassifierModel());
+  if (!encCfg->getFastPartitionChromaSwinModel().empty()
+      && !encCfg->getFastPartitionChromaClassifierModel().empty())
+  {
+    m_fastPartitionChromaSwinInfer.init(encCfg->getFastPartitionChromaSwinModel());
+    m_fastPartitionChromaClassifierInfer.init(encCfg->getFastPartitionChromaClassifierModel());
+  }
 #endif
 }
 
@@ -421,6 +427,128 @@ void EncCu::xFastPartitionPrepareCtu(CodingStructure& cs, const UnitArea& area, 
   m_fastPartitionCtuCache.valid = hasValidGridmap;
   dumpFastPartitionFirstLcuGridmaps(cs, m_fastPartitionCtuCache);
 }
+
+void EncCu::xFastPartitionBuildChromaSwinInput48(const CodingStructure& cs, int targetX, int targetY,
+                                                 FastPartitionChromaSwinInput& dst) const
+{
+  dst.targetX = targetX;
+  dst.targetY = targetY;
+
+  const CPelBuf origChroma[2] = {
+    cs.picture->getOrigBuf(COMPONENT_Cb),
+    cs.picture->getOrigBuf(COMPONENT_Cr),
+  };
+  const int cropX = targetX - 16;
+  const int cropY = targetY - 16;
+  const int bitDepth = cs.sps->getBitDepth(ChannelType::CHROMA);
+  const int shift = std::max(0, bitDepth - 8);
+  const int roundingOffset = shift > 0 ? (1 << (shift - 1)) : 0;
+
+  for (int channel = 0; channel < 2; channel++)
+  {
+    const CPelBuf& orig = origChroma[channel];
+    const int picWidth = int(orig.width);
+    const int picHeight = int(orig.height);
+    for (int y = 0; y < 48; y++)
+    {
+      const int srcY = std::min(std::max(cropY + y, 0), picHeight - 1);
+      for (int x = 0; x < 48; x++)
+      {
+        const int srcX = std::min(std::max(cropX + x, 0), picWidth - 1);
+        int pel = int(orig.at(srcX, srcY));
+        if (shift > 0)
+        {
+          pel = (pel + roundingOffset) >> shift;
+        }
+        pel = std::min(std::max(pel, 0), 255);
+        dst.chroma[size_t(channel * 48 * 48 + y * 48 + x)] = float(pel);
+      }
+    }
+  }
+}
+
+void EncCu::xFastPartitionInferChromaSwinCtu(int qp)
+{
+  m_fastPartitionChromaSwinInfer.inferCtu(m_fastPartitionChromaCtuCache.swinInputs, qp,
+                                          m_fastPartitionChromaCtuCache.gridmaps);
+}
+
+void EncCu::xFastPartitionPrepareChromaCtu(CodingStructure& cs, const UnitArea& area, int qp)
+{
+  m_fastPartitionChromaCtuCache.reset();
+
+  if (!m_fastPartitionChromaSwinInfer.isInitialized()
+      || !m_fastPartitionChromaClassifierInfer.isInitialized())
+  {
+    return;
+  }
+  if (!cs.slice->isIntra() || area.chromaFormat != ChromaFormat::_420)
+  {
+    return;
+  }
+  if (area.chromaSize().width != 64 || area.chromaSize().height != 64)
+  {
+    return;
+  }
+
+  const int ctuX = area.chromaPos().x;
+  const int ctuY = area.chromaPos().y;
+  m_fastPartitionChromaCtuCache.ctuX = ctuX;
+  m_fastPartitionChromaCtuCache.ctuY = ctuY;
+  m_fastPartitionChromaCtuCache.ctuWidth = int(area.chromaSize().width);
+  m_fastPartitionChromaCtuCache.ctuHeight = int(area.chromaSize().height);
+
+  const int targetOffsetX[4] = { 0, 32, 0, 32 };
+  const int targetOffsetY[4] = { 0, 0, 32, 32 };
+  for (int idx = 0; idx < 4; idx++)
+  {
+    xFastPartitionBuildChromaSwinInput48(
+      cs,
+      ctuX + targetOffsetX[idx],
+      ctuY + targetOffsetY[idx],
+      m_fastPartitionChromaCtuCache.swinInputs[size_t(idx)]);
+  }
+
+  xFastPartitionInferChromaSwinCtu(qp);
+
+  const CPelBuf origCb = cs.picture->getOrigBuf(COMPONENT_Cb);
+  const int pictureWidth = int(origCb.width);
+  const int pictureHeight = int(origCb.height);
+  bool hasValidGridmap = false;
+  for (FastPartitionChromaGridmap32& gridmap : m_fastPartitionChromaCtuCache.gridmaps)
+  {
+    const int validWidthPixels = std::max(0, std::min(32, pictureWidth - gridmap.targetX));
+    const int validHeightPixels = std::max(0, std::min(32, pictureHeight - gridmap.targetY));
+    gridmap.validWidthUnits = (validWidthPixels + 3) / 4;
+    gridmap.validHeightUnits = (validHeightPixels + 3) / 4;
+
+    if (gridmap.validWidthUnits == 0 || gridmap.validHeightUnits == 0)
+    {
+      gridmap.valid = false;
+      gridmap.values.fill(0.0f);
+      continue;
+    }
+
+    for (int channel = 0; channel < 2; channel++)
+    {
+      for (int y = 0; y < 8; y++)
+      {
+        for (int x = 0; x < 8; x++)
+        {
+          const bool outsidePicture = x >= gridmap.validWidthUnits || y >= gridmap.validHeightUnits;
+          const bool pictureRightEdge = channel == 0 && x == gridmap.validWidthUnits - 1;
+          const bool pictureBottomEdge = channel == 1 && y == gridmap.validHeightUnits - 1;
+          if (outsidePicture || pictureRightEdge || pictureBottomEdge)
+          {
+            gridmap.values[size_t(channel * 8 * 8 + y * 8 + x)] = 0.0f;
+          }
+        }
+      }
+    }
+    hasValidGridmap = true;
+  }
+  m_fastPartitionChromaCtuCache.valid = hasValidGridmap;
+}
 #endif
 
 /** \param    pcEncLib      pointer of encoder class
@@ -521,6 +649,9 @@ void EncCu::compressCtu(CodingStructure &cs, const UnitArea &area, const unsigne
     m_CABACEstimator->getCtx() = m_CurrCtx->start;
 
     partitioner.initCtu(area, ChannelType::CHROMA, *cs.slice);
+#if FastPartition
+    xFastPartitionPrepareChromaCtu(cs, area, currQP[ChannelType::CHROMA]);
+#endif
 
     cs.initSubStructure(*tempCS, partitioner.chType, partitioner.currArea(), false);
     cs.initSubStructure(*bestCS, partitioner.chType, partitioner.currArea(), false);
@@ -767,7 +898,8 @@ void EncCu::xCompressCU( CodingStructure*& tempCS, CodingStructure*& bestCS, Par
     m_modeCtrl->setQpCtu(m_pcSliceEncoder->getQpCtu());
   }
 #if FastPartition
-  m_modeCtrl->setFastPartitionContext(&m_fastPartitionCtuCache, &m_fastPartitionClassifierInfer);
+  m_modeCtrl->setFastPartitionContext(&m_fastPartitionCtuCache, &m_fastPartitionClassifierInfer,
+                                      &m_fastPartitionChromaCtuCache, &m_fastPartitionChromaClassifierInfer);
 #endif
   m_modeCtrl->initCULevel( partitioner, *tempCS );
 #if GDR_ENABLED

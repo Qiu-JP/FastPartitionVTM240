@@ -339,10 +339,17 @@ protected:
   FastPartitionCtuCache m_fastPartitionCtuCache;
   EncFastPartitionSwinInfer m_fastPartitionSwinInfer;
   EncFastPartitionClassifierInfer m_fastPartitionClassifierInfer;
+  FastPartitionChromaCtuCache m_fastPartitionChromaCtuCache;
+  EncFastPartitionChromaSwinInfer m_fastPartitionChromaSwinInfer;
+  EncFastPartitionClassifierInfer m_fastPartitionChromaClassifierInfer;
 
   void xFastPartitionPrepareCtu(CodingStructure& cs, const UnitArea& area, int qp);
   void xFastPartitionBuildSwinInput96(const CodingStructure& cs, int targetX, int targetY, FastPartitionSwinInput& dst) const;
   void xFastPartitionInferSwinCtu(int qp);
+  void xFastPartitionPrepareChromaCtu(CodingStructure& cs, const UnitArea& area, int qp);
+  void xFastPartitionBuildChromaSwinInput48(const CodingStructure& cs, int targetX, int targetY,
+                                            FastPartitionChromaSwinInput& dst) const;
+  void xFastPartitionInferChromaSwinCtu(int qp);
 #endif
 
   void xCalDebCost            ( CodingStructure &cs, Partitioner &partitioner, bool calDist = false );

@@ -316,7 +316,9 @@ public:
   virtual void finishCULevel        ( Partitioner &partitioner )                                                            = 0;
 #if FastPartition
   virtual void setFastPartitionContext(const FastPartitionCtuCache* ctuCache,
-                                       EncFastPartitionClassifierInfer* classifierInfer) {}
+                                       EncFastPartitionClassifierInfer* classifierInfer,
+                                       const FastPartitionChromaCtuCache* chromaCtuCache,
+                                       EncFastPartitionClassifierInfer* chromaClassifierInfer) {}
 #endif
 
 protected:
@@ -789,6 +791,8 @@ class EncModeCtrlMTnoRQT : public EncModeCtrl, public CacheBlkInfoCtrl
 #if FastPartition
   const FastPartitionCtuCache*       m_fastPartitionCtuCache = nullptr;
   EncFastPartitionClassifierInfer*   m_fastPartitionClassifierInfer = nullptr;
+  const FastPartitionChromaCtuCache* m_fastPartitionChromaCtuCache = nullptr;
+  EncFastPartitionClassifierInfer*   m_fastPartitionChromaClassifierInfer = nullptr;
 #endif
 #if GDR_ENABLED
   EncCfg m_encCfg;
@@ -808,10 +812,14 @@ public:
   virtual bool checkSkipOtherLfnst( const EncTestMode& encTestmode, CodingStructure*& tempCS, Partitioner& partitioner );
 #if FastPartition
   virtual void setFastPartitionContext(const FastPartitionCtuCache* ctuCache,
-                                       EncFastPartitionClassifierInfer* classifierInfer)
+                                       EncFastPartitionClassifierInfer* classifierInfer,
+                                       const FastPartitionChromaCtuCache* chromaCtuCache,
+                                       EncFastPartitionClassifierInfer* chromaClassifierInfer)
   {
     m_fastPartitionCtuCache = ctuCache;
     m_fastPartitionClassifierInfer = classifierInfer;
+    m_fastPartitionChromaCtuCache = chromaCtuCache;
+    m_fastPartitionChromaClassifierInfer = chromaClassifierInfer;
   }
 #endif
 

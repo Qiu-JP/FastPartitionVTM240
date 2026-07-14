@@ -1330,19 +1330,45 @@ bool EncModeCtrlMTnoRQT::xFastPartitionGetAllowedClasses(Partitioner& partitione
 {
   allowedClasses.fill(false);
 
-  if (!cs.slice->isIntra() || !isLuma(partitioner.chType))
+  if (!cs.slice->isIntra())
   {
     return false;
   }
 
-  const int cuX = cs.area.lx();
-  const int cuY = cs.area.ly();
-  const int cuWidth = cs.area.lwidth();
-  const int cuHeight = cs.area.lheight();
-  const PartSplit implicitSplit = partitioner.getImplicitSplit(cs);
-  const bool isBoundaryCu = cuX + cuWidth > cs.picture->lwidth() || cuY + cuHeight > cs.picture->lheight();
+  const bool luma = isLuma(partitioner.chType);
+  const FastPartitionCtuCache* lumaCache = luma ? m_fastPartitionCtuCache : nullptr;
+  EncFastPartitionClassifierInfer* lumaClassifier = luma ? m_fastPartitionClassifierInfer : nullptr;
+  const FastPartitionChromaCtuCache* chromaCache = luma ? nullptr : m_fastPartitionChromaCtuCache;
+  EncFastPartitionClassifierInfer* chromaClassifier = luma ? nullptr : m_fastPartitionChromaClassifierInfer;
 
-  if (cuWidth == 128 && cuHeight == 128)
+  if (luma)
+  {
+    if (lumaCache == nullptr || lumaClassifier == nullptr || !lumaClassifier->isInitialized())
+    {
+      return false;
+    }
+  }
+  else if (chromaCache == nullptr || chromaClassifier == nullptr
+           || !chromaCache->valid || !chromaClassifier->isInitialized())
+  {
+    // No complete chroma model pair was configured: preserve the original chroma RDO flow.
+    return false;
+  }
+
+  const Position cuPos = luma ? partitioner.currArea().lumaPos() : partitioner.currArea().chromaPos();
+  const Size cuSize = luma ? partitioner.currArea().lumaSize() : partitioner.currArea().chromaSize();
+  const int cuX = cuPos.x;
+  const int cuY = cuPos.y;
+  const int cuWidth = int(cuSize.width);
+  const int cuHeight = int(cuSize.height);
+  const int rootSize = luma ? 128 : 64;
+  const int modelBlockSize = luma ? 64 : 32;
+  const int pictureWidth = luma ? cs.picture->lwidth() : int(cs.picture->getOrigBuf(COMPONENT_Cb).width);
+  const int pictureHeight = luma ? cs.picture->lheight() : int(cs.picture->getOrigBuf(COMPONENT_Cb).height);
+  const PartSplit implicitSplit = partitioner.getImplicitSplit(cs);
+  const bool isBoundaryCu = cuX + cuWidth > pictureWidth || cuY + cuHeight > pictureHeight;
+
+  if (cuWidth == rootSize && cuHeight == rootSize)
   {
     if (implicitSplit != CU_DONT_SPLIT)
     {
@@ -1389,11 +1415,8 @@ bool EncModeCtrlMTnoRQT::xFastPartitionGetAllowedClasses(Partitioner& partitione
     return false;
   }
 
-  if (m_fastPartitionCtuCache == nullptr || m_fastPartitionClassifierInfer == nullptr)
-  {
-    return false;
-  }
-  if (!m_fastPartitionCtuCache->valid || cuWidth > 64 || cuHeight > 64 || cuWidth < 4 || cuHeight < 4)
+  const bool cacheValid = luma ? lumaCache->valid : chromaCache->valid;
+  if (!cacheValid || cuWidth > modelBlockSize || cuHeight > modelBlockSize || cuWidth < 4 || cuHeight < 4)
   {
     return false;
   }
@@ -1430,7 +1453,10 @@ bool EncModeCtrlMTnoRQT::xFastPartitionGetAllowedClasses(Partitioner& partitione
 
   std::array<float, FP_NUM_CLASS> probabilities;
   probabilities.fill(0.0f);
-  if (!m_fastPartitionClassifierInfer->inferCu(*m_fastPartitionCtuCache, cuX, cuY, cuWidth, cuHeight, probabilities))
+  const bool inferSucceeded = luma
+    ? lumaClassifier->inferCu(*lumaCache, cuX, cuY, cuWidth, cuHeight, probabilities)
+    : chromaClassifier->inferCu(*chromaCache, cuX, cuY, cuWidth, cuHeight, probabilities);
+  if (!inferSucceeded)
   {
     return false;
   }

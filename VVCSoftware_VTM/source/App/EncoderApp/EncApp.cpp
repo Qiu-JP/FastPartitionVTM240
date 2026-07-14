@@ -1451,6 +1451,8 @@ void EncApp::xInitLibCfg( int layerIdx )
 #if FastPartition
   m_cEncLib.setFastPartitionSwinModel                            ( m_fastPartitionSwinModel );
   m_cEncLib.setFastPartitionClassifierModel                      ( m_fastPartitionClassifierModel );
+  m_cEncLib.setFastPartitionChromaSwinModel                      ( m_fastPartitionChromaSwinModel );
+  m_cEncLib.setFastPartitionChromaClassifierModel                ( m_fastPartitionChromaClassifierModel );
   m_cEncLib.setFastPartitionPreset                               ( m_fastPartitionPreset );
   m_cEncLib.setFastPartitionThreshold                            ( m_fastPartitionThreshold );
   m_cEncLib.setFastPartitionThresholds                           ( m_fastPartitionTh );

@@ -61,6 +61,46 @@ struct FastPartitionCtuCache
   }
 };
 
+struct FastPartitionChromaSwinInput
+{
+  int targetX = 0;
+  int targetY = 0;
+  std::array<float, 2 * 48 * 48> chroma;
+};
+
+struct FastPartitionChromaGridmap32
+{
+  bool valid = false;
+  int  targetX = 0;
+  int  targetY = 0;
+  int  validWidthUnits = 0;
+  int  validHeightUnits = 0;
+  std::array<float, 2 * 8 * 8> values;
+};
+
+struct FastPartitionChromaCtuCache
+{
+  bool valid = false;
+  int  ctuX = 0;
+  int  ctuY = 0;
+  int  ctuWidth = 0;
+  int  ctuHeight = 0;
+  std::array<FastPartitionChromaSwinInput, 4> swinInputs;
+  std::array<FastPartitionChromaGridmap32, 4> gridmaps;
+
+  void reset()
+  {
+    valid = false;
+    ctuX = ctuY = ctuWidth = ctuHeight = 0;
+    for (auto& gridmap : gridmaps)
+    {
+      gridmap.valid = false;
+      gridmap.validWidthUnits = 0;
+      gridmap.validHeightUnits = 0;
+    }
+  }
+};
+
 class EncFastPartitionSwinInfer
 {
 public:
@@ -71,8 +111,28 @@ public:
   EncFastPartitionSwinInfer& operator=(const EncFastPartitionSwinInfer&) = delete;
 
   void init(const std::string& modelPath);
+  bool isInitialized() const;
   void inferCtu(const std::array<FastPartitionSwinInput, 4>& swinInputs, int qp,
                 std::array<FastPartitionGridmap64, 4>& gridmaps);
+
+private:
+  struct Impl;
+  std::unique_ptr<Impl> m_impl;
+};
+
+class EncFastPartitionChromaSwinInfer
+{
+public:
+  EncFastPartitionChromaSwinInfer();
+  ~EncFastPartitionChromaSwinInfer();
+
+  EncFastPartitionChromaSwinInfer(const EncFastPartitionChromaSwinInfer&) = delete;
+  EncFastPartitionChromaSwinInfer& operator=(const EncFastPartitionChromaSwinInfer&) = delete;
+
+  void init(const std::string& modelPath);
+  bool isInitialized() const;
+  void inferCtu(const std::array<FastPartitionChromaSwinInput, 4>& swinInputs, int qp,
+                std::array<FastPartitionChromaGridmap32, 4>& gridmaps);
 
 private:
   struct Impl;
@@ -89,7 +149,10 @@ public:
   EncFastPartitionClassifierInfer& operator=(const EncFastPartitionClassifierInfer&) = delete;
 
   void init(const std::string& modelPath);
+  bool isInitialized() const;
   bool inferCu(const FastPartitionCtuCache& ctuCache, int cuX, int cuY, int cuWidth, int cuHeight,
+               std::array<float, 6>& splitProbabilities);
+  bool inferCu(const FastPartitionChromaCtuCache& ctuCache, int cuX, int cuY, int cuWidth, int cuHeight,
                std::array<float, 6>& splitProbabilities);
 
 private:

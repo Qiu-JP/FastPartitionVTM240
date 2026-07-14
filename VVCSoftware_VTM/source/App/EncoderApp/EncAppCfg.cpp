@@ -1432,6 +1432,8 @@ bool EncAppCfg::parseCfg( int argc, char* argv[] )
 #if FastPartition
   ("FastPartitionSwinModel",                          m_fastPartitionSwinModel,                    std::string(""), "FastPartition SwinTransformer_Unet_Luma96 TorchScript model file name")
   ("FastPartitionClassifierModel",                    m_fastPartitionClassifierModel,              std::string(""), "FastPartition Classifier_I TorchScript model file name")
+  ("FastPartitionChromaSwinModel",                    m_fastPartitionChromaSwinModel,              std::string(""), "FastPartition 2x48x48 chroma Swin TorchScript model file name; empty disables chroma fast partition")
+  ("FastPartitionChromaClassifierModel",              m_fastPartitionChromaClassifierModel,        std::string(""), "FastPartition chroma Classifier_I TorchScript model file name; empty disables chroma fast partition")
   ("FastPartitionPreset",                             m_fastPartitionPreset,                       std::string("all"), "FastPartition classifier preset: all, fast, or middle")
   ("FastPartitionThreshold",                          m_fastPartitionThreshold,                    -1.0, "FastPartition classifier threshold override. Negative values use FastPartitionPreset.")
   ("FastPartitionTh",                                 m_fastPartitionTh,                            std::string(""), "FastPartition thresholds [NO_SPLIT,QT,BTH,BTV,TTH,TTV]")

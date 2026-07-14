@@ -968,6 +968,8 @@ protected:
 #if FastPartition
   std::string m_fastPartitionSwinModel;                        ///< FastPartition Swin luma TorchScript model file name
   std::string m_fastPartitionClassifierModel;                  ///< FastPartition Classifier_I TorchScript model file name
+  std::string m_fastPartitionChromaSwinModel;                  ///< FastPartition Swin chroma TorchScript model file name
+  std::string m_fastPartitionChromaClassifierModel;            ///< FastPartition chroma Classifier_I TorchScript model file name
   std::string m_fastPartitionPreset;                           ///< FastPartition classifier preset
   double      m_fastPartitionThreshold;                        ///< FastPartition classifier threshold override
   std::string m_fastPartitionTh;                               ///< FastPartition per-class thresholds

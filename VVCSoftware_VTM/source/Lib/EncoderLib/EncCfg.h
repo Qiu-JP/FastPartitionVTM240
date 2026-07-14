@@ -1084,6 +1084,8 @@ protected:
 #if FastPartition
   std::string m_fastPartitionSwinModel;            ///< FastPartition Swin luma TorchScript model file name
   std::string m_fastPartitionClassifierModel;      ///< FastPartition Classifier_I TorchScript model file name
+  std::string m_fastPartitionChromaSwinModel;      ///< FastPartition Swin chroma TorchScript model file name
+  std::string m_fastPartitionChromaClassifierModel;///< FastPartition chroma Classifier_I TorchScript model file name
   std::string m_fastPartitionPreset;               ///< FastPartition classifier preset
   double      m_fastPartitionThreshold = -1.0;     ///< FastPartition classifier threshold override
   std::array<double, 6> m_fastPartitionThresholds = { { 0.1, 0.1, 0.1, 0.1, 0.1, 0.1 } };
@@ -3229,6 +3231,10 @@ public:
   const std::string& getFastPartitionSwinModel() const               { return m_fastPartitionSwinModel;}
   void         setFastPartitionClassifierModel( const std::string &s ){ m_fastPartitionClassifierModel = s;   }
   const std::string& getFastPartitionClassifierModel() const          { return m_fastPartitionClassifierModel;}
+  void         setFastPartitionChromaSwinModel( const std::string &s ){ m_fastPartitionChromaSwinModel = s; }
+  const std::string& getFastPartitionChromaSwinModel() const          { return m_fastPartitionChromaSwinModel; }
+  void         setFastPartitionChromaClassifierModel( const std::string &s ){ m_fastPartitionChromaClassifierModel = s; }
+  const std::string& getFastPartitionChromaClassifierModel() const          { return m_fastPartitionChromaClassifierModel; }
   void         setFastPartitionPreset       ( const std::string &s ) { m_fastPartitionPreset = s;      }
   const std::string& getFastPartitionPreset() const                  { return m_fastPartitionPreset;   }
   void         setFastPartitionThreshold    ( double d )             { m_fastPartitionThreshold = d;   }
