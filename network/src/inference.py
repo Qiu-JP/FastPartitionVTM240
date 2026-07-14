@@ -144,7 +144,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Run 96x96 Swin gridmap inference for one dataset sample.")
     parser.add_argument("--checkpoint", required=True, help="Swin checkpoint path.")
     parser.add_argument("--dataset", default="DIV2K")
-    parser.add_argument("--split", default="validating96")
+    parser.add_argument("--split", default="validating")
     parser.add_argument("--component", choices=("Luma",), default="Luma")
     parser.add_argument("--sequence", default=None)
     parser.add_argument("--qp", type=int, default=None)

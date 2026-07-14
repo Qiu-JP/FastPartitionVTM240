@@ -28,9 +28,9 @@ DATA_TYPE_TO_SPLIT_DIR = {
 }
 
 DATA_TYPE_TO_OUTPUT_SPLIT_DIR = {
-    1: "training96",
-    2: "testing96",
-    3: "validating96",
+    1: "training",
+    2: "testing",
+    3: "validating",
 }
 
 DATA_TYPE_TO_DATASET = {
