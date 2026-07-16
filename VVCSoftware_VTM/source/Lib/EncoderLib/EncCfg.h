@@ -1083,9 +1083,9 @@ protected:
   std::string m_scalingListFileName;              ///< quantization matrix file name
 #if FastPartition
   std::string m_fastPartitionSwinModel;            ///< FastPartition Swin luma TorchScript model file name
-  std::string m_fastPartitionClassifierModel;      ///< FastPartition Classifier_I TorchScript model file name
+  std::string m_fastPartitionClassifierModel;      ///< FastPartition Classifier_I native JSON model file name
   std::string m_fastPartitionChromaSwinModel;      ///< FastPartition Swin chroma TorchScript model file name
-  std::string m_fastPartitionChromaClassifierModel;///< FastPartition chroma Classifier_I TorchScript model file name
+  std::string m_fastPartitionChromaClassifierModel;///< FastPartition chroma Classifier_I native JSON model file name
   std::string m_fastPartitionPreset;               ///< FastPartition classifier preset
   double      m_fastPartitionThreshold = -1.0;     ///< FastPartition classifier threshold override
   std::array<double, 6> m_fastPartitionThresholds = { { 0.1, 0.1, 0.1, 0.1, 0.1, 0.1 } };

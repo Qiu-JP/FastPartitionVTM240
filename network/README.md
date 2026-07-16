@@ -193,7 +193,8 @@ network/output/<outDir>/<jobID>/
 | `--stage1Lr` / `--stage2Lr` | 两阶段学习率。 |
 | `--stage1GridLossWeight` / `--stage2GridLossWeight` | 两阶段 gridmap loss 权重。 |
 | `--stage1ClsLossWeight` / `--stage2ClsLossWeight` | 两阶段 classifier loss 权重。 |
-| `--gridLossType` | gridmap loss 类型：`BCE`、`L1`、`HUBER`、`MSE`。 |
+| `--gridLossType` | gridmap loss 类型：`BCE`、`BCE_L1`、`WBCE`、`L1`、`HUBER`、`MSE`。 |
+| `--fasttrain` | `1` 时，训练和验证均在每个 batch 内按 Classifier ROI 形状随机采样，每种形状最多保留 512 个节点；默认 `0` 使用全部节点。 |
 | `--swinCkpt` | 可选 Swin checkpoint。 |
 | `--classifierCkpt` | 可选 `Classifier_I` checkpoint。 |
 | `--tbTrainImageSamples` | TensorBoard training 图像样本，默认 `simple:1989496,medium:819088,complex:320136`。 |
@@ -287,16 +288,17 @@ python network/src/saveModel.py \
 
 默认导出到 checkpoint 同目录，文件名为 `swin-final.pt`。
 
-导出 `Classifier_I` TorchScript：
+导出 `Classifier_I` native JSON：
 
 ```bash
 python network/src/saveModel.py \
-  --task export_classifier \
+  --task export_classifier_json \
   --checkpoint network/checkpoints/classifier_i_pretrain/logical/model-final.pth \
+  --output network/checkpoints/classifier_i_pretrain/logical/model-final.native.json \
   --device cpu
 ```
 
-默认导出到 checkpoint 同目录，文件名为 `model-final.pt`。如需指定其他位置或名称，可额外传入 `--output <path>`。
+VTM 通过 `--FastPartitionClassifierModel=<path>` 直接加载导出的 `.native.json` 文件。
 
 导出完成后，使用独立命令启动 Netron 查看 `.pt` 结构：
 

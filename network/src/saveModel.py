@@ -1,10 +1,8 @@
 import argparse
+import json
 from pathlib import Path
-from typing import Optional
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 import paths
 from model import Classifier_I
@@ -75,126 +73,52 @@ def serve_netron(model_path, host, port):
     netron.wait()
 
 
-class ClassifierIExportWrapper(nn.Module):
-    """TorchScript-friendly Classifier_I wrapper with explicit H/W branches."""
-
-    def __init__(self, source):
-        super().__init__()
-        self.num_classes = int(source.num_classes)
-        self.input_channel = int(source.input_channel)
-        self.mask_value = float(source.mask_value)
-
-        self.branch_16x16 = source.branches["16x16"]
-        self.branch_8x8 = source.branches["8x8"]
-        self.branch_8x4 = source.branches["8x4"]
-        self.branch_4x8 = source.branches["4x8"]
-        self.branch_8x2 = source.branches["8x2"]
-        self.branch_2x8 = source.branches["2x8"]
-        self.branch_8x1 = source.branches["8x1"]
-        self.branch_1x8 = source.branches["1x8"]
-        self.branch_4x2 = source.branches["4x2"]
-        self.branch_2x4 = source.branches["2x4"]
-        self.branch_4x1 = source.branches["4x1"]
-        self.branch_1x4 = source.branches["1x4"]
-        self.branch_4x4 = source.branches["4x4"]
-        self.branch_2x2 = source.branches["2x2"]
-        self.branch_2x1 = source.branches["2x1"]
-        self.branch_1x2 = source.branches["1x2"]
-
-        for grid_h, grid_w in CLASSIFIER_I_GRID_SIZES + ((1, 1),):
-            key = "{}x{}".format(grid_h, grid_w)
-            self.register_buffer("mask_" + key, getattr(source, "mask_" + key).clone())
-
-    def _apply_mask(self, logits, mask):
-        mask = mask.to(device=logits.device)
-        if mask.dim() == 1:
-            mask = mask.unsqueeze(0)
-        mask = mask.expand_as(logits)
-        return logits.masked_fill(~mask, self.mask_value)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        dynamic_mask: Optional[torch.Tensor] = None,
-        return_probs: bool = False,
-    ) -> torch.Tensor:
-        B = x.size(0)
-        C = x.size(1)
-        H = x.size(2)
-        W = x.size(3)
-        if C != self.input_channel:
-            raise RuntimeError("Classifier_I expects 2 input channels")
-
-        if H == 16 and W == 16:
-            logits = self.branch_16x16(x.reshape(B, -1))
-            static_mask = self.mask_16x16
-        elif H == 8 and W == 8:
-            logits = self.branch_8x8(x.reshape(B, -1))
-            static_mask = self.mask_8x8
-        elif H == 8 and W == 4:
-            logits = self.branch_8x4(x.reshape(B, -1))
-            static_mask = self.mask_8x4
-        elif H == 4 and W == 8:
-            logits = self.branch_4x8(x.reshape(B, -1))
-            static_mask = self.mask_4x8
-        elif H == 8 and W == 2:
-            logits = self.branch_8x2(x.reshape(B, -1))
-            static_mask = self.mask_8x2
-        elif H == 2 and W == 8:
-            logits = self.branch_2x8(x.reshape(B, -1))
-            static_mask = self.mask_2x8
-        elif H == 8 and W == 1:
-            logits = self.branch_8x1(x.reshape(B, -1))
-            static_mask = self.mask_8x1
-        elif H == 1 and W == 8:
-            logits = self.branch_1x8(x.reshape(B, -1))
-            static_mask = self.mask_1x8
-        elif H == 4 and W == 2:
-            logits = self.branch_4x2(x.reshape(B, -1))
-            static_mask = self.mask_4x2
-        elif H == 2 and W == 4:
-            logits = self.branch_2x4(x.reshape(B, -1))
-            static_mask = self.mask_2x4
-        elif H == 4 and W == 1:
-            logits = self.branch_4x1(x.reshape(B, -1))
-            static_mask = self.mask_4x1
-        elif H == 1 and W == 4:
-            logits = self.branch_1x4(x.reshape(B, -1))
-            static_mask = self.mask_1x4
-        elif H == 4 and W == 4:
-            logits = self.branch_4x4(x.reshape(B, -1))
-            static_mask = self.mask_4x4
-        elif H == 2 and W == 2:
-            logits = self.branch_2x2(x.reshape(B, -1))
-            static_mask = self.mask_2x2
-        elif H == 2 and W == 1:
-            logits = self.branch_2x1(x.reshape(B, -1))
-            static_mask = self.mask_2x1
-        elif H == 1 and W == 2:
-            logits = self.branch_1x2(x.reshape(B, -1))
-            static_mask = self.mask_1x2
-        elif H == 1 and W == 1:
-            logits = x.new_full((B, self.num_classes), self.mask_value)
-            logits[:, 0] = 0
-            static_mask = self.mask_1x1
-        else:
-            raise RuntimeError("Unsupported Classifier_I grid ROI")
-
-        logits = self._apply_mask(logits, static_mask)
-        if dynamic_mask is not None:
-            logits = self._apply_mask(logits, dynamic_mask.to(dtype=torch.bool))
-        if return_probs:
-            return F.softmax(logits, dim=1)
-        return logits
+def tensor_to_list(tensor):
+    return tensor.detach().cpu().float().tolist()
 
 
-def export_classifier(checkpoint_path, output_path, device):
+def export_classifier_json(checkpoint_path, output_path, device):
     model = Classifier_I()
     missing, unexpected = load_model_weights(model, checkpoint_path, device)
     model.eval()
-    wrapper = ClassifierIExportWrapper(model).eval()
-    scripted = torch.jit.script(wrapper)
-    scripted.save(str(output_path))
+
+    branches = []
+    for grid_h, grid_w in CLASSIFIER_I_GRID_SIZES:
+        key = "{}x{}".format(grid_h, grid_w)
+        branch = model.branches[key]
+        fc1 = branch[0]
+        fc2 = branch[2]
+        branches.append({
+            "name": key,
+            "grid_h": grid_h,
+            "grid_w": grid_w,
+            "input_dim": int(fc1.in_features),
+            "hidden_dim": int(fc1.out_features),
+            "fc1_weight": tensor_to_list(fc1.weight),
+            "fc1_bias": tensor_to_list(fc1.bias),
+            "fc2_weight": tensor_to_list(fc2.weight),
+            "fc2_bias": tensor_to_list(fc2.bias),
+            "static_mask": tensor_to_list(getattr(model, "mask_" + key).to(dtype=torch.int32)),
+        })
+
+    payload = {
+        "format": "ClassifierI.NativeJSON",
+        "version": 1,
+        "num_classes": int(model.num_classes),
+        "input_channel": int(model.input_channel),
+        "mask_value": float(model.mask_value),
+        "branches": branches,
+        "branch_1x1": {
+            "grid_h": 1,
+            "grid_w": 1,
+            "static_mask": tensor_to_list(model.mask_1x1.to(dtype=torch.int32)),
+        },
+    }
+
+    with output_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+        f.write("\n")
+
     return missing, unexpected
 
 
@@ -211,9 +135,13 @@ def export_swin_luma(checkpoint_path, output_path, device, use_context_mask):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Export 96x96 trained checkpoints for C++ deployment.")
-    parser.add_argument("--task", choices=("export_classifier", "swin_luma"), required=True)
+    parser.add_argument(
+        "--task",
+        choices=("export_classifier_json", "swin_luma"),
+        required=True,
+    )
     parser.add_argument("--checkpoint", required=True, help="Path to a .pth checkpoint under network/checkpoints.")
-    parser.add_argument("--output", required=True, help="Output .pt path.")
+    parser.add_argument("--output", required=True, help="Output .pt or .native.json path.")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--useContextMask", action="store_true", help="Use the context-mask variant for SwinTransformer_Unet_Luma96.")
     parser.add_argument("--viewNetron", action="store_true", help="Start a Netron server for the exported .pt model.")
@@ -233,8 +161,8 @@ if __name__ == "__main__":
         output_path = paths.project_root() / output_path
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    if args.task == "export_classifier":
-        missing, unexpected = export_classifier(checkpoint_path, output_path, device)
+    if args.task == "export_classifier_json":
+        missing, unexpected = export_classifier_json(checkpoint_path, output_path, device)
     elif args.task == "swin_luma":
         missing, unexpected = export_swin_luma(checkpoint_path, output_path, device, args.useContextMask)
 
