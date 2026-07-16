@@ -33,6 +33,9 @@ def getDat(strName, fpt, strTag, datQpThreshold):
     # pop and check info items
     strLineCur = next(fpt).rstrip()
     strInfoAll = re.split("\s{2,}", strLineCur)
+    bolHasElapsed = strInfoAll[-1] == CSTR_INFO_TIME
+    if bolHasElapsed:
+        strInfoAll = strInfoAll[:-1]
     for idx in range(len(strInfoAll)):
         if strInfoAll[idx] != CSTR_INFO_BFR_ALL[idx % 4]:
             assert False, "\n\n[error from {:s}] the {:d}(st/nd/rd/th) info item \"{:s}\" in {:s} is incorrect\n".format(strName, idx, strInfoAll[idx], strTag)
@@ -41,13 +44,21 @@ def getDat(strName, fpt, strTag, datQpThreshold):
 
     # main body
     datFul = {}
+    datTime = {}
     for strLineCur in fpt:
         # get info
-        [*strDat, strSequence] = strLineCur.split()
+        if bolHasElapsed:
+            [*strDat, strElapsed, strSequence] = strLineCur.split()
+        else:
+            [*strDat, strSequence] = strLineCur.split()
         [strSequence, strQp] = strSequence.split(sep = "_")
         datQp = int(strQp)
         if datQp < datQpThreshold:
             continue
+        if bolHasElapsed:
+            if not strSequence in datTime:
+                datTime[strSequence] = {}
+            datTime[strSequence][datQp] = float(strElapsed)
         # create key seq
         if not strSequence in datFul:
             datFul[strSequence] = {}
@@ -76,7 +87,7 @@ def getDat(strName, fpt, strTag, datQpThreshold):
     fpt.close()
 
     # return
-    return datFul
+    return datFul, datTime
 
 
 #*** PARAMTER ******************************************************************
@@ -84,6 +95,7 @@ def getDat(strName, fpt, strTag, datQpThreshold):
 CSTR_TYPE_ALL     = ("average", "I frame", "P frame", "B frame")
 CSTR_INFO_BFR_ALL = ("bitrate(kb/s)", "psnr(Y)", "psnr(U)", "psnr(V)")
 CSTR_INFO_AFT_ALL = ("bdrate(Y)", "bdrate(U)", "bdrate(V)", "bdrate(average)")
+CSTR_INFO_TIME    = "elapsed(s)"
 CSTR_USAGE        = "\n[information from {:s}] usage: getBdRate.py anchor.log result.log [YUV420|YUV444 [<QP threshold>]] > bdRate.log\n".format(sys.argv[0])
 
 
@@ -123,10 +135,20 @@ if len(sys.argv) > 5:
     assert False, "\n\n[error from {:s}] unknown parameter \"{:s}\"\n".format(sys.argv[0], sys.argv[5:]) + CSTR_USAGE
 
 # process anchor
-datAnchor = getDat(sys.argv[0], fptAnchor, "anchor", datQpThreshold)
+datAnchor, datTimeAnchor = getDat(sys.argv[0], fptAnchor, "anchor", datQpThreshold)
 
 # process testor
-datResult = getDat(sys.argv[0], fptResult, "result", datQpThreshold)
+datResult, datTimeResult = getDat(sys.argv[0], fptResult, "result", datQpThreshold)
+
+# Compute one time-saving value per sequence over all QPs present in both runs.
+timeSavings = {}
+for strSequence in datTimeAnchor:
+    if strSequence in datTimeResult:
+        datQps = set(datTimeAnchor[strSequence]) & set(datTimeResult[strSequence])
+        datTimeAnchorSum = sum(datTimeAnchor[strSequence][datQp] for datQp in datQps)
+        datTimeResultSum = sum(datTimeResult[strSequence][datQp] for datQp in datQps)
+        if datTimeAnchorSum:
+            timeSavings[strSequence] = (datTimeAnchorSum - datTimeResultSum) / datTimeAnchorSum * 100.0
 
 
 #--- CORE ------------------------------
@@ -134,7 +156,10 @@ datResult = getDat(sys.argv[0], fptResult, "result", datQpThreshold)
 print("{:<57s} {:<57s} {:<57s} {:s}".format(*CSTR_TYPE_ALL))
 for x in range(4):
     print("{:<12s} {:<12s} {:<12s} {:<18s} ".format(*CSTR_INFO_AFT_ALL), end = "")
-print("{:s}".format("sequence"))
+if timeSavings:
+    print("{:<18s} {:s}".format("time saving(%)", "sequence"))
+else:
+    print("{:s}".format("sequence"))
 
 # body
 # for sequence
@@ -195,7 +220,10 @@ for strSequence in datAnchor:
             print("{:<12.3f} {:<12.3f} {:<12.3f} {:<18.3f} ".format(*datBdRt), end = "")
 
         # dump strSequence
-        print(strSequence)
+        if timeSavings:
+            print("{:<18.3f} {:s}".format(timeSavings.get(strSequence, float("nan")), strSequence))
+        else:
+            print(strSequence)
 
 # dump datBdRtStat
 print("")
@@ -213,4 +241,10 @@ for strStat in ("min", "AVE", "max"):
                     print("{:<12.3f} {:<12.3f} {:<12.3f} {:.3f}"    .format(*(func(datBdRtAll[strTyp][strInfoAft]) for strInfoAft in CSTR_INFO_AFT_ALL)), end = "")
                 else:
                     print("{:<12.3f} {:<12.3f} {:<12.3f} {:<18.3f} ".format(*(func(datBdRtAll[strTyp][strInfoAft]) for strInfoAft in CSTR_INFO_AFT_ALL)), end = "")
+        if timeSavings:
+            if idxLine == 0:
+                print(" {:<18s}".format(strStat + "(time saving)"), end = "")
+            else:
+                func = {"min": np.min, "AVE": np.mean, "max": np.max}[strStat]
+                print(" {:<18.3f}".format(func(list(timeSavings.values()))), end = "")
         print("")

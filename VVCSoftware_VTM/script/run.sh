@@ -14,6 +14,8 @@ FULL_FRAMES=0
 WORKDIR=""
 FAST_MODEL=""
 CLASSIFIER_MODEL=""
+CHROMA_FAST_MODEL=""
+CHROMA_CLASSIFIER_MODEL=""
 FAST_PARTITION_PRESET="all"
 FAST_PARTITION_THRESHOLD=""
 FAST_PARTITION_THRESHOLDS=""
@@ -43,7 +45,12 @@ Options:
   --workdir DIR        Output directory. Default: ${SCRIPT_DIR}/output/ai_eval_<timestamp>
   --fast-model FILE    TorchScript Swin model passed to test encoder as --FastPartitionSwinModel.
   --classifier-model FILE
-                       TorchScript Classifier_I model passed as --FastPartitionClassifierModel.
+                       Native JSON Classifier_I model passed as --FastPartitionClassifierModel.
+  --chroma-fast-model FILE
+                       2x48x48 Chroma TorchScript model passed as --FastPartitionChromaSwinModel.
+  --chroma-classifier-model FILE
+                       Chroma native JSON Classifier_I model passed as --FastPartitionChromaClassifierModel.
+                       Omit either chroma model to keep the original chroma RDO flow.
   --preset NAME        FastPartitionPreset passed to test encoder. Default: ${FAST_PARTITION_PRESET}
   --threshold VALUE    Optional FastPartitionThreshold override passed to test encoder.
   --thresholds LIST    FastPartitionTh list, e.g. "[0.1,0.1,0.1,0.1,0.1,0.1]".
@@ -103,6 +110,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --classifier-model)
       CLASSIFIER_MODEL="$2"
+      shift 2
+      ;;
+    --chroma-fast-model)
+      CHROMA_FAST_MODEL="$2"
+      shift 2
+      ;;
+    --chroma-classifier-model)
+      CHROMA_CLASSIFIER_MODEL="$2"
       shift 2
       ;;
     --preset)
@@ -190,6 +205,12 @@ fi
 if [[ -n "$CLASSIFIER_MODEL" && ! -f "$CLASSIFIER_MODEL" ]]; then
   die "classifier model not found: $CLASSIFIER_MODEL"
 fi
+if [[ -n "$CHROMA_FAST_MODEL" && ! -f "$CHROMA_FAST_MODEL" ]]; then
+  die "chroma fast model not found: $CHROMA_FAST_MODEL"
+fi
+if [[ -n "$CHROMA_CLASSIFIER_MODEL" && ! -f "$CHROMA_CLASSIFIER_MODEL" ]]; then
+  die "chroma classifier model not found: $CHROMA_CLASSIFIER_MODEL"
+fi
 
 mkdir -p "$WORKDIR/logs/anchor" "$WORKDIR/logs/test" "$WORKDIR/tmp"
 if [[ "$DUMP_FIRST_LCU" -eq 1 || "$DUMP_BOUNDARY_CTU" -eq 1 ]]; then
@@ -198,12 +219,7 @@ fi
 
 RD_ANCHOR="${WORKDIR}/rd_anchor.log"
 RD_TEST="${WORKDIR}/rd_test.log"
-BD_LOG="${WORKDIR}/bd_rate.log"
-PER_QP_CSV="${WORKDIR}/per_qp_results.csv"
-RESULT_TXT="${WORKDIR}/result.txt"
-FAILURES="${WORKDIR}/failures.txt"
-
-: > "$FAILURES"
+RESULT_LOG="${WORKDIR}/result.log"
 
 write_rd_header() {
   local out="$1"
@@ -212,7 +228,7 @@ write_rd_header() {
     for _ in 1 2 3 4; do
       printf "%-12s  %-12s  %-12s  %-18s  " "bitrate(kb/s)" "psnr(Y)" "psnr(U)" "psnr(V)"
     done
-    printf "\n"
+    printf "%s\n" "elapsed(s)"
   } > "$out"
 }
 
@@ -228,11 +244,13 @@ append_rd_row() {
   local i_y="$9"
   local i_u="${10}"
   local i_v="${11}"
+  local elapsed="${12}"
 
   printf "%-12.4f %-12.4f %-12.4f %-12.4f " "$a_bitrate" "$a_y" "$a_u" "$a_v" >> "$out"
   printf "%-12.4f %-12.4f %-12.4f %-12.4f " "$i_bitrate" "$i_y" "$i_u" "$i_v" >> "$out"
   printf "%-12.4f %-12.4f %-12.4f %-12.4f " 0 0 0 0 >> "$out"
   printf "%-12.4f %-12.4f %-12.4f %-12.4f " 0 0 0 0 >> "$out"
+  printf "%-18.4f " "$elapsed" >> "$out"
   printf "%s_%s\n" "$seq" "$qp" >> "$out"
 }
 
@@ -273,49 +291,7 @@ find_yuv_file() {
 
 parse_encode_log() {
   local log_file="$1"
-  "$PYTHON_BIN" - "$log_file" <<'PY'
-import math
-import re
-import sys
-
-log_path = sys.argv[1]
-lines = open(log_path, "r", errors="replace").read().splitlines()
-summary = {}
-elapsed = None
-
-num = r"(?:[-+]?nan|[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)"
-metric_re = re.compile(r"^\s*(\d+)\s+([aipb])\s+(" + num + r")\s+(" + num + r")\s+(" + num + r")\s+(" + num + r")")
-time_re = re.compile(r"Total Time:\s*([0-9.]+)\s*sec\.\s*\[user\]\s*([0-9.]+)\s*sec\.\s*\[elapsed\]")
-
-for line in lines:
-    m = metric_re.match(line)
-    if m:
-        frame_count = int(m.group(1))
-        frame_type = m.group(2)
-        values = [float(m.group(i)) for i in range(3, 7)]
-        summary[frame_type] = [frame_count] + values
-        continue
-    m = time_re.search(line)
-    if m:
-        elapsed = float(m.group(2))
-
-if "a" not in summary:
-    raise SystemExit("missing average summary row")
-if elapsed is None:
-    raise SystemExit("missing elapsed time")
-
-a = summary["a"]
-i = summary.get("i", a)
-required = a[1:] + i[1:] + [elapsed]
-if any((not math.isfinite(x)) for x in required):
-    raise SystemExit("summary contains non-finite values")
-
-print("\t".join(str(x) for x in [
-    a[0], a[1], a[2], a[3], a[4],
-    i[0], i[1], i[2], i[3], i[4],
-    elapsed,
-]))
-PY
+  "$PYTHON_BIN" "$SCRIPT_DIR/parseLog.py" "$log_file"
 }
 
 run_encoder() {
@@ -347,6 +323,12 @@ run_encoder() {
   fi
   if [[ "$kind" == "test" && -n "$CLASSIFIER_MODEL" ]]; then
     cmd+=( --FastPartitionClassifierModel="$CLASSIFIER_MODEL" )
+  fi
+  if [[ "$kind" == "test" && -n "$CHROMA_FAST_MODEL" ]]; then
+    cmd+=( --FastPartitionChromaSwinModel="$CHROMA_FAST_MODEL" )
+  fi
+  if [[ "$kind" == "test" && -n "$CHROMA_CLASSIFIER_MODEL" ]]; then
+    cmd+=( --FastPartitionChromaClassifierModel="$CHROMA_CLASSIFIER_MODEL" )
   fi
   if [[ "$kind" == "test" ]]; then
     cmd+=( --FastPartitionPreset="$FAST_PARTITION_PRESET" )
@@ -380,7 +362,6 @@ run_encoder() {
 
 write_rd_header "$RD_ANCHOR"
 write_rd_header "$RD_TEST"
-printf "sequence,qp,frames,width,height,fps,anchor_bitrate,anchor_y,anchor_u,anchor_v,anchor_time,test_bitrate,test_y,test_u,test_v,test_time,time_saving_percent,time_ratio\n" > "$PER_QP_CSV"
 
 IFS=' ' read -r -a QPS <<< "$QPS_STR"
 if [[ "${#QPS[@]}" -eq 0 ]]; then
@@ -401,7 +382,7 @@ while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
 
   seq_cfg="${VTM_DIR}/cfg/per-sequence/${seq}.cfg"
   if [[ ! -f "$seq_cfg" ]]; then
-    echo "${seq},ALL,missing sequence cfg: ${seq_cfg}" >> "$FAILURES"
+    echo "WARNING: ${seq}: missing sequence cfg: ${seq_cfg}" >&2
     continue
   fi
 
@@ -412,7 +393,7 @@ while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
 
   yuv_file="$(find_yuv_file "$cfg_input" "$seq" "$width" "$height" "$fps")"
   if [[ -z "$yuv_file" ]]; then
-    echo "${seq},ALL,missing YUV file: ${cfg_input}" >> "$FAILURES"
+    echo "WARNING: ${seq}: missing YUV file: ${cfg_input}" >&2
     continue
   fi
 
@@ -426,174 +407,38 @@ while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
     test_log="${WORKDIR}/logs/test/${seq}_QP${qp}.log"
 
     if ! run_encoder "anchor" "$ANCHOR_BIN" "$seq" "$qp" "$frames" "$yuv_file" "$seq_cfg" "$anchor_log"; then
-      echo "${seq},QP${qp},anchor encode failed: ${anchor_log}" >> "$FAILURES"
+      echo "WARNING: ${seq} QP${qp}: anchor encode failed: ${anchor_log}" >&2
       continue
     fi
     if ! run_encoder "test" "$TEST_BIN" "$seq" "$qp" "$frames" "$yuv_file" "$seq_cfg" "$test_log"; then
-      echo "${seq},QP${qp},test encode failed: ${test_log}" >> "$FAILURES"
+      echo "WARNING: ${seq} QP${qp}: test encode failed: ${test_log}" >&2
       continue
     fi
 
     if ! anchor_metrics="$(parse_encode_log "$anchor_log")"; then
-      echo "${seq},QP${qp},anchor log parse failed: ${anchor_log}" >> "$FAILURES"
+      echo "WARNING: ${seq} QP${qp}: anchor log parse failed: ${anchor_log}" >&2
       continue
     fi
     if ! test_metrics="$(parse_encode_log "$test_log")"; then
-      echo "${seq},QP${qp},test log parse failed: ${test_log}" >> "$FAILURES"
+      echo "WARNING: ${seq} QP${qp}: test log parse failed: ${test_log}" >&2
       continue
     fi
 
     IFS=$'\t' read -r a_frames a_br a_y a_u a_v i_frames i_br i_y i_u i_v a_time <<< "$anchor_metrics"
     IFS=$'\t' read -r t_a_frames t_br t_y t_u t_v t_i_frames t_i_br t_i_y t_i_u t_i_v t_time <<< "$test_metrics"
 
-    time_saving="$("$PYTHON_BIN" - "$a_time" "$t_time" <<'PY'
-import sys
-a = float(sys.argv[1])
-t = float(sys.argv[2])
-print((a - t) / a * 100.0 if a else 0.0)
-PY
-)"
-    time_ratio="$("$PYTHON_BIN" - "$a_time" "$t_time" <<'PY'
-import sys
-a = float(sys.argv[1])
-t = float(sys.argv[2])
-print(t / a if a else 0.0)
-PY
-)"
-
-    append_rd_row "$RD_ANCHOR" "$seq" "$qp" "$a_br" "$a_y" "$a_u" "$a_v" "$i_br" "$i_y" "$i_u" "$i_v"
-    append_rd_row "$RD_TEST" "$seq" "$qp" "$t_br" "$t_y" "$t_u" "$t_v" "$t_i_br" "$t_i_y" "$t_i_u" "$t_i_v"
-    printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n" \
-      "$seq" "$qp" "$frames" "$width" "$height" "$fps" \
-      "$a_br" "$a_y" "$a_u" "$a_v" "$a_time" \
-      "$t_br" "$t_y" "$t_u" "$t_v" "$t_time" \
-      "$time_saving" "$time_ratio" >> "$PER_QP_CSV"
+    append_rd_row "$RD_ANCHOR" "$seq" "$qp" "$a_br" "$a_y" "$a_u" "$a_v" "$i_br" "$i_y" "$i_u" "$i_v" "$a_time"
+    append_rd_row "$RD_TEST" "$seq" "$qp" "$t_br" "$t_y" "$t_u" "$t_v" "$t_i_br" "$t_i_y" "$t_i_u" "$t_i_v" "$t_time"
   done
 done < "$SEQ_LIST"
 
 if [[ "${#QPS[@]}" -ge 3 ]]; then
-  set +e
-  "$PYTHON_BIN" "$SCRIPT_DIR/getBdRate.py" "$RD_ANCHOR" "$RD_TEST" YUV420 > "$BD_LOG" 2>&1
-  BD_STATUS=$?
-  set -e
-  if [[ "$BD_STATUS" -ne 0 ]]; then
-    echo "getBdRate.py failed; see ${BD_LOG}" >> "$FAILURES"
-  fi
+  "$PYTHON_BIN" "$SCRIPT_DIR/getBdRate.py" "$RD_ANCHOR" "$RD_TEST" > "$RESULT_LOG" 2>&1
 else
-  echo "BD-rate skipped because fewer than 3 QP points were requested." > "$BD_LOG"
+  echo "BD-rate skipped because fewer than 3 QP points were requested." > "$RESULT_LOG"
 fi
 
-"$PYTHON_BIN" - "$SCRIPT_DIR" "$PER_QP_CSV" "$FAILURES" "$RESULT_TXT" "$BD_LOG" <<'PY'
-import csv
-import math
-import sys
-from collections import defaultdict
-from pathlib import Path
-
-script_dir, per_qp_csv, failures_path, result_path, bd_log = sys.argv[1:]
-sys.path.insert(0, script_dir)
-_bd_core = None
-_np = None
-
-def load_bd_core():
-    global _bd_core, _np
-    if _bd_core is None:
-        from getBdRateCore import getBdRateCore
-        import numpy as np
-        _bd_core = getBdRateCore
-        _np = np
-    return _bd_core, _np
-
-rows = []
-with open(per_qp_csv, newline="") as f:
-    reader = csv.DictReader(f)
-    for row in reader:
-        rows.append(row)
-
-by_seq = defaultdict(list)
-for row in rows:
-    by_seq[row["sequence"]].append(row)
-
-def f(row, key):
-    return float(row[key])
-
-def calc_bdrate(seq_rows, comp):
-    seq_rows = sorted(seq_rows, key=lambda r: int(r["qp"]))
-    if len(seq_rows) < 3:
-        return math.nan
-    try:
-        getBdRateCore, np = load_bd_core()
-        anchor_bitrate = np.array([f(r, "anchor_bitrate") for r in seq_rows], dtype=float)
-        test_bitrate = np.array([f(r, "test_bitrate") for r in seq_rows], dtype=float)
-        anchor_psnr = np.array([f(r, f"anchor_{comp}") for r in seq_rows], dtype=float)
-        test_psnr = np.array([f(r, f"test_{comp}") for r in seq_rows], dtype=float)
-        if not all(np.isfinite(x).all() for x in (anchor_bitrate, test_bitrate, anchor_psnr, test_psnr)):
-            return math.nan
-        return float(getBdRateCore(anchor_bitrate, anchor_psnr, test_bitrate, test_psnr))
-    except Exception:
-        return math.nan
-
-def fmt(x):
-    return "nan" if x is None or not math.isfinite(x) else f"{x:.3f}"
-
-seq_summaries = []
-for seq in sorted(by_seq):
-    seq_rows = by_seq[seq]
-    bdr_y = calc_bdrate(seq_rows, "y")
-    bdr_u = calc_bdrate(seq_rows, "u")
-    bdr_v = calc_bdrate(seq_rows, "v")
-    if all(math.isfinite(x) for x in (bdr_y, bdr_u, bdr_v)):
-        bdr_avg = (4 * bdr_y + bdr_u + bdr_v) / 6.0
-    else:
-        bdr_avg = math.nan
-    avg_ts = sum(f(r, "time_saving_percent") for r in seq_rows) / len(seq_rows)
-    seq_summaries.append((seq, bdr_y, bdr_u, bdr_v, bdr_avg, avg_ts))
-
-def mean_valid(values):
-    vals = [x for x in values if math.isfinite(x)]
-    return sum(vals) / len(vals) if vals else math.nan
-
-avg_bdr_y = mean_valid([x[1] for x in seq_summaries])
-avg_bdr_u = mean_valid([x[2] for x in seq_summaries])
-avg_bdr_v = mean_valid([x[3] for x in seq_summaries])
-avg_bdr_avg = mean_valid([x[4] for x in seq_summaries])
-avg_ts = mean_valid([x[5] for x in seq_summaries])
-
-failures = Path(failures_path).read_text().strip()
-
-with open(result_path, "w") as out:
-    out.write("FastPartition all-intra evaluation\n")
-    out.write(f"per_qp_csv: {per_qp_csv}\n")
-    out.write(f"bd_rate_log: {bd_log}\n\n")
-
-    out.write("[Per-sequence per-QP results]\n")
-    out.write("sequence qp frames anchor_bitrate anchor_y anchor_u anchor_v anchor_time ")
-    out.write("test_bitrate test_y test_u test_v test_time time_saving(%) time_ratio\n")
-    for r in sorted(rows, key=lambda x: (x["sequence"], int(x["qp"]))):
-        out.write(
-            f"{r['sequence']} {r['qp']} {r['frames']} "
-            f"{fmt(f(r, 'anchor_bitrate'))} {fmt(f(r, 'anchor_y'))} {fmt(f(r, 'anchor_u'))} {fmt(f(r, 'anchor_v'))} {fmt(f(r, 'anchor_time'))} "
-            f"{fmt(f(r, 'test_bitrate'))} {fmt(f(r, 'test_y'))} {fmt(f(r, 'test_u'))} {fmt(f(r, 'test_v'))} {fmt(f(r, 'test_time'))} "
-            f"{fmt(f(r, 'time_saving_percent'))} {fmt(f(r, 'time_ratio'))}\n"
-        )
-
-    out.write("\n[Per-sequence BD-rate and time saving]\n")
-    out.write("sequence bdrate_y(%) bdrate_u(%) bdrate_v(%) bdrate_avg(%) avg_time_saving(%)\n")
-    for seq, y, u, v, avg, ts in seq_summaries:
-        out.write(f"{seq} {fmt(y)} {fmt(u)} {fmt(v)} {fmt(avg)} {fmt(ts)}\n")
-
-    out.write("\n[Average]\n")
-    out.write(f"average_bdrate_y(%) {fmt(avg_bdr_y)}\n")
-    out.write(f"average_bdrate_u(%) {fmt(avg_bdr_u)}\n")
-    out.write(f"average_bdrate_v(%) {fmt(avg_bdr_v)}\n")
-    out.write(f"average_bdrate_avg(%) {fmt(avg_bdr_avg)}\n")
-    out.write(f"average_time_saving(%) {fmt(avg_ts)}\n")
-
-    out.write("\n[Failures]\n")
-    out.write(failures + "\n" if failures else "none\n")
-PY
-
-cat "$RESULT_TXT"
+cat "$RESULT_LOG"
 echo
 echo "[run] workdir: $WORKDIR"
-echo "[run] result:  $RESULT_TXT"
+echo "[run] result:  $RESULT_LOG"
