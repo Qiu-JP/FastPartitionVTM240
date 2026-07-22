@@ -60,7 +60,8 @@
 //########### place macros to be be kept below this line ###############
 
 #define Save_Depth     1
-#define FastPartition  1
+#define FastPartition  0
+#define RDOStats       1
 
 #ifndef JVET_AJ0151_DSC_SEI
 #define JVET_AJ0151_DSC_SEI   1                      // Digitally signed content signing and verification (requires OpenSSL v3)
@@ -1571,5 +1572,3 @@ struct XuPool
 //! \}
 
 #endif
-
-

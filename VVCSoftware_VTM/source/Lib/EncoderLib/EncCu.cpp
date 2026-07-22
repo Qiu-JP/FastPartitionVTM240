@@ -50,6 +50,13 @@
 #include "CommonLib/dtrace_buffer.h"
 
 #include <stdio.h>
+#if RDOStats
+#include <atomic>
+#include <array>
+#include <map>
+#include <mutex>
+#include <utility>
+#endif
 #include <cmath>
 #include <algorithm>
 #include <cstdlib>
@@ -58,6 +65,160 @@
 //! \{
 
 // ====================================================================================================================
+
+#if RDOStats
+namespace
+{
+constexpr size_t RDO_SPLIT_MODE_COUNT = 5;
+
+uint64_t getArea4x4Units(int width, int height)
+{
+  return uint64_t(width) * uint64_t(height) / 16;
+}
+
+struct RdoSplitStats
+{
+  struct SizeStats
+  {
+    uint64_t splitTests = 0;
+    uint64_t split4x4 = 0;
+    std::array<uint64_t, RDO_SPLIT_MODE_COUNT> modes{};
+    std::array<uint64_t, RDO_SPLIT_MODE_COUNT> mode4x4{};
+  };
+
+  struct ChannelStats
+  {
+    std::atomic<uint64_t> splitTests{ 0 };
+    std::atomic<uint64_t> split4x4{ 0 };
+    std::array<std::atomic<uint64_t>, RDO_SPLIT_MODE_COUNT> modes{};
+    std::array<std::atomic<uint64_t>, RDO_SPLIT_MODE_COUNT> mode4x4{};
+
+    std::mutex sizeMutex;
+    std::map<std::pair<int, int>, SizeStats> sizeStats;
+  };
+
+  ChannelStats luma;
+  ChannelStats chroma;
+
+  ~RdoSplitStats()
+  {
+    print("luma", luma);
+    print("chroma", chroma);
+  }
+
+  static void print(const char* channel, ChannelStats& stats)
+  {
+    const uint64_t tests = stats.splitTests.load();
+    if (tests == 0)
+    {
+      return;
+    }
+    const uint64_t split4x4 = stats.split4x4.load();
+    std::fprintf(stderr,
+                 "[RdoSplitStats] channel=%s testedSplitModes=%llu testedSplit4x4=%llu "
+                 "QT=%llu BTH=%llu BTV=%llu TTH=%llu TTV=%llu "
+                 "QT4x4=%llu BTH4x4=%llu BTV4x4=%llu TTH4x4=%llu TTV4x4=%llu\n",
+                 channel,
+                 (unsigned long long)tests,
+                 (unsigned long long)split4x4,
+                 (unsigned long long)stats.modes[0].load(),
+                 (unsigned long long)stats.modes[1].load(),
+                 (unsigned long long)stats.modes[2].load(),
+                 (unsigned long long)stats.modes[3].load(),
+                 (unsigned long long)stats.modes[4].load(),
+                 (unsigned long long)stats.mode4x4[0].load(),
+                 (unsigned long long)stats.mode4x4[1].load(),
+                 (unsigned long long)stats.mode4x4[2].load(),
+                 (unsigned long long)stats.mode4x4[3].load(),
+                 (unsigned long long)stats.mode4x4[4].load());
+
+    std::lock_guard<std::mutex> lock(stats.sizeMutex);
+    for (const auto& entry : stats.sizeStats)
+    {
+      const int width = entry.first.first;
+      const int height = entry.first.second;
+      const SizeStats& sizeStats = entry.second;
+      std::fprintf(stderr,
+                   "[RdoSplitStatsSize] channel=%s size=%dx%d testedSplitModes=%llu testedSplit4x4=%llu "
+                   "QT=%llu BTH=%llu BTV=%llu TTH=%llu TTV=%llu "
+                   "QT4x4=%llu BTH4x4=%llu BTV4x4=%llu TTH4x4=%llu TTV4x4=%llu\n",
+                   channel,
+                   width,
+                   height,
+                   (unsigned long long)sizeStats.splitTests,
+                   (unsigned long long)sizeStats.split4x4,
+                   (unsigned long long)sizeStats.modes[0],
+                   (unsigned long long)sizeStats.modes[1],
+                   (unsigned long long)sizeStats.modes[2],
+                   (unsigned long long)sizeStats.modes[3],
+                   (unsigned long long)sizeStats.modes[4],
+                   (unsigned long long)sizeStats.mode4x4[0],
+                   (unsigned long long)sizeStats.mode4x4[1],
+                   (unsigned long long)sizeStats.mode4x4[2],
+                   (unsigned long long)sizeStats.mode4x4[3],
+                   (unsigned long long)sizeStats.mode4x4[4]);
+    }
+  }
+};
+
+RdoSplitStats g_rdoSplitStats;
+
+struct RdoSplitNodeCounter
+{
+  RdoSplitNodeCounter(ChannelType channelType, int areaWidth, int areaHeight)
+    : channel(channelType), width(areaWidth), height(areaHeight), area4x4(getArea4x4Units(areaWidth, areaHeight))
+  {}
+
+  ~RdoSplitNodeCounter()
+  {
+    RdoSplitStats::ChannelStats& stats = channel == ChannelType::LUMA ? g_rdoSplitStats.luma
+                                                                      : g_rdoSplitStats.chroma;
+    uint64_t total = 0;
+    for (size_t index = 0; index < modeCounts.size(); ++index)
+    {
+      stats.modes[index].fetch_add(modeCounts[index], std::memory_order_relaxed);
+      stats.mode4x4[index].fetch_add(modeCounts[index] * area4x4, std::memory_order_relaxed);
+      total += modeCounts[index];
+    }
+    if (total == 0)
+    {
+      return;
+    }
+    stats.splitTests.fetch_add(total, std::memory_order_relaxed);
+    stats.split4x4.fetch_add(total * area4x4, std::memory_order_relaxed);
+
+    std::lock_guard<std::mutex> lock(stats.sizeMutex);
+    RdoSplitStats::SizeStats& sizeStats = stats.sizeStats[std::make_pair(width, height)];
+    sizeStats.splitTests += total;
+    sizeStats.split4x4 += total * area4x4;
+    for (size_t index = 0; index < modeCounts.size(); ++index)
+    {
+      sizeStats.modes[index] += modeCounts[index];
+      sizeStats.mode4x4[index] += modeCounts[index] * area4x4;
+    }
+  }
+
+  void record(EncTestModeType type)
+  {
+    switch (type)
+    {
+    case ETM_SPLIT_QT:   modeCounts[0]++; break;
+    case ETM_SPLIT_BT_H: modeCounts[1]++; break;
+    case ETM_SPLIT_BT_V: modeCounts[2]++; break;
+    case ETM_SPLIT_TT_H: modeCounts[3]++; break;
+    case ETM_SPLIT_TT_V: modeCounts[4]++; break;
+    default: break;
+    }
+  }
+
+  ChannelType channel;
+  int width;
+  int height;
+  uint64_t area4x4;
+  std::array<uint64_t, RDO_SPLIT_MODE_COUNT> modeCounts{};
+};
+}
+#endif
 
 const MergeIdxPair EncCu::m_geoModeTest[GEO_MAX_NUM_CANDS] = {
   MergeIdxPair{ 0, 1 }, MergeIdxPair{ 1, 0 }, MergeIdxPair{ 0, 2 }, MergeIdxPair{ 1, 2 }, MergeIdxPair{ 2, 0 },
@@ -834,6 +995,12 @@ bool EncCu::xCheckBestMode( CodingStructure *&tempCS, CodingStructure *&bestCS, 
 
 void EncCu::xCompressCU( CodingStructure*& tempCS, CodingStructure*& bestCS, Partitioner& partitioner, double maxCostAllowed )
 {
+#if RDOStats
+  const UnitArea& rdoStatsArea = partitioner.currArea();
+  RdoSplitNodeCounter rdoSplitNodeCounter(partitioner.chType,
+                                          rdoStatsArea.lwidth(),
+                                          rdoStatsArea.lheight());
+#endif
   CHECK(maxCostAllowed < 0, "Wrong value of maxCostAllowed!");
 
   uint32_t compBegin;
@@ -1230,6 +1397,9 @@ void EncCu::xCompressCU( CodingStructure*& tempCS, CodingStructure*& bestCS, Par
     }
     else if( isModeSplit( currTestMode ) )
     {
+#if RDOStats
+      rdoSplitNodeCounter.record(currTestMode.type);
+#endif
       if (bestCS->cus.size() != 0)
       {
         splitmode = bestCS->cus[0]->splitSeries;
