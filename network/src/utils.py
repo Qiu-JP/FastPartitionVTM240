@@ -529,16 +529,30 @@ def empty_classifier_shape_stats():
     return {}
 
 
-def update_classifier_shape_stats(stats, shape_name, loss_value, correct, count):
+def update_classifier_shape_stats(
+    stats,
+    shape_name,
+    loss_value,
+    correct,
+    count,
+    top2_correct=None,
+    top3_correct=None,
+):
     if shape_name not in stats:
         stats[shape_name] = {
             "loss_sum": 0.0,
             "correct": 0,
+            "top2_correct": 0,
+            "top3_correct": 0,
             "count": 0,
         }
     payload = stats[shape_name]
     payload["loss_sum"] = payload["loss_sum"] + loss_value * int(count)
     payload["correct"] = payload["correct"] + correct
+    if top2_correct is not None:
+        payload["top2_correct"] = payload["top2_correct"] + top2_correct
+    if top3_correct is not None:
+        payload["top3_correct"] = payload["top3_correct"] + top3_correct
     payload["count"] += int(count)
 
 
@@ -550,15 +564,115 @@ def finalize_classifier_shape_stats(stats):
             continue
         loss_sum = payload["loss_sum"]
         correct = payload["correct"]
+        top2_correct = payload.get("top2_correct", 0)
+        top3_correct = payload.get("top3_correct", 0)
         if torch.is_tensor(loss_sum):
             loss_sum = loss_sum.detach().item()
         if torch.is_tensor(correct):
             correct = correct.detach().item()
+        if torch.is_tensor(top2_correct):
+            top2_correct = top2_correct.detach().item()
+        if torch.is_tensor(top3_correct):
+            top3_correct = top3_correct.detach().item()
         finalized[shape_name] = {
             "loss": float(loss_sum) / float(count),
             "acc": float(correct) / float(count),
+            "top2": float(top2_correct) / float(count),
+            "top3": float(top3_correct) / float(count),
         }
     return finalized
+
+
+def empty_classifier_prune_stats(thresholds=(0.1, 0.2, 0.3)):
+    return {
+        float(threshold): {
+            "keep_correct": 0,
+            "kept_candidates": 0,
+            "legal_candidates": 0,
+            "count": 0,
+        }
+        for threshold in thresholds
+    }
+
+
+def update_classifier_prune_stats(stats, batch_stats):
+    for threshold, payload in batch_stats.items():
+        threshold = float(threshold)
+        if threshold not in stats:
+            stats[threshold] = {
+                "keep_correct": 0,
+                "kept_candidates": 0,
+                "legal_candidates": 0,
+                "count": 0,
+            }
+        dst = stats[threshold]
+        for key in ["keep_correct", "kept_candidates", "legal_candidates", "count"]:
+            dst[key] = dst[key] + payload[key]
+
+
+def finalize_classifier_prune_stats(stats):
+    def to_float(value):
+        if torch.is_tensor(value):
+            return float(value.detach().item())
+        return float(value)
+
+    finalized = {}
+    for threshold, payload in sorted(stats.items()):
+        count = int(to_float(payload["count"]))
+        keep_correct = to_float(payload["keep_correct"])
+        kept_candidates = to_float(payload["kept_candidates"])
+        legal_candidates = to_float(payload["legal_candidates"])
+        if count <= 0 or legal_candidates <= 0:
+            finalized[float(threshold)] = {
+                "keep_rate": 0.0,
+                "false_prune_rate": 0.0,
+                "avg_candidates_kept": 0.0,
+                "candidate_reduction": 0.0,
+            }
+            continue
+        keep_rate = keep_correct / float(count)
+        finalized[float(threshold)] = {
+            "keep_rate": keep_rate,
+            "false_prune_rate": 1.0 - keep_rate,
+            "avg_candidates_kept": kept_candidates / float(count),
+            "candidate_reduction": 1.0 - kept_candidates / legal_candidates,
+        }
+    return finalized
+
+
+def classifier_prediction_stats(logits, labels, thresholds=(0.1, 0.2, 0.3)):
+    logits_for_rank = logits.float()
+    labels = labels.long()
+    k2 = min(2, logits_for_rank.shape[1])
+    k3 = min(3, logits_for_rank.shape[1])
+    top2 = torch.topk(logits_for_rank, k=k2, dim=1).indices
+    top3 = torch.topk(logits_for_rank, k=k3, dim=1).indices
+    top2_correct = torch.any(top2 == labels[:, None], dim=1).sum()
+    top3_correct = torch.any(top3 == labels[:, None], dim=1).sum()
+
+    probs = torch.softmax(logits_for_rank, dim=1)
+    legal_mask = logits_for_rank > -1e8
+    top1 = torch.argmax(logits_for_rank, dim=1)
+    label_indices = labels[:, None]
+    legal_counts = legal_mask.sum(dim=1)
+
+    prune_stats = {}
+    for threshold in thresholds:
+        kept = (probs >= float(threshold)) & legal_mask
+        kept_counts = kept.sum(dim=1)
+        fallback = kept_counts == 0
+        true_kept = kept.gather(1, label_indices).squeeze(1)
+        if torch.any(fallback):
+            true_kept = torch.where(fallback, top1 == labels, true_kept)
+            kept_counts = torch.where(fallback, torch.ones_like(kept_counts), kept_counts)
+        prune_stats[float(threshold)] = {
+            "keep_correct": true_kept.sum(),
+            "kept_candidates": kept_counts.sum(),
+            "legal_candidates": legal_counts.sum(),
+            "count": labels.numel(),
+        }
+
+    return top2_correct, top3_correct, prune_stats
 
 
 def classifier_node_loss_legacy(
@@ -581,9 +695,10 @@ def classifier_node_loss_legacy(
             node_batches[key].append((batch_idx, grid_y, grid_x, label))
 
     total_nodes = 0
-    losses = []
+    loss_sum = pred_gridmap.new_zeros((), dtype=torch.float32)
     correct = pred_gridmap.new_zeros((), dtype=torch.long)
     shape_stats = empty_classifier_shape_stats()
+    prune_stats = empty_classifier_prune_stats()
     for (grid_h, grid_w), shape_nodes in node_batches.items():
         roi = torch.cat(
             [
@@ -602,28 +717,32 @@ def classifier_node_loss_legacy(
             dtype=torch.long,
             device=pred_gridmap.device,
         )
-        total_nodes += labels.numel()
-
         logits = classifier(roi)
         shape_loss = ce_loss(logits, labels)
-        losses.append(shape_loss)
+        shape_count = labels.numel()
+        loss_sum = loss_sum + shape_loss * float(shape_count)
         pred_labels = torch.argmax(logits, dim=1)
         shape_correct = torch.sum(pred_labels == labels)
+        shape_top2_correct, shape_top3_correct, shape_prune_stats = classifier_prediction_stats(logits, labels)
         correct += shape_correct
+        total_nodes += shape_count
 
         update_classifier_shape_stats(
             shape_stats,
             classifier_shape_name(grid_h, grid_w),
             shape_loss.detach(),
             shape_correct,
-            labels.numel(),
+            shape_count,
+            shape_top2_correct,
+            shape_top3_correct,
         )
+        update_classifier_prune_stats(prune_stats, shape_prune_stats)
 
     if total_nodes == 0:
         zero = pred_gridmap.sum() * 0.0
-        return zero, zero.detach(), 0, {}
+        return zero, zero.detach(), 0, {}, empty_classifier_prune_stats()
 
-    return torch.stack(losses).mean(), correct / float(total_nodes), total_nodes, shape_stats
+    return loss_sum / float(total_nodes), correct / float(total_nodes), total_nodes, shape_stats, prune_stats
 
 
 def _pack_classifier_nodes(node_batch):
@@ -725,9 +844,10 @@ def classifier_node_loss_vectorized(
     packed_nodes = packed_nodes.to(device=device, non_blocking=True)
     packed_batch_indices = packed_batch_indices.to(device=device, non_blocking=True)
     total_nodes = 0
-    losses = []
+    loss_sum = pred_gridmap.new_zeros((), dtype=torch.float32)
     correct = pred_gridmap.new_zeros((), dtype=torch.long)
     shape_stats = empty_classifier_shape_stats()
+    prune_stats = empty_classifier_prune_stats()
 
     for grid_h, grid_w, start, end in selected_groups:
         shape_nodes = packed_nodes[start:end]
@@ -776,9 +896,10 @@ def classifier_node_loss_vectorized(
         logits = logits_chunks[0] if len(logits_chunks) == 1 else torch.cat(logits_chunks, dim=0)
         labels = shape_nodes[:, 4].long()
         shape_loss = ce_loss(logits, labels)
-        losses.append(shape_loss)
+        loss_sum = loss_sum + shape_loss * float(shape_count)
         pred_labels = torch.argmax(logits, dim=1)
         shape_correct = torch.sum(pred_labels == labels)
+        shape_top2_correct, shape_top3_correct, shape_prune_stats = classifier_prediction_stats(logits, labels)
         correct += shape_correct
         total_nodes += shape_count
         update_classifier_shape_stats(
@@ -787,9 +908,12 @@ def classifier_node_loss_vectorized(
             shape_loss.detach(),
             shape_correct,
             shape_count,
+            shape_top2_correct,
+            shape_top3_correct,
         )
+        update_classifier_prune_stats(prune_stats, shape_prune_stats)
 
-    return torch.stack(losses).mean(), correct / float(total_nodes), total_nodes, shape_stats
+    return loss_sum / float(total_nodes), correct / float(total_nodes), total_nodes, shape_stats, prune_stats
 
 
 def classifier_node_loss(
@@ -956,12 +1080,13 @@ def _run_joint_epoch(
     accu_loss = torch.zeros(1).to(device)
     accu_grid_loss = torch.zeros(1).to(device)
     accu_cls_loss = torch.zeros(1).to(device)
-    accu_cls_acc = torch.zeros(1).to(device)
+    accu_cls_correct = torch.zeros(1).to(device)
     grid_tp = torch.zeros((), dtype=torch.long, device=device)
     grid_fp = torch.zeros((), dtype=torch.long, device=device)
     grid_fn = torch.zeros((), dtype=torch.long, device=device)
     total_cls_nodes = 0
     classifier_shape_stats = empty_classifier_shape_stats()
+    classifier_prune_stats = empty_classifier_prune_stats()
 
     progress = tqdm(data_loader, file=sys.stdout)
     for step, data in enumerate(progress):
@@ -979,7 +1104,7 @@ def _run_joint_epoch(
         with autocast(enabled=False):
             loss_gridmap = pred_gridmap.float() if amp_enabled else pred_gridmap
             grid_loss = grid_loss_fn(loss_gridmap, gridmap_batch.float())
-            cls_loss, cls_acc, cls_nodes, batch_shape_stats = classifier_node_loss(
+            cls_loss, cls_acc, cls_nodes, batch_shape_stats, batch_prune_stats = classifier_node_loss(
                 classifier=classifier,
                 pred_gridmap=loss_gridmap,
                 node_batch=node_batch,
@@ -1011,7 +1136,7 @@ def _run_joint_epoch(
         accu_loss += loss.detach()
         accu_grid_loss += grid_loss.detach()
         accu_cls_loss += cls_loss.detach()
-        accu_cls_acc += cls_acc
+        accu_cls_correct += cls_acc.detach() * float(cls_nodes)
         total_cls_nodes += cls_nodes
         for shape_name, payload in batch_shape_stats.items():
             update_classifier_shape_stats(
@@ -1020,14 +1145,17 @@ def _run_joint_epoch(
                 payload["loss_sum"] / float(payload["count"]),
                 payload["correct"],
                 payload["count"],
+                payload.get("top2_correct"),
+                payload.get("top3_correct"),
             )
+        update_classifier_prune_stats(classifier_prune_stats, batch_prune_stats)
 
         if step == 0 or (step + 1) % progress_update_interval == 0:
             grid_precision, grid_recall = precision_recall(grid_tp, grid_fp, grid_fn)
             phase = "train" if training else "valid"
             progress.desc = (
                 "[{} {} epoch {}] loss: {:.6f}, grid: {:.6f}, cls: {:.6f}, "
-                "grid_precision: {:.6f}, grid_recall: {:.6f}, cls_acc: {:.6f}, cls_nodes: {:.2f}"
+                "grid_precision: {:.6f}, grid_recall: {:.6f}, cls_acc: {:.6f}"
             ).format(
                 phase,
                 stage_name,
@@ -1037,8 +1165,7 @@ def _run_joint_epoch(
                 accu_cls_loss.item() / (step + 1),
                 grid_precision.item(),
                 grid_recall.item(),
-                accu_cls_acc.item() / (step + 1),
-                total_cls_nodes / float(step + 1),
+                accu_cls_correct.item() / float(total_cls_nodes) if total_cls_nodes > 0 else 0.0,
             )
 
     step_count = step + 1
@@ -1054,10 +1181,11 @@ def _run_joint_epoch(
         accu_cls_loss.item() / step_count,
         grid_precision.item(),
         grid_recall.item(),
-        accu_cls_acc.item() / step_count,
+        accu_cls_correct.item() / float(total_cls_nodes) if total_cls_nodes > 0 else 0.0,
         total_cls_nodes / float(step_count),
         finalize_classifier_shape_stats(classifier_shape_stats),
         peak_memory_mb,
+        finalize_classifier_prune_stats(classifier_prune_stats),
     )
 
 

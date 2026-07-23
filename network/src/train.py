@@ -74,6 +74,59 @@ def add_classifier_shape_scalars(tb_writer, phase, shape_stats, epoch):
         tb_writer.add_scalar(f"Classifier/{phase}/{shape_name}/acc", stats["acc"], epoch)
 
 
+def classifier_shape_sort_key(shape_name):
+    try:
+        h_str, w_str = shape_name.split("x", 1)
+        h = int(h_str)
+        w = int(w_str)
+        return h * w, h, w
+    except Exception:
+        return 0, 0, 0
+
+
+def format_classifier_shape_acc(shape_stats):
+    return format_classifier_shape_metric(shape_stats, "acc")
+
+
+def format_classifier_shape_metric(shape_stats, metric_name):
+    if not shape_stats:
+        return "none"
+    parts = []
+    for shape_name, stats in sorted(shape_stats.items(), key=lambda item: classifier_shape_sort_key(item[0])):
+        parts.append("{}={:.2f}%".format(shape_name, float(stats[metric_name]) * 100.0))
+    return ", ".join(parts)
+
+
+def format_prune_stats(prune_stats):
+    if not prune_stats:
+        return "none"
+    parts = []
+    for threshold, stats in sorted(prune_stats.items()):
+        parts.append(
+            "T={:.2f}:keep={:.2f}% false={:.2f}% reduction={:.2f}%".format(
+                float(threshold),
+                float(stats["keep_rate"]) * 100.0,
+                float(stats["false_prune_rate"]) * 100.0,
+                float(stats["candidate_reduction"]) * 100.0,
+            )
+        )
+    return " | ".join(parts)
+
+
+def write_epoch_summary(summary_path, epoch, stage_name, train_metrics, val_metrics):
+    with open(summary_path, "a") as f:
+        f.write("Epoch {} Stage {}\n".format(epoch, stage_name))
+        f.write("Classifier shape acc train: {}\n".format(format_classifier_shape_metric(train_metrics[7], "acc")))
+        f.write("Classifier shape top2 train: {}\n".format(format_classifier_shape_metric(train_metrics[7], "top2")))
+        f.write("Classifier shape top3 train: {}\n".format(format_classifier_shape_metric(train_metrics[7], "top3")))
+        f.write("Classifier prune train: {}\n".format(format_prune_stats(train_metrics[9])))
+        f.write("Classifier shape acc val: {}\n".format(format_classifier_shape_metric(val_metrics[7], "acc")))
+        f.write("Classifier shape top2 val: {}\n".format(format_classifier_shape_metric(val_metrics[7], "top2")))
+        f.write("Classifier shape top3 val: {}\n".format(format_classifier_shape_metric(val_metrics[7], "top3")))
+        f.write("Classifier prune val: {}\n".format(format_prune_stats(val_metrics[9])))
+        f.write("\n")
+
+
 def parse_tb_image_sample_spec(spec):
     samples = []
     for item in spec.split(','):
@@ -157,11 +210,12 @@ def train_SwinTransU(args):
         os.makedirs(ckpt_out_dir)
     tb_writer = setup_tensorboard(args, log_out_dir)
     log_dir = os.path.join(log_out_dir, 'loss.txt')
+    summary_dir = os.path.join(log_out_dir, 'summary.txt')
     with open(log_dir, 'a') as f:
         s = (
             "epoch_num, stage, grid_weight, cls_weight, lr, epoch_loss, grid_loss, cls_loss, "
-            "grid_precision, grid_recall, cls_accu, avg_cls_nodes, val_loss, val_grid_loss, val_cls_loss, "
-            "val_grid_precision, val_grid_recall, val_cls_accu, val_avg_cls_nodes\n"
+            "grid_precision, grid_recall, cls_accu, val_loss, val_grid_loss, val_cls_loss, "
+            "val_grid_precision, val_grid_recall, val_cls_accu\n"
         )
         f.write(s)
         for s in [
@@ -356,6 +410,9 @@ def train_SwinTransU(args):
                 val_metrics[5],
             )
         )
+        print("Classifier shape acc train: {}".format(format_classifier_shape_acc(train_metrics[7])))
+        print("Classifier shape acc val: {}".format(format_classifier_shape_acc(val_metrics[7])))
+        write_epoch_summary(summary_dir, epoch, stage_name, train_metrics, val_metrics)
         print('***********************************************************************'
               '***********************************************************************')
 
@@ -366,8 +423,8 @@ def train_SwinTransU(args):
                 grid_weight,
                 cls_weight,
                 optimizer.param_groups[0]["lr"],
-                *train_metrics[:7],
-                *val_metrics[:7],
+                *train_metrics[:6],
+                *val_metrics[:6],
             ]:
                 f.write(str(s))
                 f.write(',')
