@@ -428,6 +428,7 @@ protected:
   bool      m_useAMaxBT;
   bool      m_e0023FastEnc;
   bool      m_contentBasedFastQtbt;
+  bool      m_splitStructurePruning;
   bool      m_useNonLinearAlfLuma;
   bool      m_useNonLinearAlfChroma;
   unsigned  m_maxNumAlfAlternativesChroma;
@@ -1845,6 +1846,8 @@ public:
   bool      getUseE0023FastEnc              () const         { return m_e0023FastEnc; }
   void      setUseContentBasedFastQtbt      ( bool b )       { m_contentBasedFastQtbt = b; }
   bool      getUseContentBasedFastQtbt      () const         { return m_contentBasedFastQtbt; }
+  void      setSplitStructurePruning        ( bool b )       { m_splitStructurePruning = b; }
+  bool      getSplitStructurePruning        () const         { return m_splitStructurePruning; }
   void      setUseNonLinearAlfLuma          ( bool b )       { m_useNonLinearAlfLuma = b; }
   bool      getUseNonLinearAlfLuma          () const         { return m_useNonLinearAlfLuma; }
   void      setUseNonLinearAlfChroma        ( bool b )       { m_useNonLinearAlfChroma = b; }

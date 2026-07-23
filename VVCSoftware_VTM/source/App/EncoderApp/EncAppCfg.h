@@ -439,6 +439,7 @@ protected:
   int       m_mergeRdCandQuotaGpm;
   bool      m_e0023FastEnc;
   bool      m_contentBasedFastQtbt;
+  bool      m_splitStructurePruning;
   bool      m_useNonLinearAlfLuma;
   bool      m_useNonLinearAlfChroma;
   unsigned  m_maxNumAlfAlternativesChroma;

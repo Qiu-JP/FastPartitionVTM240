@@ -2255,6 +2255,24 @@ bool EncModeCtrlMTnoRQT::tryMode( const EncTestMode& encTestmode, const CodingSt
       return false;
     }
 
+    if( m_pcEncCfg->getSplitStructurePruning() )
+    {
+      if( split == CU_HORZ_SPLIT || split == CU_VERT_SPLIT )
+      {
+        if( partitioner.currMtDepth != partitioner.currBtDepth || partitioner.currBtDepth >= 2 )
+        {
+          return false;
+        }
+      }
+      else if( split == CU_TRIH_SPLIT || split == CU_TRIV_SPLIT )
+      {
+        if( partitioner.currMtDepth != 0 )
+        {
+          return false;
+        }
+      }
+    }
+
     if( m_pcEncCfg->getUseContentBasedFastQtbt() )
     {
       const CompArea& currArea = partitioner.currArea().Y();

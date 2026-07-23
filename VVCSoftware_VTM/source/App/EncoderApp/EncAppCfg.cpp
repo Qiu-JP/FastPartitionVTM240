@@ -1241,6 +1241,7 @@ bool EncAppCfg::parseCfg( int argc, char* argv[] )
   ("E0023FastEnc",                                    m_e0023FastEnc,                                    true, "Fast encoding setting for QTBT (proposal E0023)")
   ("MTTSkipping",                                     m_useMttSkip,                                     false, "MTT split modes early termination")
   ("ContentBasedFastQtbt",                            m_contentBasedFastQtbt,                           false, "Signal based QTBT speed-up")
+  ("SplitStructurePruning",                           m_splitStructurePruning,                          false, "Restrict split structure: BT depth <= 2, TT depth <= 1, and no BT/TT nesting")
   ("UseNonLinearAlfLuma",                             m_useNonLinearAlfLuma,                             true, "Non-linear adaptive loop filters for Luma Channel")
   ("UseNonLinearAlfChroma",                           m_useNonLinearAlfChroma,                           true, "Non-linear adaptive loop filters for Chroma Channels")
   ("MaxNumAlfAlternativesChroma",                     m_maxNumAlfAlternativesChroma,
@@ -6854,6 +6855,7 @@ void EncAppCfg::xPrintParameter()
   msg( VERBOSE, "AMaxBT:%d ", m_useAMaxBT );
   msg( VERBOSE, "E0023FastEnc:%d ", m_e0023FastEnc );
   msg( VERBOSE, "ContentBasedFastQtbt:%d ", m_contentBasedFastQtbt );
+  msg( VERBOSE, "SplitStructurePruning:%d ", m_splitStructurePruning );
   msg( VERBOSE, "UseNonLinearAlfLuma:%d ", m_useNonLinearAlfLuma );
   msg( VERBOSE, "UseNonLinearAlfChroma:%d ", m_useNonLinearAlfChroma );
   msg( VERBOSE, "MaxNumAlfAlternativesChroma:%d ", m_maxNumAlfAlternativesChroma );
