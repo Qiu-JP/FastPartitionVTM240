@@ -6,6 +6,8 @@ import pandas as pd
 import paths
 import torch
 import torch.nn as nn
+from torch.cuda.amp import autocast
+from torch.utils.checkpoint import checkpoint
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
@@ -35,9 +37,26 @@ CLASSIFIER_SUPPORTED_SIZES = {
     (2, 1),
     (1, 2),
 }
+CLASSIFIER_SUPPORTED_SIZE_ORDER = tuple(sorted(CLASSIFIER_SUPPORTED_SIZES))
+
+BCE_PROB_MIN = 1e-7
+BCE_PROB_MAX = 1.0 - BCE_PROB_MIN
+
+
+def clamp_bce_probability(prediction):
+    return prediction.clamp(min=BCE_PROB_MIN, max=BCE_PROB_MAX)
+
+
+class ClampedBCELoss(nn.Module):
+    def forward(self, prediction, target):
+        return nn.functional.binary_cross_entropy(
+            clamp_bce_probability(prediction),
+            target,
+        )
+
 
 LOSS_FUNCTIONS = {
-    "BCE": nn.BCELoss(),
+    "BCE": ClampedBCELoss(),
     "HUBER": nn.SmoothL1Loss(),
     "L1": nn.L1Loss(),
     "MSE": nn.MSELoss(),
@@ -45,13 +64,56 @@ LOSS_FUNCTIONS = {
 }
 
 
-def get_loss_function(loss_name):
+class WeightedBCELoss(nn.Module):
+    def __init__(self, positive_weight=1.0, negative_weight=1.0):
+        super().__init__()
+        if positive_weight <= 0 or negative_weight <= 0:
+            raise ValueError("Weighted BCE weights must be positive")
+        self.positive_weight = float(positive_weight)
+        self.negative_weight = float(negative_weight)
+
+    def forward(self, prediction, target):
+        prediction = clamp_bce_probability(prediction)
+        loss = -(
+            self.positive_weight * target * torch.log(prediction)
+            + self.negative_weight * (1.0 - target) * torch.log(1.0 - prediction)
+        )
+        return loss.mean()
+
+
+class BCEL1Loss(nn.Module):
+    def __init__(self, l1_weight=0.2):
+        super().__init__()
+        if l1_weight < 0:
+            raise ValueError("BCE+L1 weight must be non-negative")
+        self.l1_weight = float(l1_weight)
+        self.bce = ClampedBCELoss()
+        self.l1 = nn.L1Loss()
+
+    def forward(self, prediction, target):
+        return self.bce(prediction, target) + self.l1_weight * self.l1(prediction, target)
+
+
+def get_loss_function(
+    loss_name,
+    positive_weight=1.0,
+    negative_weight=1.0,
+    l1_weight=0.2,
+):
+    if loss_name.upper() == "WBCE":
+        return WeightedBCELoss(
+            positive_weight=positive_weight,
+            negative_weight=negative_weight,
+        )
+    if loss_name.upper() == "BCE_L1":
+        return BCEL1Loss(l1_weight=l1_weight)
     try:
         return LOSS_FUNCTIONS[loss_name.upper()]
     except KeyError:
         raise ValueError(
             "Unsupported lossFunction '{}'. Available options: {}".format(
-                loss_name, ", ".join(sorted(LOSS_FUNCTIONS.keys()))
+                loss_name,
+                ", ".join(sorted(list(LOSS_FUNCTIONS.keys()) + ["BCE_L1", "WBCE"])),
             )
         )
 
@@ -475,8 +537,8 @@ def update_classifier_shape_stats(stats, shape_name, loss_value, correct, count)
             "count": 0,
         }
     payload = stats[shape_name]
-    payload["loss_sum"] += float(loss_value) * int(count)
-    payload["correct"] += int(correct)
+    payload["loss_sum"] = payload["loss_sum"] + loss_value * int(count)
+    payload["correct"] = payload["correct"] + correct
     payload["count"] += int(count)
 
 
@@ -486,16 +548,26 @@ def finalize_classifier_shape_stats(stats):
         count = int(payload["count"])
         if count <= 0:
             continue
+        loss_sum = payload["loss_sum"]
+        correct = payload["correct"]
+        if torch.is_tensor(loss_sum):
+            loss_sum = loss_sum.detach().item()
+        if torch.is_tensor(correct):
+            correct = correct.detach().item()
         finalized[shape_name] = {
-            "loss": payload["loss_sum"] / float(count),
-            "acc": payload["correct"] / float(count),
+            "loss": float(loss_sum) / float(count),
+            "acc": float(correct) / float(count),
         }
     return finalized
 
 
-def classifier_node_loss(classifier, pred_gridmap, node_batch, ce_loss):
+def classifier_node_loss_legacy(
+    classifier,
+    pred_gridmap,
+    node_batch,
+    ce_loss,
+):
     node_batches = {}
-    total_nodes = 0
 
     for batch_idx, nodes in enumerate(node_batch):
         nodes_iter = nodes.tolist() if torch.is_tensor(nodes) else nodes
@@ -505,58 +577,268 @@ def classifier_node_loss(classifier, pred_gridmap, node_batch, ce_loss):
                 continue
             key = (grid_h, grid_w)
             if key not in node_batches:
-                node_batches[key] = {"roi": [], "label": []}
-            node_batches[key]["roi"].append(
+                node_batches[key] = []
+            node_batches[key].append((batch_idx, grid_y, grid_x, label))
+
+    total_nodes = 0
+    losses = []
+    correct = pred_gridmap.new_zeros((), dtype=torch.long)
+    shape_stats = empty_classifier_shape_stats()
+    for (grid_h, grid_w), shape_nodes in node_batches.items():
+        roi = torch.cat(
+            [
                 pred_gridmap[
                     batch_idx:batch_idx + 1,
                     :,
                     grid_y:grid_y + grid_h,
                     grid_x:grid_x + grid_w,
                 ]
-            )
-            node_batches[key]["label"].append(label)
-            total_nodes += 1
+                for batch_idx, grid_y, grid_x, _ in shape_nodes
+            ],
+            dim=0,
+        )
+        labels = torch.tensor(
+            [label for _, _, _, label in shape_nodes],
+            dtype=torch.long,
+            device=pred_gridmap.device,
+        )
+        total_nodes += labels.numel()
 
-    if total_nodes == 0:
-        zero = pred_gridmap.sum() * 0.0
-        return zero, 0.0, 0, {}
-
-    losses = []
-    correct = 0
-    shape_stats = empty_classifier_shape_stats()
-    for (grid_h, grid_w), payload in node_batches.items():
-        roi = torch.cat(payload["roi"], dim=0)
-        labels = torch.tensor(payload["label"], dtype=torch.long, device=pred_gridmap.device)
         logits = classifier(roi)
         shape_loss = ce_loss(logits, labels)
         losses.append(shape_loss)
         pred_labels = torch.argmax(logits, dim=1)
-        shape_correct = torch.sum(pred_labels == labels).item()
+        shape_correct = torch.sum(pred_labels == labels)
         correct += shape_correct
 
         update_classifier_shape_stats(
             shape_stats,
             classifier_shape_name(grid_h, grid_w),
-            shape_loss.detach().item(),
+            shape_loss.detach(),
             shape_correct,
             labels.numel(),
+        )
+
+    if total_nodes == 0:
+        zero = pred_gridmap.sum() * 0.0
+        return zero, zero.detach(), 0, {}
+
+    return torch.stack(losses).mean(), correct / float(total_nodes), total_nodes, shape_stats
+
+
+def _pack_classifier_nodes(node_batch):
+    """Group CPU node metadata by ROI shape without per-node Python conversion."""
+    node_tensors = []
+    node_counts = []
+    for nodes in node_batch:
+        tensor = nodes if torch.is_tensor(nodes) else torch.as_tensor(nodes, dtype=torch.long)
+        if tensor.numel() == 0:
+            tensor = tensor.reshape(0, 5)
+        if tensor.dim() != 2 or tensor.shape[1] != 5:
+            raise ValueError("Classifier nodes must have shape [N, 5]")
+        tensor = tensor.to(device="cpu", dtype=torch.long)
+        node_tensors.append(tensor)
+        node_counts.append(tensor.shape[0])
+
+    if not node_tensors or sum(node_counts) == 0:
+        return None, None, []
+
+    all_nodes = torch.cat(node_tensors, dim=0)
+    batch_indices = torch.repeat_interleave(
+        torch.arange(len(node_tensors), dtype=torch.long),
+        torch.as_tensor(node_counts, dtype=torch.long),
+    )
+
+    shape_groups = []
+    for grid_h, grid_w in CLASSIFIER_SUPPORTED_SIZE_ORDER:
+        shape_indices = torch.nonzero(
+            (all_nodes[:, 2] == grid_h) & (all_nodes[:, 3] == grid_w),
+            as_tuple=False,
+        ).flatten()
+        shape_count = int(shape_indices.numel())
+        if shape_count == 0:
+            continue
+        shape_groups.append((int(shape_indices[0]), grid_h, grid_w, shape_indices))
+
+    # Match the legacy dictionary's first-occurrence shape order for exact A/B
+    # comparisons while retaining every valid classifier node.
+    selected_groups = []
+    packed_indices = []
+    packed_offset = 0
+    for _, grid_h, grid_w, shape_indices in sorted(shape_groups):
+        shape_count = int(shape_indices.numel())
+        packed_indices.append(shape_indices)
+        selected_groups.append((grid_h, grid_w, packed_offset, packed_offset + shape_count))
+        packed_offset += shape_count
+
+    if not packed_indices:
+        return None, None, []
+
+    selected_indices = torch.cat(packed_indices, dim=0)
+    return (
+        all_nodes.index_select(0, selected_indices),
+        batch_indices.index_select(0, selected_indices),
+        selected_groups,
+    )
+
+
+def extract_classifier_rois_vectorized(
+    pred_gridmap,
+    batch_indices,
+    grid_y,
+    grid_x,
+    grid_h,
+    grid_w,
+):
+    """Extract [N, C, H, W] ROIs with one differentiable indexed operation."""
+    device = pred_gridmap.device
+    batch_indices = batch_indices.to(device=device, dtype=torch.long)
+    grid_y = grid_y.to(device=device, dtype=torch.long)
+    grid_x = grid_x.to(device=device, dtype=torch.long)
+    channels = torch.arange(pred_gridmap.shape[1], device=device, dtype=torch.long)
+    row_offsets = torch.arange(grid_h, device=device, dtype=torch.long)
+    col_offsets = torch.arange(grid_w, device=device, dtype=torch.long)
+    return pred_gridmap[
+        batch_indices[:, None, None, None],
+        channels[None, :, None, None],
+        grid_y[:, None, None, None] + row_offsets[None, None, :, None],
+        grid_x[:, None, None, None] + col_offsets[None, None, None, :],
+    ]
+
+
+def classifier_node_loss_vectorized(
+    classifier,
+    pred_gridmap,
+    node_batch,
+    ce_loss,
+    roi_chunk_size=0,
+):
+    if roi_chunk_size < 0:
+        raise ValueError("roi_chunk_size must be non-negative")
+
+    packed_nodes, packed_batch_indices, selected_groups = _pack_classifier_nodes(node_batch)
+    if not selected_groups:
+        zero = pred_gridmap.sum() * 0.0
+        return zero, zero.detach(), 0, {}
+
+    device = pred_gridmap.device
+    packed_nodes = packed_nodes.to(device=device, non_blocking=True)
+    packed_batch_indices = packed_batch_indices.to(device=device, non_blocking=True)
+    total_nodes = 0
+    losses = []
+    correct = pred_gridmap.new_zeros((), dtype=torch.long)
+    shape_stats = empty_classifier_shape_stats()
+
+    for grid_h, grid_w, start, end in selected_groups:
+        shape_nodes = packed_nodes[start:end]
+        shape_batch_indices = packed_batch_indices[start:end]
+        shape_count = end - start
+        chunk_size = roi_chunk_size if roi_chunk_size > 0 else shape_count
+        logits_chunks = []
+
+        for chunk_start in range(0, shape_count, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, shape_count)
+            chunk_nodes = shape_nodes[chunk_start:chunk_end]
+            chunk_batch_indices = shape_batch_indices[chunk_start:chunk_end]
+
+            def classifier_from_gridmap(
+                gridmap, batch_ids, nodes, roi_h=grid_h, roi_w=grid_w
+            ):
+                roi = extract_classifier_rois_vectorized(
+                    pred_gridmap=gridmap,
+                    batch_indices=batch_ids,
+                    grid_y=nodes[:, 0],
+                    grid_x=nodes[:, 1],
+                    grid_h=roi_h,
+                    grid_w=roi_w,
+                )
+                return classifier(roi)
+
+            if (
+                torch.is_grad_enabled()
+                and pred_gridmap.requires_grad
+                and pred_gridmap.device.type == "cuda"
+                and roi_chunk_size > 0
+                and shape_count > roi_chunk_size
+            ):
+                logits = checkpoint(
+                    classifier_from_gridmap,
+                    pred_gridmap,
+                    chunk_batch_indices,
+                    chunk_nodes,
+                )
+            else:
+                logits = classifier_from_gridmap(
+                    pred_gridmap, chunk_batch_indices, chunk_nodes
+                )
+            logits_chunks.append(logits)
+
+        logits = logits_chunks[0] if len(logits_chunks) == 1 else torch.cat(logits_chunks, dim=0)
+        labels = shape_nodes[:, 4].long()
+        shape_loss = ce_loss(logits, labels)
+        losses.append(shape_loss)
+        pred_labels = torch.argmax(logits, dim=1)
+        shape_correct = torch.sum(pred_labels == labels)
+        correct += shape_correct
+        total_nodes += shape_count
+        update_classifier_shape_stats(
+            shape_stats,
+            classifier_shape_name(grid_h, grid_w),
+            shape_loss.detach(),
+            shape_correct,
+            shape_count,
         )
 
     return torch.stack(losses).mean(), correct / float(total_nodes), total_nodes, shape_stats
 
 
+def classifier_node_loss(
+    classifier,
+    pred_gridmap,
+    node_batch,
+    ce_loss,
+    roi_extraction="vectorized",
+    roi_chunk_size=0,
+):
+    if roi_extraction == "legacy":
+        return classifier_node_loss_legacy(
+            classifier=classifier,
+            pred_gridmap=pred_gridmap,
+            node_batch=node_batch,
+            ce_loss=ce_loss,
+        )
+    if roi_extraction != "vectorized":
+        raise ValueError("roi_extraction must be 'legacy' or 'vectorized'")
+    return classifier_node_loss_vectorized(
+        classifier=classifier,
+        pred_gridmap=pred_gridmap,
+        node_batch=node_batch,
+        ce_loss=ce_loss,
+        roi_chunk_size=roi_chunk_size,
+    )
+
+
 def grid_positive_counts(pred_gridmap, label_gridmap, threshold=GRID_POSITIVE_THRESHOLD):
     pred_positive = pred_gridmap >= threshold
     label_positive = label_gridmap >= threshold
-    true_positive = torch.logical_and(pred_positive, label_positive).sum().item()
-    false_positive = torch.logical_and(pred_positive, ~label_positive).sum().item()
-    false_negative = torch.logical_and(~pred_positive, label_positive).sum().item()
+    true_positive = torch.logical_and(pred_positive, label_positive).sum()
+    false_positive = torch.logical_and(pred_positive, ~label_positive).sum()
+    false_negative = torch.logical_and(~pred_positive, label_positive).sum()
     return true_positive, false_positive, false_negative
 
 
 def precision_recall(true_positive, false_positive, false_negative):
     precision_den = true_positive + false_positive
     recall_den = true_positive + false_negative
+    if torch.is_tensor(true_positive):
+        zero = true_positive.new_zeros((), dtype=torch.float32)
+        precision = torch.where(
+            precision_den > 0, true_positive.float() / precision_den.float(), zero
+        )
+        recall = torch.where(
+            recall_den > 0, true_positive.float() / recall_den.float(), zero
+        )
+        return precision, recall
     precision = true_positive / float(precision_den) if precision_den > 0 else 0.0
     recall = true_positive / float(recall_den) if recall_den > 0 else 0.0
     return precision, recall
@@ -574,6 +856,11 @@ def train_one_epoch(
     grid_weight,
     cls_weight,
     stage_name="train",
+    roi_extraction="vectorized",
+    classifier_roi_chunk_size=0,
+    progress_update_interval=50,
+    amp_enabled=False,
+    grad_scaler=None,
 ):
     swin_model.train()
     classifier.train()
@@ -591,6 +878,11 @@ def train_one_epoch(
         cls_weight=cls_weight,
         stage_name=stage_name,
         training=True,
+        roi_extraction=roi_extraction,
+        classifier_roi_chunk_size=classifier_roi_chunk_size,
+        progress_update_interval=progress_update_interval,
+        amp_enabled=amp_enabled,
+        grad_scaler=grad_scaler,
     )
 
 
@@ -606,6 +898,10 @@ def evaluate(
     grid_weight,
     cls_weight,
     stage_name="valid",
+    roi_extraction="vectorized",
+    classifier_roi_chunk_size=0,
+    progress_update_interval=50,
+    amp_enabled=False,
 ):
     swin_model.eval()
     classifier.eval()
@@ -622,6 +918,11 @@ def evaluate(
         cls_weight=cls_weight,
         stage_name=stage_name,
         training=False,
+        roi_extraction=roi_extraction,
+        classifier_roi_chunk_size=classifier_roi_chunk_size,
+        progress_update_interval=progress_update_interval,
+        amp_enabled=amp_enabled,
+        grad_scaler=None,
     )
 
 
@@ -638,14 +939,27 @@ def _run_joint_epoch(
     cls_weight,
     stage_name,
     training,
+    roi_extraction,
+    classifier_roi_chunk_size,
+    progress_update_interval,
+    amp_enabled,
+    grad_scaler,
 ):
+    if progress_update_interval <= 0:
+        raise ValueError("progress_update_interval must be positive")
+    amp_enabled = bool(amp_enabled and device.type == "cuda")
+    if training and amp_enabled and grad_scaler is None:
+        raise ValueError("grad_scaler is required when AMP training is enabled")
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+
     accu_loss = torch.zeros(1).to(device)
     accu_grid_loss = torch.zeros(1).to(device)
     accu_cls_loss = torch.zeros(1).to(device)
     accu_cls_acc = torch.zeros(1).to(device)
-    grid_tp = 0
-    grid_fp = 0
-    grid_fn = 0
+    grid_tp = torch.zeros((), dtype=torch.long, device=device)
+    grid_fp = torch.zeros((), dtype=torch.long, device=device)
+    grid_fn = torch.zeros((), dtype=torch.long, device=device)
     total_cls_nodes = 0
     classifier_shape_stats = empty_classifier_shape_stats()
 
@@ -653,32 +967,45 @@ def _run_joint_epoch(
     for step, data in enumerate(progress):
         input_batch, qp_batch, gridmap_batch, node_batch = data
 
-        input_batch = input_batch.to(device)
-        qp_batch = qp_batch.to(device)
-        gridmap_batch = gridmap_batch.to(device)
+        input_batch = input_batch.to(device, non_blocking=True)
+        qp_batch = qp_batch.to(device, non_blocking=True)
+        gridmap_batch = gridmap_batch.to(device, non_blocking=True)
 
-        pred_gridmap = swin_model(input_batch, qp_batch)
-        grid_loss = grid_loss_fn(pred_gridmap, gridmap_batch)
-        cls_loss, cls_acc, cls_nodes, batch_shape_stats = classifier_node_loss(
-            classifier=classifier,
-            pred_gridmap=pred_gridmap,
-            node_batch=node_batch,
-            ce_loss=cls_loss_fn,
-        )
-        loss = grid_weight * grid_loss + cls_weight * cls_loss
+        with autocast(enabled=amp_enabled):
+            pred_gridmap = swin_model(input_batch, qp_batch)
+        # The model returns sigmoid probabilities. BCELoss is unsafe under
+        # autocast, and Classifier_I uses a large negative static mask that is
+        # intentionally kept in FP32. Gradients still flow through this cast.
+        with autocast(enabled=False):
+            loss_gridmap = pred_gridmap.float() if amp_enabled else pred_gridmap
+            grid_loss = grid_loss_fn(loss_gridmap, gridmap_batch.float())
+            cls_loss, cls_acc, cls_nodes, batch_shape_stats = classifier_node_loss(
+                classifier=classifier,
+                pred_gridmap=loss_gridmap,
+                node_batch=node_batch,
+                ce_loss=cls_loss_fn,
+                roi_extraction=roi_extraction,
+                roi_chunk_size=classifier_roi_chunk_size,
+            )
+            loss = grid_weight * grid_loss + cls_weight * cls_loss
 
         tp, fp, fn = grid_positive_counts(pred_gridmap, gridmap_batch)
         grid_tp += tp
         grid_fp += fp
         grid_fn += fn
-        grid_precision, grid_recall = precision_recall(grid_tp, grid_fp, grid_fn)
-
         if training:
-            loss.backward()
-            if not torch.isfinite(loss):
+            if amp_enabled:
+                grad_scaler.scale(loss).backward()
+            else:
+                loss.backward()
+            if not bool(torch.isfinite(loss).item()):
                 print("WARNING: non-finite loss, ending training ", loss)
                 sys.exit(1)
-            optimizer.step()
+            if amp_enabled:
+                grad_scaler.step(optimizer)
+                grad_scaler.update()
+            else:
+                optimizer.step()
             optimizer.zero_grad()
 
         accu_loss += loss.detach()
@@ -695,34 +1022,42 @@ def _run_joint_epoch(
                 payload["count"],
             )
 
-        phase = "train" if training else "valid"
-        progress.desc = (
-            "[{} {} epoch {}] loss: {:.6f}, grid: {:.6f}, cls: {:.6f}, "
-            "grid_precision: {:.6f}, grid_recall: {:.6f}, cls_acc: {:.6f}, cls_nodes: {:.2f}"
-        ).format(
-            phase,
-            stage_name,
-            epoch,
-            accu_loss.item() / (step + 1),
-            accu_grid_loss.item() / (step + 1),
-            accu_cls_loss.item() / (step + 1),
-            grid_precision,
-            grid_recall,
-            accu_cls_acc.item() / (step + 1),
-            total_cls_nodes / float(step + 1),
-        )
+        if step == 0 or (step + 1) % progress_update_interval == 0:
+            grid_precision, grid_recall = precision_recall(grid_tp, grid_fp, grid_fn)
+            phase = "train" if training else "valid"
+            progress.desc = (
+                "[{} {} epoch {}] loss: {:.6f}, grid: {:.6f}, cls: {:.6f}, "
+                "grid_precision: {:.6f}, grid_recall: {:.6f}, cls_acc: {:.6f}, cls_nodes: {:.2f}"
+            ).format(
+                phase,
+                stage_name,
+                epoch,
+                accu_loss.item() / (step + 1),
+                accu_grid_loss.item() / (step + 1),
+                accu_cls_loss.item() / (step + 1),
+                grid_precision.item(),
+                grid_recall.item(),
+                accu_cls_acc.item() / (step + 1),
+                total_cls_nodes / float(step + 1),
+            )
 
     step_count = step + 1
     grid_precision, grid_recall = precision_recall(grid_tp, grid_fp, grid_fn)
+    peak_memory_mb = 0.0
+    if device.type == "cuda":
+        peak_memory_mb = torch.cuda.max_memory_allocated(device) / (1024.0 * 1024.0)
+        phase = "train" if training else "valid"
+        print("{} peak CUDA memory allocated: {:.2f} MiB".format(phase, peak_memory_mb))
     return (
         accu_loss.item() / step_count,
         accu_grid_loss.item() / step_count,
         accu_cls_loss.item() / step_count,
-        grid_precision,
-        grid_recall,
+        grid_precision.item(),
+        grid_recall.item(),
         accu_cls_acc.item() / step_count,
         total_cls_nodes / float(step_count),
         finalize_classifier_shape_stats(classifier_shape_stats),
+        peak_memory_mb,
     )
 
 

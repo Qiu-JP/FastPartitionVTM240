@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import torch.optim as optim
+from torch.cuda.amp import GradScaler
 try:
     from torch.utils.tensorboard import SummaryWriter
 except ModuleNotFoundError:
@@ -26,7 +27,6 @@ from utils import (
 )
 from model import SwinTransformer_Unet_Luma96 as model96
 from model import Classifier_I as classifier_i
-
 
 class Tee:
     def __init__(self, *streams):
@@ -132,6 +132,14 @@ def load_model_weights(model, checkpoint_path, device, model_name):
 
 def train_SwinTransU(args):
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    fasttrain_enabled = bool(args.fasttrain)
+    roi_extraction = "vectorized" if fasttrain_enabled else "legacy"
+    classifier_roi_chunk_size = 0
+    num_workers = 4 if fasttrain_enabled else 2
+    progress_update_interval = 50 if fasttrain_enabled else 1
+    amp_enabled = bool(fasttrain_enabled and device.type == "cuda")
+    if fasttrain_enabled and not amp_enabled:
+        print("Fast training requested but CUDA is unavailable; falling back to FP32.")
 
     Net = model96(use_context_mask=args.useContextMask).to(device)
     Classifier = classifier_i().to(device)
@@ -168,6 +176,15 @@ def train_SwinTransU(args):
             args.stage1ClsLossWeight,
             args.stage2GridLossWeight,
             args.stage2ClsLossWeight,
+            args.gridPositiveWeight,
+            args.gridNegativeWeight,
+            args.gridL1Weight,
+            args.fasttrain,
+            roi_extraction,
+            classifier_roi_chunk_size,
+            num_workers,
+            progress_update_interval,
+            int(amp_enabled),
         ]:
             f.write(str(s))
             f.write(',')
@@ -179,13 +196,17 @@ def train_SwinTransU(args):
         type=args.trainSplit,
         component=args.component,
     )
+    loader_worker_args = {}
+    if num_workers > 0:
+        loader_worker_args.update(persistent_workers=True, prefetch_factor=2)
     train_dataLoader = DataLoader(
         dataset=train_dataset,
-        num_workers=2,
+        num_workers=num_workers,
         batch_size=args.batchSize,
-        pin_memory=True,
+        pin_memory=device.type == "cuda",
         shuffle=True,
         collate_fn=collate_gridmap_with_nodes,
+        **loader_worker_args,
     )
     val_dataset = IdAlignedGridmapCuTreeDataset(
         dataset_name=args.dataset,
@@ -194,17 +215,43 @@ def train_SwinTransU(args):
     )
     val_dataLoader = DataLoader(
         dataset=val_dataset,
-        num_workers=2,
+        num_workers=num_workers,
         batch_size=args.batchSize,
-        pin_memory=True,
+        pin_memory=device.type == "cuda",
         shuffle=False,
         collate_fn=collate_gridmap_with_nodes,
+        **loader_worker_args,
     )
 
     pg = [p for p in list(Net.parameters()) + list(Classifier.parameters()) if p.requires_grad]
     optimizer = optim.AdamW(pg, lr=args.lr, weight_decay=5E-2)
-    grid_loss_fn = get_loss_function(args.gridLossType)
+    grad_scaler = GradScaler(enabled=amp_enabled)
+    grid_loss_fn = get_loss_function(
+        args.gridLossType,
+        positive_weight=args.gridPositiveWeight,
+        negative_weight=args.gridNegativeWeight,
+        l1_weight=args.gridL1Weight,
+    )
+    if args.gridLossType == "WBCE":
+        print(
+            "Weighted BCE: positive_weight={}, negative_weight={}".format(
+                args.gridPositiveWeight,
+                args.gridNegativeWeight,
+            )
+        )
+    elif args.gridLossType == "BCE_L1":
+        print("BCE + L1: l1_weight={}".format(args.gridL1Weight))
     cls_loss_fn = nn.CrossEntropyLoss()
+    print(
+        "Fast training: {}, ROI extraction: {}, classifier nodes: all, "
+        "ROI chunk size: {}, AMP: {}, DataLoader workers: {}".format(
+            fasttrain_enabled,
+            roi_extraction,
+            classifier_roi_chunk_size if classifier_roi_chunk_size > 0 else "all",
+            amp_enabled,
+            num_workers,
+        )
+    )
     tb_train_samples, tb_val_samples = resolve_tb_image_samples(args)
 
     def stage_config(epoch):
@@ -231,6 +278,11 @@ def train_SwinTransU(args):
             grid_weight=grid_weight,
             cls_weight=cls_weight,
             stage_name=stage_name,
+            roi_extraction=roi_extraction,
+            classifier_roi_chunk_size=classifier_roi_chunk_size,
+            progress_update_interval=progress_update_interval,
+            amp_enabled=amp_enabled,
+            grad_scaler=grad_scaler,
         )
         val_metrics = evaluate(
             swin_model=Net,
@@ -243,6 +295,10 @@ def train_SwinTransU(args):
             grid_weight=grid_weight,
             cls_weight=cls_weight,
             stage_name=stage_name,
+            roi_extraction=roi_extraction,
+            classifier_roi_chunk_size=classifier_roi_chunk_size,
+            progress_update_interval=progress_update_interval,
+            amp_enabled=amp_enabled,
         )
 
         if tb_writer is not None:
@@ -263,6 +319,8 @@ def train_SwinTransU(args):
             tb_writer.add_scalar("LR", optimizer.param_groups[0]["lr"], epoch)
             add_classifier_shape_scalars(tb_writer, "train", train_metrics[7], epoch)
             add_classifier_shape_scalars(tb_writer, "val", val_metrics[7], epoch)
+            tb_writer.add_scalar("Memory/train_peak_allocated_mb", train_metrics[8], epoch)
+            tb_writer.add_scalar("Memory/val_peak_allocated_mb", val_metrics[8], epoch)
             add_gridmap_sample_set(tb_writer, "train", Net, train_dataset, tb_train_samples, device, epoch)
             add_gridmap_sample_set(tb_writer, "val", Net, val_dataset, tb_val_samples, device, epoch)
             tb_writer.flush()
@@ -441,7 +499,17 @@ if __name__ == '__main__':
     parser.add_argument('--useContextMask', action='store_true', help='Enable 96x96 context attention mask in SwinTransformer_Unet_Luma96')
     parser.add_argument('--swinCkpt', type=str, default=None, help='Optional Swin checkpoint to resume from')
     parser.add_argument('--classifierCkpt', type=str, default=None, help='Optional Classifier_I checkpoint to resume from')
-    parser.add_argument('--gridLossType', type=str, default='BCE', choices=['BCE', 'L1', 'HUBER', 'MSE'], help='Loss function for Swin gridmap supervision')
+    parser.add_argument('--gridLossType', type=str, default='BCE', choices=['BCE', 'BCE_L1', 'WBCE', 'L1', 'HUBER', 'MSE'], help='Loss function for Swin gridmap supervision')
+    parser.add_argument('--gridPositiveWeight', type=float, default=1.0, help='Positive-label weight used by WBCE')
+    parser.add_argument('--gridNegativeWeight', type=float, default=1.0, help='Negative-label weight used by WBCE')
+    parser.add_argument('--gridL1Weight', type=float, default=0.2, help='L1 coefficient used by BCE_L1')
+    parser.add_argument(
+        '--fasttrain',
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help='Enable full-node vectorized ROI extraction, CUDA AMP, 4 DataLoader workers, and progress updates every 50 batches',
+    )
     parser.add_argument('--jointStage1Epoch', type=int, default=50, help='Epoch threshold for joint training stage 1')
     parser.add_argument('--stage1Lr', type=float, default=None, help='Joint stage 1 base learning rate, default uses --lr')
     parser.add_argument('--stage2Lr', type=float, default=None, help='Joint stage 2 base learning rate, default uses --lr')
