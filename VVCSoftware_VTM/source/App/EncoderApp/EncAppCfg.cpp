@@ -1438,6 +1438,7 @@ bool EncAppCfg::parseCfg( int argc, char* argv[] )
   ("FastPartitionPreset",                             m_fastPartitionPreset,                       std::string("all"), "FastPartition classifier preset: all, fast, or middle")
   ("FastPartitionThreshold",                          m_fastPartitionThreshold,                    -1.0, "FastPartition classifier threshold override. Negative values use FastPartitionPreset.")
   ("FastPartitionTh",                                 m_fastPartitionTh,                            std::string(""), "FastPartition thresholds [NO_SPLIT,QT,BTH,BTV,TTH,TTV]")
+  ("FastPartitionThBySize",                           m_fastPartitionThBySize,                      std::string(""), "FastPartition size-aware thresholds, e.g. \"64x64:[NO_SPLIT,QT,BTH,BTV,TTH,TTV];32x32:[...]\"")
 #endif
   ("DisableScalingMatrixForLFNST",                    m_disableScalingMatrixForLfnstBlks,                true, "Disable scaling matrices, when enabled, for LFNST-coded blocks")
   ("DisableScalingMatrixForAlternativeColourSpace",   m_disableScalingMatrixForAlternativeColourSpace,  false, "Disable scaling matrices when the colour space is not equal to the designated colour space of scaling matrix")

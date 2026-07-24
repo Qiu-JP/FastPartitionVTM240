@@ -974,6 +974,7 @@ protected:
   std::string m_fastPartitionPreset;                           ///< FastPartition classifier preset
   double      m_fastPartitionThreshold;                        ///< FastPartition classifier threshold override
   std::string m_fastPartitionTh;                               ///< FastPartition per-class thresholds
+  std::string m_fastPartitionThBySize;                         ///< FastPartition size-aware per-class thresholds
 #endif
   bool      m_disableScalingMatrixForLfnstBlks;
   bool      m_disableScalingMatrixForAlternativeColourSpace;

@@ -1465,6 +1465,9 @@ bool EncModeCtrlMTnoRQT::xFastPartitionGetAllowedClasses(Partitioner& partitione
   float bestProbability = -1.0f;
   int legalAllowedCount = 0;
   const double thresholdOverride = m_pcEncCfg->getFastPartitionThreshold();
+  const std::array<double, FP_NUM_CLASS>* perSizeThresholds =
+    m_pcEncCfg->getFastPartitionThresholdsForSize(cuWidth, cuHeight);
+  const bool usePerSizeThresholds = perSizeThresholds != nullptr;
   const bool usePerClassThresholds = m_pcEncCfg->getFastPartitionThresholdsEnabled();
   const std::array<double, FP_NUM_CLASS>& perClassThresholds = m_pcEncCfg->getFastPartitionThresholds();
 
@@ -1475,8 +1478,9 @@ bool EncModeCtrlMTnoRQT::xFastPartitionGetAllowedClasses(Partitioner& partitione
       bestProbability = probabilities[cls];
       bestClass = cls;
     }
-    const double threshold = usePerClassThresholds ? perClassThresholds[cls]
-                                                    : (thresholdOverride >= 0.0 ? thresholdOverride : 0.1);
+    const double threshold = usePerSizeThresholds ? (*perSizeThresholds)[cls]
+                             : (usePerClassThresholds ? perClassThresholds[cls]
+                                                       : (thresholdOverride >= 0.0 ? thresholdOverride : 0.1));
     if (probabilities[cls] >= threshold)
     {
       allowedClasses[cls] = true;
@@ -1506,7 +1510,7 @@ bool EncModeCtrlMTnoRQT::xFastPartitionGetAllowedClasses(Partitioner& partitione
                    partitioner.currDepth, partitioner.currQtDepth, partitioner.currBtDepth,
                    isBoundaryCu ? 1 : 0,
                    getFastPartitionSplitName(implicitSplit),
-                   usePerClassThresholds ? "per-class" : "single",
+                   usePerSizeThresholds ? "per-size" : (usePerClassThresholds ? "per-class" : "single"),
                    getFastPartitionClassName(bestClass), bestProbability);
       for (int cls = 0; cls < FP_NUM_CLASS; cls++)
       {
@@ -1515,8 +1519,9 @@ bool EncModeCtrlMTnoRQT::xFastPartitionGetAllowedClasses(Partitioner& partitione
       std::fprintf(statFile, " thresholds=");
       for (int cls = 0; cls < FP_NUM_CLASS; cls++)
       {
-        const double threshold = usePerClassThresholds ? perClassThresholds[cls]
-                                                        : (thresholdOverride >= 0.0 ? thresholdOverride : 0.1);
+        const double threshold = usePerSizeThresholds ? (*perSizeThresholds)[cls]
+                                 : (usePerClassThresholds ? perClassThresholds[cls]
+                                                           : (thresholdOverride >= 0.0 ? thresholdOverride : 0.1));
         std::fprintf(statFile, "%s%s:%.6f", cls == 0 ? "" : ",", getFastPartitionClassName(cls), threshold);
       }
       printFastPartitionClassFlags(statFile, " legal=", legalClasses);

@@ -60,7 +60,7 @@
 //########### place macros to be be kept below this line ###############
 
 #define Save_Depth     1
-#define FastPartition  0
+#define FastPartition  1
 #define RDOStats       1
 
 #ifndef JVET_AJ0151_DSC_SEI

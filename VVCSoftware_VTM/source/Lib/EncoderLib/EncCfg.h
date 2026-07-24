@@ -48,6 +48,7 @@
 #include "EncCfgParam.h"
 
 #include <array>
+#include <map>
 #include <sstream>
 
 #if JVET_O0756_CALCULATE_HDRMETRICS
@@ -1091,6 +1092,7 @@ protected:
   double      m_fastPartitionThreshold = -1.0;     ///< FastPartition classifier threshold override
   std::array<double, 6> m_fastPartitionThresholds = { { 0.1, 0.1, 0.1, 0.1, 0.1, 0.1 } };
   bool        m_fastPartitionThresholdsEnabled = false;
+  std::map<std::pair<int, int>, std::array<double, 6>> m_fastPartitionThresholdsBySize;
 #endif
 
   bool      m_disableScalingMatrixForAlternativeColourSpace;
@@ -3271,6 +3273,49 @@ public:
   }
   bool         getFastPartitionThresholdsEnabled() const             { return m_fastPartitionThresholdsEnabled; }
   const std::array<double, 6>& getFastPartitionThresholds() const    { return m_fastPartitionThresholds; }
+  void         setFastPartitionThresholdsBySize( const std::string& s )
+  {
+    m_fastPartitionThresholdsBySize.clear();
+    if (s.empty())
+    {
+      return;
+    }
+
+    std::string values = s;
+    for (char& c : values)
+    {
+      if (c == '[' || c == ']' || c == ',' || c == ';' || c == ':'
+          || c == 'x' || c == 'X')
+      {
+        c = ' ';
+      }
+    }
+
+    std::istringstream stream(values);
+    while (stream)
+    {
+      int width = 0;
+      int height = 0;
+      if (!(stream >> width >> height))
+      {
+        break;
+      }
+      CHECK(width <= 0 || height <= 0, "FastPartitionThBySize contains a non-positive CU size");
+      std::array<double, 6> thresholds;
+      for (double& threshold : thresholds)
+      {
+        CHECK(!(stream >> threshold) || threshold < 0.0,
+              "FastPartitionThBySize entries must contain width, height, and six non-negative thresholds");
+      }
+      m_fastPartitionThresholdsBySize[std::make_pair(width, height)] = thresholds;
+    }
+  }
+  bool         getFastPartitionThresholdsBySizeEnabled() const       { return !m_fastPartitionThresholdsBySize.empty(); }
+  const std::array<double, 6>* getFastPartitionThresholdsForSize( int width, int height ) const
+  {
+    auto it = m_fastPartitionThresholdsBySize.find(std::make_pair(width, height));
+    return it == m_fastPartitionThresholdsBySize.end() ? nullptr : &it->second;
+  }
 #endif
   void         setDisableScalingMatrixForAlternativeColourSpace(bool b) { m_disableScalingMatrixForAlternativeColourSpace = b; }
   bool         getDisableScalingMatrixForAlternativeColourSpace()    { return m_disableScalingMatrixForAlternativeColourSpace; }

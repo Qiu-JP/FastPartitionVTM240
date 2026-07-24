@@ -1457,6 +1457,7 @@ void EncApp::xInitLibCfg( int layerIdx )
   m_cEncLib.setFastPartitionPreset                               ( m_fastPartitionPreset );
   m_cEncLib.setFastPartitionThreshold                            ( m_fastPartitionThreshold );
   m_cEncLib.setFastPartitionThresholds                           ( m_fastPartitionTh );
+  m_cEncLib.setFastPartitionThresholdsBySize                     ( m_fastPartitionThBySize );
 #endif
   m_cEncLib.setDisableScalingMatrixForLfnstBlks                  ( m_disableScalingMatrixForLfnstBlks);
   m_cEncLib.setDisableScalingMatrixForAlternativeColourSpace(m_disableScalingMatrixForAlternativeColourSpace);
