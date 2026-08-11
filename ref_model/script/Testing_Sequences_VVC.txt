@@ -20,7 +20,4 @@ BasketballPass,BasketballPass.yuv,416,240,1,50
 FourPeople,FourPeople.yuv,1280,720,1,60
 Johnny,Johnny.yuv,1280,720,1,60
 KristenAndSara,KristenAndSara.yuv,1280,720,1,60
-BasketballDrillText,BasketballDrillText.yuv,832,480,1,50
-SlideEditing,SlideEditing.yuv,1280,720,1,30
-SlideShow,SlideShow.yuv,1280,720,1,20
 #end!!!!
