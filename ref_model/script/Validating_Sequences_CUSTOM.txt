@@ -1,0 +1,13 @@
+# CUSTOM pre-sampled YUV format: name,file,width,height,frames,fps
+uvg_racenight,uvg_racenight_3840x2160.yuv,3840,2160,3,50
+uvg_twilight,uvg_twilight_3840x2160.yuv,3840,2160,3,50
+xiph_old_town_1080,xiph_old_town_1080_1920x1080.yuv,1920,1080,4,50
+mcl_jcv_src17,videoSRC17_1920x1080_24.yuv,1920,1080,4,24
+mcl_jcv_src27,videoSRC27_1920x1080_30.yuv,1920,1080,4,30
+xiph_washdc_4sif,xiph_washdc_4sif_640x480.yuv,640,480,10,30
+xiph_soccer_cif,xiph_soccer_cif_352x288.yuv,352,288,10,30
+xiph_news_cif,xiph_news_cif_352x288.yuv,352,288,10,30
+xiph_tennis_sif,xiph_tennis_sif_352x240.yuv,352,240,10,30
+xiph_stockholm_720,xiph_stockholm_720_1280x720.yuv,1280,720,10,59.94
+xiph_mobcal_720,xiph_mobcal_720_1280x720.yuv,1280,720,10,50
+# CUSTOM pre-sampled YUV format: name,file,width,height,frames,fps
