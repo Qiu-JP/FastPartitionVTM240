@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -38,7 +39,8 @@ def partition_root() -> Path:
 
 
 def dataset_root() -> Path:
-    return data_root() / "dataset"
+    override = os.environ.get("FASTPARTITION_DATASET_ROOT")
+    return Path(override) if override else data_root() / "dataset"
 
 
 def metadata_root() -> Path:
@@ -81,11 +83,23 @@ _DATASET_SPECS = {
         partition_subdir="DIV2K",
         default_sequence_list="Training_Sequences_DIV2K.txt",
     ),
+    "CUSTOM": DatasetSpec(
+        name="CUSTOM",
+        video_subdir="CUSTOM",
+        partition_subdir="CUSTOM",
+        default_sequence_list="Training_Sequences_CUSTOM.txt",
+    ),
     "HEVC_CTC": DatasetSpec(
         name="HEVC_CTC",
         video_subdir="HEVC_CTC",
         partition_subdir="HEVC_CTC",
         default_sequence_list="Testing_Sequences.txt",
+    ),
+    "VVC_CTC": DatasetSpec(
+        name="VVC_CTC",
+        video_subdir="VVC_CTC",
+        partition_subdir="VVC_CTC",
+        default_sequence_list="Testing_Sequences_VVC.txt",
     ),
 }
 
@@ -106,10 +120,14 @@ def sequence_list_path(filename: Optional[str] = None, dataset_name: Optional[st
 
 
 def video_dataset_root(dataset_name: str) -> Path:
-    return video_root() / dataset_spec(dataset_name).video_subdir
+    override = os.environ.get("FASTPARTITION_VIDEO_ROOT")
+    return Path(override) if override else video_root() / dataset_spec(dataset_name).video_subdir
 
 
 def partition_dataset_root(dataset_name: str, qp: Optional[int] = None) -> Path:
+    override = os.environ.get("FASTPARTITION_PARTITION_ROOT")
+    if override:
+        return Path(override)
     base = partition_root() / dataset_spec(dataset_name).partition_subdir
     if qp is None:
         return base

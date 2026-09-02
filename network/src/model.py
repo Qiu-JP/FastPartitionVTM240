@@ -555,7 +555,7 @@ class BasicLayer(nn.Module):
             flops += self.upsample.flops()
         return flops
 
-class SwinTransformer_Unet_Luma96(nn.Module):
+class SwinTransformer_Unet(nn.Module):
     r""" Swin Transformer
         A PyTorch impl of : `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows`  -
           https://arxiv.org/pdf/2103.14030
@@ -579,16 +579,16 @@ class SwinTransformer_Unet_Luma96(nn.Module):
     """
 
     def __init__(self, patch_size=4, in_chans=1, num_classes=2,
-                 embed_dim=128, depths=(2, 6, 2), depths_decoder=(2, 2), num_heads=(4, 8, 16),num_heads_up=(8,4),
+                 embed_dim=128, depths=(2, 6), depths_decoder=(2,), num_heads=(4, 8),num_heads_up=(4,),
                  window_size=4, mlp_ratio=4., qkv_bias=True,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
                  norm_layer=nn.LayerNorm, patch_norm=True,
-                 use_checkpoint=False, input_size=96, target_size=64,
-                 use_context_mask=False, **kwargs):
+                 use_checkpoint=False, input_size=48, target_size=32,
+                 use_context_mask=True, **kwargs):
         super().__init__()
 
         if not isinstance(patch_size, int):
-            raise ValueError("SwinTransformer_Unet_Luma96 expects integer patch_size")
+            raise ValueError("SwinTransformer_Unet expects integer patch_size")
         if target_size % patch_size != 0:
             raise ValueError("target_size must be divisible by patch_size")
         if (target_size // patch_size) % (2 ** len(depths_decoder)) != 0:
@@ -785,7 +785,7 @@ class SwinTransformer_Unet_Luma96(nn.Module):
         # x: [B, L, C]
         if x.shape[-2:] != (self.input_size, self.input_size):
             raise ValueError(
-                "SwinTransformer_Unet_Luma96 expects input spatial size {}x{}, got {}x{}".format(
+                "SwinTransformer_Unet expects input spatial size {}x{}, got {}x{}".format(
                     self.input_size, self.input_size, x.shape[-2], x.shape[-1]
                 )
             )
@@ -828,7 +828,7 @@ class Classifier_I(nn.Module):
         # Hidden size follows the paper note: 32 channels for CU area >= 512,
         # otherwise 16 channels.
         branch_specs = {
-            (16, 16): 32,  # 64x64
+            (16, 16): 32,  # historical large ROI
             (8, 8): 32,    # 32x32
             (8, 4): 32,    # 16x32
             (4, 8): 32,    # 32x16
@@ -934,8 +934,8 @@ class Classifier_I(nn.Module):
 
 if __name__ == "__main__":
     # 创建模型
-    model = SwinTransformer_Unet_Luma96()
-    dummy_input = torch.randn(2, 1, 96, 96)
+    model = SwinTransformer_Unet()
+    dummy_input = torch.randn(2, 1, 48, 48)
     dummy_qp = torch.tensor([[32.0 / 51.0], [37.0 / 51.0]], dtype=torch.float32)
  
     print(f"Swin-Unet输入形状: {dummy_input.shape}")

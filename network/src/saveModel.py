@@ -6,7 +6,7 @@ import torch
 
 import paths
 from model import Classifier_I
-from model import SwinTransformer_Unet_Luma96
+from model import SwinTransformer_Unet
 
 
 CLASSIFIER_I_GRID_SIZES = (
@@ -123,10 +123,10 @@ def export_classifier_json(checkpoint_path, output_path, device):
 
 
 def export_swin_luma(checkpoint_path, output_path, device, use_context_mask):
-    model = SwinTransformer_Unet_Luma96(use_context_mask=use_context_mask)
+    model = SwinTransformer_Unet(use_context_mask=use_context_mask)
     missing, unexpected = load_model_weights(model, checkpoint_path, device)
     model.eval()
-    dummy_input = torch.randn(1, 1, 96, 96, device=device)
+    dummy_input = torch.randn(1, 1, 48, 48, device=device)
     dummy_qp = torch.randn(1, 1, device=device)
     traced = torch.jit.trace(model, (dummy_input, dummy_qp), strict=False)
     traced.save(str(output_path))
@@ -134,7 +134,7 @@ def export_swin_luma(checkpoint_path, output_path, device, use_context_mask):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Export 96x96 trained checkpoints for C++ deployment.")
+    parser = argparse.ArgumentParser(description="Export 48x48 trained checkpoints for C++ deployment.")
     parser.add_argument(
         "--task",
         choices=("export_classifier_json", "swin_luma"),
@@ -143,7 +143,7 @@ def parse_args():
     parser.add_argument("--checkpoint", required=True, help="Path to a .pth checkpoint under network/checkpoints.")
     parser.add_argument("--output", required=True, help="Output .pt or .native.json path.")
     parser.add_argument("--device", default="cpu")
-    parser.add_argument("--useContextMask", action="store_true", help="Use the context-mask variant for SwinTransformer_Unet_Luma96.")
+    parser.add_argument("--useContextMask", action="store_true", default=True, help="Use the context-mask variant for SwinTransformer_Unet.")
     parser.add_argument("--viewNetron", action="store_true", help="Start a Netron server for the exported .pt model.")
     parser.add_argument("--netronHost", default="127.0.0.1", help="Host address for --viewNetron.")
     parser.add_argument("--netronPort", type=int, default=8080, help="Port for --viewNetron.")

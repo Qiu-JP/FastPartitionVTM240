@@ -25,7 +25,7 @@ from utils import (
     train_one_epoch_classifier,
     get_loss_function,
 )
-from model import SwinTransformer_Unet_Luma96 as model96
+from model import SwinTransformer_Unet as model
 from model import Classifier_I as classifier_i
 
 class Tee:
@@ -113,7 +113,7 @@ def format_prune_stats(prune_stats):
     return " | ".join(parts)
 
 
-def write_epoch_summary(summary_path, epoch, stage_name, train_metrics, val_metrics):
+def write_epoch_summary(summary_path, epoch, stage_name, train_metrics, val_metrics, test_metrics=None):
     with open(summary_path, "a") as f:
         f.write("Epoch {} Stage {}\n".format(epoch, stage_name))
         f.write("Classifier shape acc train: {}\n".format(format_classifier_shape_metric(train_metrics[7], "acc")))
@@ -124,6 +124,11 @@ def write_epoch_summary(summary_path, epoch, stage_name, train_metrics, val_metr
         f.write("Classifier shape top2 val: {}\n".format(format_classifier_shape_metric(val_metrics[7], "top2")))
         f.write("Classifier shape top3 val: {}\n".format(format_classifier_shape_metric(val_metrics[7], "top3")))
         f.write("Classifier prune val: {}\n".format(format_prune_stats(val_metrics[9])))
+        if test_metrics is not None:
+            f.write("Classifier shape acc test: {}\n".format(format_classifier_shape_metric(test_metrics[7], "acc")))
+            f.write("Classifier shape top2 test: {}\n".format(format_classifier_shape_metric(test_metrics[7], "top2")))
+            f.write("Classifier shape top3 test: {}\n".format(format_classifier_shape_metric(test_metrics[7], "top3")))
+            f.write("Classifier prune test: {}\n".format(format_prune_stats(test_metrics[9])))
         f.write("\n")
 
 
@@ -183,6 +188,35 @@ def load_model_weights(model, checkpoint_path, device, model_name):
     print(f"Loaded {model_name} checkpoint:", checkpoint_path)
 
 
+def classifier_safety_threshold_table(args, device):
+    if args.classifierSafetyThresholdPreset == "none":
+        return None
+    if args.classifierSafetyThresholdPreset != "table3_lambda2000":
+        raise ValueError(
+            "Unsupported classifier safety threshold preset: {}".format(
+                args.classifierSafetyThresholdPreset
+            )
+        )
+    default_tau = float(args.classifierSafetyTauLarge)
+    table_by_pixel_hw = {
+        (32, 32): [0.006, 0.147, 0.114, 0.121, 0.073, 0.085],
+        (16, 16): [0.011, 0.170, 0.025, 0.031, 0.028, 0.036],
+        (16, 32): [0.039, None, 0.114, 0.108, 0.078, 0.091],
+        (8, 32): [0.042, None, 0.062, 0.042, None, 0.052],
+        (8, 16): [-0.010, None, 0.042, 0.049, None, 0.037],
+        (32, 16): [0.031, None, 0.107, 0.115, 0.088, 0.080],
+        (32, 8): [0.034, None, 0.045, 0.068, 0.052, None],
+        (16, 8): [-0.010, None, 0.045, 0.051, 0.043, None],
+    }
+    thresholds = {}
+    for (pixel_h, pixel_w), values in table_by_pixel_hw.items():
+        grid_h = pixel_h // 4
+        grid_w = pixel_w // 4
+        filled = [default_tau if value is None else float(value) for value in values]
+        thresholds[(grid_h, grid_w)] = torch.tensor(filled, dtype=torch.float32, device=device)
+    return thresholds
+
+
 def train_SwinTransU(args):
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     fasttrain_enabled = bool(args.fasttrain)
@@ -194,12 +228,13 @@ def train_SwinTransU(args):
     if fasttrain_enabled and not amp_enabled:
         print("Fast training requested but CUDA is unavailable; falling back to FP32.")
 
-    Net = model96(use_context_mask=args.useContextMask).to(device)
+    Net = model(use_context_mask=args.useContextMask).to(device)
     Classifier = classifier_i().to(device)
     print("Swin context mask:", args.useContextMask)
 
-    load_model_weights(Net, args.swinCkpt, device, "SwinTransformer_Unet_Luma96")
+    load_model_weights(Net, args.swinCkpt, device, "SwinTransformer_Unet")
     load_model_weights(Classifier, args.classifierCkpt, device, "Classifier_I")
+    classifier_safety_thresholds = classifier_safety_threshold_table(args, device)
 
     log_out_dir = os.path.join(str(paths.output_root()), args.outDir, args.jobID)
     ckpt_out_dir = os.path.join(str(paths.checkpoints_root()), args.outDir, args.jobID)
@@ -239,6 +274,11 @@ def train_SwinTransU(args):
             num_workers,
             progress_update_interval,
             int(amp_enabled),
+            args.classifierSafetyTauLarge,
+            args.classifierSafetyLossWeight,
+            args.classifierSafetyThresholdPreset,
+            args.classifierSafetyThresholdOnlyShapes,
+            args.checkpointInterval,
         ]:
             f.write(str(s))
             f.write(',')
@@ -306,6 +346,22 @@ def train_SwinTransU(args):
             num_workers,
         )
     )
+    if args.classifierSafetyLossWeight > 0 and args.classifierSafetyTauLarge > 0:
+        print(
+            "Classifier all-shape safety loss: tau={}, weight={}".format(
+                args.classifierSafetyTauLarge,
+                args.classifierSafetyLossWeight,
+            )
+        )
+    if classifier_safety_thresholds is not None:
+        print(
+            "Classifier safety threshold preset: {} (fallback tau={})".format(
+                args.classifierSafetyThresholdPreset,
+                args.classifierSafetyTauLarge,
+            )
+        )
+    if args.classifierSafetyThresholdOnlyShapes:
+        print("Classifier loss is restricted to shapes covered by the safety threshold preset.")
     tb_train_samples, tb_val_samples = resolve_tb_image_samples(args)
 
     def stage_config(epoch):
@@ -337,6 +393,10 @@ def train_SwinTransU(args):
             progress_update_interval=progress_update_interval,
             amp_enabled=amp_enabled,
             grad_scaler=grad_scaler,
+            classifier_safety_tau_large=args.classifierSafetyTauLarge,
+            classifier_safety_loss_weight=args.classifierSafetyLossWeight,
+            classifier_safety_thresholds=classifier_safety_thresholds,
+            classifier_safety_threshold_only_shapes=bool(args.classifierSafetyThresholdOnlyShapes),
         )
         val_metrics = evaluate(
             swin_model=Net,
@@ -353,6 +413,10 @@ def train_SwinTransU(args):
             classifier_roi_chunk_size=classifier_roi_chunk_size,
             progress_update_interval=progress_update_interval,
             amp_enabled=amp_enabled,
+            classifier_safety_tau_large=args.classifierSafetyTauLarge,
+            classifier_safety_loss_weight=args.classifierSafetyLossWeight,
+            classifier_safety_thresholds=classifier_safety_thresholds,
+            classifier_safety_threshold_only_shapes=bool(args.classifierSafetyThresholdOnlyShapes),
         )
 
         if tb_writer is not None:
@@ -379,7 +443,7 @@ def train_SwinTransU(args):
             add_gridmap_sample_set(tb_writer, "val", Net, val_dataset, tb_val_samples, device, epoch)
             tb_writer.flush()
 
-        if (epoch + 1) % 10 == 0:
+        if args.checkpointInterval > 0 and (epoch + 1) % args.checkpointInterval == 0:
             torch.save(Net.state_dict(), os.path.join(ckpt_out_dir, "swin-{}.pth".format(epoch)))
             torch.save(Classifier.state_dict(), os.path.join(ckpt_out_dir, "classifier-{}.pth".format(epoch)))
 
@@ -540,7 +604,7 @@ if __name__ == '__main__':
     parser.add_argument('--batchSize', type=int, default=256)
     parser.add_argument('--lr', type=float, default=0.0001)
     parser.add_argument('--device', default='cuda:0', help='device id (i.e. 0 or 0,1 or cpu)')
-    parser.add_argument('--outDir', type=str, default='swin_luma96_joint')
+    parser.add_argument('--outDir', type=str, default='swin_luma_joint')
     parser.add_argument('--task', type=str, default='swin_luma',
                         choices=['pretrain_classifier_logical', 'swin_luma'])
     parser.add_argument('--logFile', type=str, default='train.log')
@@ -553,7 +617,7 @@ if __name__ == '__main__':
     parser.add_argument('--tbImageSampleIndex', type=int, default=None, help='Optional fixed sample index for both train and val TensorBoard gridmap images')
     parser.add_argument('--tbTrainImageSamples', type=str, default='simple:1989496,medium:819088,complex:320136', help='Comma-separated training TensorBoard gridmap samples, e.g. simple:0,medium:1,complex:2')
     parser.add_argument('--tbValImageSamples', type=str, default='simple:116602,medium:54490,complex:121714', help='Comma-separated validation TensorBoard gridmap samples, e.g. simple:0,medium:1,complex:2')
-    parser.add_argument('--useContextMask', action='store_true', help='Enable 96x96 context attention mask in SwinTransformer_Unet_Luma96')
+    parser.add_argument('--useContextMask', action='store_true', default=True, help='Enable context attention mask in SwinTransformer_Unet')
     parser.add_argument('--swinCkpt', type=str, default=None, help='Optional Swin checkpoint to resume from')
     parser.add_argument('--classifierCkpt', type=str, default=None, help='Optional Classifier_I checkpoint to resume from')
     parser.add_argument('--gridLossType', type=str, default='BCE', choices=['BCE', 'BCE_L1', 'WBCE', 'L1', 'HUBER', 'MSE'], help='Loss function for Swin gridmap supervision')
@@ -574,6 +638,23 @@ if __name__ == '__main__':
     parser.add_argument('--stage1ClsLossWeight', type=float, default=0.02, help='Joint stage 1 classifier loss weight')
     parser.add_argument('--stage2GridLossWeight', type=float, default=0.5, help='Joint stage 2 gridmap loss weight')
     parser.add_argument('--stage2ClsLossWeight', type=float, default=1.0, help='Joint stage 2 classifier loss weight')
+    parser.add_argument('--classifierSafetyTauLarge', type=float, default=0.0, help='True-class probability floor for large ROI safety loss; 0 disables it')
+    parser.add_argument('--classifierSafetyLossWeight', type=float, default=0.0, help='Weight for large ROI true-class probability safety loss')
+    parser.add_argument(
+        '--classifierSafetyThresholdPreset',
+        type=str,
+        default='none',
+        choices=['none', 'table3_lambda2000'],
+        help='Optional per-shape/per-class true-label safety threshold preset; missing shapes fall back to --classifierSafetyTauLarge',
+    )
+    parser.add_argument(
+        '--classifierSafetyThresholdOnlyShapes',
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help='If 1, classifier CE/safety loss only uses ROI shapes included in --classifierSafetyThresholdPreset',
+    )
+    parser.add_argument('--checkpointInterval', type=int, default=10, help='Save Swin/classifier checkpoints every N epochs; 0 disables periodic saves')
 
     args = parser.parse_args()
 

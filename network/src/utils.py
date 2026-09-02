@@ -38,7 +38,6 @@ CLASSIFIER_SUPPORTED_SIZES = {
     (1, 2),
 }
 CLASSIFIER_SUPPORTED_SIZE_ORDER = tuple(sorted(CLASSIFIER_SUPPORTED_SIZES))
-
 BCE_PROB_MIN = 1e-7
 BCE_PROB_MAX = 1.0 - BCE_PROB_MIN
 
@@ -207,11 +206,16 @@ def build_tensorboard_preview_background(dataset, sample_index):
         raise IndexError(f"tbImageSampleIndex {sample_index} out of range [0, {len(dataset)})")
     sample_id = dataset.common_ids[sample_index]
     luma = dataset.input_array[dataset.input_positions[sample_index]][0]
-    luma_lcu = center_crop_array(luma, LUMA_LCU_SIZE)
+    gridmap = dataset.gridmap_array[dataset.gridmap_positions[sample_index]]
+    preview_size = int(gridmap.shape[-1]) * 4
+    luma_lcu = center_crop_array(luma, preview_size)
 
-    chroma_ids, chroma_array = load_chroma_input_for_preview(dataset)
+    try:
+        chroma_ids, chroma_array = load_chroma_input_for_preview(dataset)
+    except FileNotFoundError:
+        return normalize_preview_image(luma_lcu)
     if sample_id not in chroma_ids.index:
-        raise KeyError(f"Sample id not found in Chroma input: {sample_id}")
+        return normalize_preview_image(luma_lcu)
     chroma_pos = int(chroma_ids.loc[sample_id, "sample_index"])
     chroma = chroma_array[chroma_pos]
     chroma_lcu = np.stack(
@@ -402,15 +406,21 @@ class IdAlignedGridmapDataset(Dataset):
         self.gridmap_array = np.load(self.gridmap_npy_path, mmap_mode="r")
         self.input_ids = input_payload["ids"]
         self.gridmap_ids = gridmap_payload["ids"]
+        self.id_columns = list(input_payload.get("id_columns", ID_COLUMNS))
+        gridmap_id_columns = list(gridmap_payload.get("id_columns", ID_COLUMNS))
 
-        if list(self.input_ids.index.names) != ID_COLUMNS:
+        if self.id_columns != gridmap_id_columns:
             raise RuntimeError(
-                f"input ids must be indexed by {ID_COLUMNS}. "
+                f"input/gridmap id columns mismatch: {self.id_columns} != {gridmap_id_columns}"
+            )
+        if list(self.input_ids.index.names) != self.id_columns:
+            raise RuntimeError(
+                f"input ids must be indexed by {self.id_columns}. "
                 "Regenerate the pkl files with the current createDataset script."
             )
-        if list(self.gridmap_ids.index.names) != ID_COLUMNS:
+        if list(self.gridmap_ids.index.names) != self.id_columns:
             raise RuntimeError(
-                f"gridmap ids must be indexed by {ID_COLUMNS}. "
+                f"gridmap ids must be indexed by {self.id_columns}. "
                 "Regenerate the pkl files with the current createDataset script."
             )
 
@@ -473,8 +483,13 @@ class IdAlignedGridmapCuTreeDataset(IdAlignedGridmapDataset):
 
         payload = pd.read_pickle(self.cu_tree_path)
         samples = payload["samples"]
-        if list(samples.index.names) != ID_COLUMNS:
-            raise RuntimeError(f"CU tree samples must be indexed by {ID_COLUMNS}")
+        tree_id_columns = list(payload.get("id_columns", ID_COLUMNS))
+        if tree_id_columns != self.id_columns:
+            raise RuntimeError(
+                f"CU tree id columns mismatch: {tree_id_columns} != {self.id_columns}"
+            )
+        if list(samples.index.names) != self.id_columns:
+            raise RuntimeError(f"CU tree samples must be indexed by {self.id_columns}")
         label_format = payload.get("format")
         if label_format != "cu_tree_numpy":
             raise RuntimeError(
@@ -675,11 +690,28 @@ def classifier_prediction_stats(logits, labels, thresholds=(0.1, 0.2, 0.3)):
     return top2_correct, top3_correct, prune_stats
 
 
+def classifier_true_prob_safety_loss(logits, labels, tau, threshold_by_label=None):
+    if tau <= 0 and threshold_by_label is None:
+        return logits.sum() * 0.0
+    probs = torch.softmax(logits.float(), dim=1)
+    true_probs = probs.gather(1, labels.long()[:, None]).squeeze(1)
+    if threshold_by_label is None:
+        thresholds = torch.full_like(true_probs, float(tau))
+    else:
+        thresholds = threshold_by_label.to(device=logits.device, dtype=torch.float32)
+        thresholds = thresholds.gather(0, labels.long())
+    return torch.relu(thresholds - true_probs).mean()
+
+
 def classifier_node_loss_legacy(
     classifier,
     pred_gridmap,
     node_batch,
     ce_loss,
+    safety_tau_large=0.0,
+    safety_loss_weight=0.0,
+    safety_thresholds=None,
+    safety_threshold_only_shapes=False,
 ):
     node_batches = {}
 
@@ -700,6 +732,10 @@ def classifier_node_loss_legacy(
     shape_stats = empty_classifier_shape_stats()
     prune_stats = empty_classifier_prune_stats()
     for (grid_h, grid_w), shape_nodes in node_batches.items():
+        if safety_threshold_only_shapes and (
+            safety_thresholds is None or (grid_h, grid_w) not in safety_thresholds
+        ):
+            continue
         roi = torch.cat(
             [
                 pred_gridmap[
@@ -718,7 +754,19 @@ def classifier_node_loss_legacy(
             device=pred_gridmap.device,
         )
         logits = classifier(roi)
-        shape_loss = ce_loss(logits, labels)
+        shape_ce_loss = ce_loss(logits, labels)
+        shape_safety_loss = logits.sum() * 0.0
+        if safety_loss_weight > 0:
+            threshold_by_label = None
+            if safety_thresholds is not None:
+                threshold_by_label = safety_thresholds.get((grid_h, grid_w))
+            shape_safety_loss = classifier_true_prob_safety_loss(
+                logits=logits,
+                labels=labels,
+                tau=safety_tau_large,
+                threshold_by_label=threshold_by_label,
+            )
+        shape_loss = shape_ce_loss + float(safety_loss_weight) * shape_safety_loss
         shape_count = labels.numel()
         loss_sum = loss_sum + shape_loss * float(shape_count)
         pred_labels = torch.argmax(logits, dim=1)
@@ -831,6 +879,10 @@ def classifier_node_loss_vectorized(
     node_batch,
     ce_loss,
     roi_chunk_size=0,
+    safety_tau_large=0.0,
+    safety_loss_weight=0.0,
+    safety_thresholds=None,
+    safety_threshold_only_shapes=False,
 ):
     if roi_chunk_size < 0:
         raise ValueError("roi_chunk_size must be non-negative")
@@ -850,6 +902,10 @@ def classifier_node_loss_vectorized(
     prune_stats = empty_classifier_prune_stats()
 
     for grid_h, grid_w, start, end in selected_groups:
+        if safety_threshold_only_shapes and (
+            safety_thresholds is None or (grid_h, grid_w) not in safety_thresholds
+        ):
+            continue
         shape_nodes = packed_nodes[start:end]
         shape_batch_indices = packed_batch_indices[start:end]
         shape_count = end - start
@@ -895,7 +951,19 @@ def classifier_node_loss_vectorized(
 
         logits = logits_chunks[0] if len(logits_chunks) == 1 else torch.cat(logits_chunks, dim=0)
         labels = shape_nodes[:, 4].long()
-        shape_loss = ce_loss(logits, labels)
+        shape_ce_loss = ce_loss(logits, labels)
+        shape_safety_loss = logits.sum() * 0.0
+        if safety_loss_weight > 0:
+            threshold_by_label = None
+            if safety_thresholds is not None:
+                threshold_by_label = safety_thresholds.get((grid_h, grid_w))
+            shape_safety_loss = classifier_true_prob_safety_loss(
+                logits=logits,
+                labels=labels,
+                tau=safety_tau_large,
+                threshold_by_label=threshold_by_label,
+            )
+        shape_loss = shape_ce_loss + float(safety_loss_weight) * shape_safety_loss
         loss_sum = loss_sum + shape_loss * float(shape_count)
         pred_labels = torch.argmax(logits, dim=1)
         shape_correct = torch.sum(pred_labels == labels)
@@ -913,6 +981,10 @@ def classifier_node_loss_vectorized(
         )
         update_classifier_prune_stats(prune_stats, shape_prune_stats)
 
+    if total_nodes == 0:
+        zero = pred_gridmap.sum() * 0.0
+        return zero, zero.detach(), 0, {}, empty_classifier_prune_stats()
+
     return loss_sum / float(total_nodes), correct / float(total_nodes), total_nodes, shape_stats, prune_stats
 
 
@@ -923,6 +995,10 @@ def classifier_node_loss(
     ce_loss,
     roi_extraction="vectorized",
     roi_chunk_size=0,
+    safety_tau_large=0.0,
+    safety_loss_weight=0.0,
+    safety_thresholds=None,
+    safety_threshold_only_shapes=False,
 ):
     if roi_extraction == "legacy":
         return classifier_node_loss_legacy(
@@ -930,6 +1006,10 @@ def classifier_node_loss(
             pred_gridmap=pred_gridmap,
             node_batch=node_batch,
             ce_loss=ce_loss,
+            safety_tau_large=safety_tau_large,
+            safety_loss_weight=safety_loss_weight,
+            safety_thresholds=safety_thresholds,
+            safety_threshold_only_shapes=safety_threshold_only_shapes,
         )
     if roi_extraction != "vectorized":
         raise ValueError("roi_extraction must be 'legacy' or 'vectorized'")
@@ -939,6 +1019,10 @@ def classifier_node_loss(
         node_batch=node_batch,
         ce_loss=ce_loss,
         roi_chunk_size=roi_chunk_size,
+        safety_tau_large=safety_tau_large,
+        safety_loss_weight=safety_loss_weight,
+        safety_thresholds=safety_thresholds,
+        safety_threshold_only_shapes=safety_threshold_only_shapes,
     )
 
 
@@ -985,6 +1069,10 @@ def train_one_epoch(
     progress_update_interval=50,
     amp_enabled=False,
     grad_scaler=None,
+    classifier_safety_tau_large=0.0,
+    classifier_safety_loss_weight=0.0,
+    classifier_safety_thresholds=None,
+    classifier_safety_threshold_only_shapes=False,
 ):
     swin_model.train()
     classifier.train()
@@ -1007,6 +1095,10 @@ def train_one_epoch(
         progress_update_interval=progress_update_interval,
         amp_enabled=amp_enabled,
         grad_scaler=grad_scaler,
+        classifier_safety_tau_large=classifier_safety_tau_large,
+        classifier_safety_loss_weight=classifier_safety_loss_weight,
+        classifier_safety_thresholds=classifier_safety_thresholds,
+        classifier_safety_threshold_only_shapes=classifier_safety_threshold_only_shapes,
     )
 
 
@@ -1026,6 +1118,10 @@ def evaluate(
     classifier_roi_chunk_size=0,
     progress_update_interval=50,
     amp_enabled=False,
+    classifier_safety_tau_large=0.0,
+    classifier_safety_loss_weight=0.0,
+    classifier_safety_thresholds=None,
+    classifier_safety_threshold_only_shapes=False,
 ):
     swin_model.eval()
     classifier.eval()
@@ -1047,6 +1143,10 @@ def evaluate(
         progress_update_interval=progress_update_interval,
         amp_enabled=amp_enabled,
         grad_scaler=None,
+        classifier_safety_tau_large=classifier_safety_tau_large,
+        classifier_safety_loss_weight=classifier_safety_loss_weight,
+        classifier_safety_thresholds=classifier_safety_thresholds,
+        classifier_safety_threshold_only_shapes=classifier_safety_threshold_only_shapes,
     )
 
 
@@ -1068,6 +1168,10 @@ def _run_joint_epoch(
     progress_update_interval,
     amp_enabled,
     grad_scaler,
+    classifier_safety_tau_large,
+    classifier_safety_loss_weight,
+    classifier_safety_thresholds,
+    classifier_safety_threshold_only_shapes,
 ):
     if progress_update_interval <= 0:
         raise ValueError("progress_update_interval must be positive")
@@ -1111,6 +1215,10 @@ def _run_joint_epoch(
                 ce_loss=cls_loss_fn,
                 roi_extraction=roi_extraction,
                 roi_chunk_size=classifier_roi_chunk_size,
+                safety_tau_large=classifier_safety_tau_large,
+                safety_loss_weight=classifier_safety_loss_weight,
+                safety_thresholds=classifier_safety_thresholds,
+                safety_threshold_only_shapes=classifier_safety_threshold_only_shapes,
             )
             loss = grid_weight * grid_loss + cls_weight * cls_loss
 

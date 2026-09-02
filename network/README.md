@@ -2,7 +2,9 @@
 
 `network/` 是 FastPartitionVTM 的神经网络工作区，负责把标准 VTM 导出的划分信息转换为训练数据集，并完成模型训练、单样本推理、TorchScript 导出和实验结果查看。
 
-Luma 输入为 `1x64x64`，gridmap 标签为 `2x16x16`；Chroma 输入为 `2x32x32`，gridmap 标签为 `2x8x8`。`Classifier_I` 在局部 gridmap ROI 上预测 CU 划分类型，类别顺序为 `[NO_SPLIT, QT, BTH, BTV, TTH, TTV]`。
+Luma 输入为 `1x48x48`，gridmap 标签为 `2x8x8`；Chroma 输入为 `2x32x32`，gridmap 标签为 `2x4x4`。`Classifier_I` 在局部 gridmap ROI 上预测 CU 划分类型，类别顺序为 `[NO_SPLIT, QT, BTH, BTV, TTH, TTV]`。
+
+当前主线数据尺寸为：Luma block `32x32`、输入 `48x48`；Chroma block `16x16`、输入 `32x32`。两者均由 `createDataset.py` 直接生成，不需要额外的合并脚本。
 
 ## 目录结构
 
@@ -48,11 +50,11 @@ network/
 | 文件 | 功能 | 输入 | 输出 |
 | --- | --- | --- | --- |
 | `paths.py` | 统一管理项目路径和数据集路径。 | 项目根目录、dataset 名称、split 名称。 | `Path` 对象。 |
-| `createDataset.py` | 64x64 主线数据集生成与预览。 | VTM 划分文本、YUV 视频、序列清单；或内置逻辑划分规则。 | `data/dataset/<dataset>/<split>/` 下的 input/gridmap/CU tree；或 `network/figures/` 下预览图。 |
-| `model.py` | 64x64 Swin gridmap 网络和 `Classifier_I` 定义。 | 训练/推理脚本传入的张量。 | gridmap 预测、分类 logits/probability。 |
-| `train.py` | 64x64 主线训练入口。 | 数据集 `.npy/.pkl`、可选预训练 checkpoint。 | `.pth` checkpoint、日志、loss、TensorBoard。 |
-| `inference.py` | 64x64 单样本推理与可视化。 | Swin checkpoint、数据集样本 index 或样本 id。 | `network/figures/<name>.png`。 |
-| `saveModel.py` | 64x64 模型导出。 | `.pth` checkpoint。 | TorchScript `.pt`。 |
+| `createDataset.py` | 32x32 Luma 和 16x16 Chroma 数据集生成与预览。 | VTM 划分文本、YUV 视频、序列清单；或内置逻辑划分规则。 | `data/dataset/<dataset>/<split>/` 下的 input/gridmap/CU tree；或 `network/figures/` 下预览图。 |
+| `model.py` | 48x48 输入、32x32 目标的 Swin gridmap 网络和 `Classifier_I` 定义。 | 训练/推理脚本传入的张量。 | gridmap 预测、分类 logits/probability。 |
+| `train.py` | 32x32 主线训练入口。 | 数据集 `.npy/.pkl`、可选预训练 checkpoint。 | `.pth` checkpoint、日志、loss、TensorBoard。 |
+| `inference.py` | 32x32 单样本推理与可视化。 | Swin checkpoint、数据集样本 index 或样本 id。 | `network/figures/<name>.png`。 |
+| `saveModel.py` | 32x32 模型导出。 | `.pth` checkpoint。 | TorchScript `.pt`。 |
 | `utils.py` | Dataset、样本对齐、CU tree 读取、loss、训练/验证循环、可视化辅助函数。 | 数据集文件、模型输出和标签。 | batch、loss、指标、TensorBoard 图像。 |
 
 ## 数据集生成
@@ -194,12 +196,26 @@ network/output/<outDir>/<jobID>/
 | `--stage1GridLossWeight` / `--stage2GridLossWeight` | 两阶段 gridmap loss 权重。 |
 | `--stage1ClsLossWeight` / `--stage2ClsLossWeight` | 两阶段 classifier loss 权重。 |
 | `--gridLossType` | gridmap loss 类型：`BCE`、`BCE_L1`、`WBCE`、`L1`、`HUBER`、`MSE`。 |
-| `--fasttrain` | `1` 时，训练和验证均在每个 batch 内按 Classifier ROI 形状随机采样，每种形状最多保留 512 个节点；默认 `0` 使用全部节点。 |
+| `--fasttrain` | `1` 启用推荐快速训练配置：全部节点、向量化 ROI、CUDA AMP、4 个 DataLoader workers、每 50 batch 更新进度；不会进行节点采样。`0` 使用原有的 legacy FP32 路径。 |
 | `--swinCkpt` | 可选 Swin checkpoint。 |
 | `--classifierCkpt` | 可选 `Classifier_I` checkpoint。 |
 | `--tbTrainImageSamples` | TensorBoard training 图像样本，默认 `simple:1989496,medium:819088,complex:320136`。 |
 | `--tbValImageSamples` | TensorBoard validation 图像样本，默认 `simple:116602,medium:54490,complex:121714`。 |
 | `--tbImageSampleIndex` | 可选覆盖参数；若提供，training 和 validation 都只写这一个样本。 |
+
+推荐快速训练配置：
+
+```bash
+--batchSize 256 \
+--fasttrain 1
+```
+
+`--fasttrain 1` 内部固定使用全节点向量化 ROI、无分块、4 个 DataLoader workers、
+每 50 batch 更新一次 tqdm，并为 Swin 主干启用 CUDA AMP。Classifier 与 BCE/grid loss
+仍保持 FP32。训练过程中不会采样或丢弃 Classifier 节点。
+
+训练和验证结束时会打印峰值 CUDA allocated memory，并写入 TensorBoard 的
+`Memory/train_peak_allocated_mb` 与 `Memory/val_peak_allocated_mb`。
 
 ## TensorBoard
 

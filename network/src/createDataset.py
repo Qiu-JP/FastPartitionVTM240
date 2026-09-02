@@ -1,5 +1,10 @@
 import argparse
+import math
 import os
+import pickle
+import re
+import sys
+import subprocess
 import time
 from pathlib import Path
 
@@ -65,13 +70,20 @@ PARTITION_INFO_COLUMNS = [
 ID_COLUMNS = ["sequence_name", "qp", "frame_id", "ctu_id"]
 
 DEFAULT_BLOCK_SIZE_MAP = {
-    "Luma": 64,
-    "Chroma": 32,
+    "Luma": 32,
+    "Chroma": 16,
 }
 
 DEFAULT_INPUT_SIZE_MAP = {
-    "Luma": 96,
-    "Chroma": 48,
+    "Luma": 48,
+    "Chroma": 32,
+}
+
+RDO_FILE_PATTERN = re.compile(r"^(?P<sequence>.+)_QP(?P<qp>\d+)\.tsv$")
+RDO_SUPPORTED_SIZES = {
+    (16, 16), (8, 8), (8, 4), (4, 8), (8, 2), (2, 8),
+    (8, 1), (1, 8), (4, 2), (2, 4), (4, 1), (1, 4),
+    (4, 4), (2, 2), (2, 1), (1, 2),
 }
 
 YUV420_COMPONENTS = {
@@ -654,11 +666,22 @@ def reconstruct_classifier_nodes_from_records(records, block_size):
     seen = set()
     while stack:
         x, y, w, h, depth = stack.pop()
+        # VVC split syntax can describe a child narrower than the 4x4
+        # classifier grid. Such a child is terminal/unsupported for this
+        # dataset and must not become a zero-sized grid node.
+        if w < 4 or h < 4:
+            continue
         node = (x, y, w, h)
         if node in seen or node not in node_labels:
             continue
         seen.add(node)
+        # A 4x4 luma CU is already at the VTM minimum and has no
+        # partition decision to learn.
+        if w == 4 and h == 4:
+            continue
         label = node_labels[node]
+        if x % 4 != 0 or y % 4 != 0 or w % 4 != 0 or h % 4 != 0:
+            continue
         ordered_nodes.append((x, y, w, h, depth, label))
         if label != 0:
             children = split_node_children_abs(x, y, w, h, label)
@@ -756,11 +779,12 @@ def convert_component_partition_to_cu_tree(component, partition_info_path, save_
     return save_path
 
 
-def convert_partition_to_cu_tree(data_type, block_size_map=None, dataset_name=None, component="both"):
+def convert_partition_to_cu_tree(data_type, block_size_map=None, dataset_name=None, component="both", output_split=None, source_dataset=None):
     dataset_name = resolve_dataset_name(data_type, dataset_name)
     partition_split_dir = resolve_split_dir(data_type)
-    output_split_dir = resolve_output_split_dir(data_type)
-    partition_dir = paths.partition_dataset_root(dataset_name) / partition_split_dir
+    output_split_dir = output_split or resolve_output_split_dir(data_type)
+    source_dataset = source_dataset or dataset_name
+    partition_dir = paths.partition_dataset_root(source_dataset) / partition_split_dir
     save_dir = paths.ensure_dir(paths.dataset_root() / dataset_name / output_split_dir)
     if block_size_map is None:
         block_size_map = DEFAULT_BLOCK_SIZE_MAP
@@ -779,6 +803,321 @@ def convert_partition_to_cu_tree(data_type, block_size_map=None, dataset_name=No
             )
         )
     return output_paths
+
+
+def load_rdo_sequence_widths(path):
+    widths = {}
+    with Path(path).open("r", encoding="utf-8") as source:
+        for raw_line in source:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "end!!!!" in line:
+                continue
+            fields = [field.strip() for field in line.split(",")]
+            if len(fields) < 4:
+                raise ValueError(f"Malformed sequence-list line: {raw_line.rstrip()}")
+            widths[fields[0]] = int(fields[2])
+    return widths
+
+
+def discover_rdo_files_for_dataset(root):
+    files = []
+    for path in sorted(Path(root).glob("*_QP*.tsv")):
+        match = RDO_FILE_PATTERN.match(path.name)
+        if match is None:
+            continue
+        done_path = Path(str(path) + ".done")
+        if not done_path.exists() or path.stat().st_size == 0:
+            continue
+        files.append((path, match.group("sequence"), int(match.group("qp"))))
+    if not files:
+        raise FileNotFoundError(f"No completed RDO TSV files found under {root}")
+    return files
+
+
+def _parse_dataset_rdo_fields(fields, outer_ctu_columns, coordinate_scale=0):
+    best_cost = float(fields[51])
+    if not math.isfinite(best_cost):
+        return None
+    completed = np.zeros(6, dtype=np.bool_)
+    rd_delta = np.full(6, np.inf, dtype=np.float32)
+    for mode in range(6):
+        base = 14 + 6 * mode
+        if int(fields[base + 2]) > 0:
+            mode_cost = float(fields[base + 3])
+            if math.isfinite(mode_cost):
+                completed[mode] = True
+                rd_delta[mode] = np.float32(max(mode_cost - best_cost, 0.0))
+    x, y = int(fields[5]), int(fields[6])
+    width, height = int(fields[7]), int(fields[8])
+    scaled_width = width >> coordinate_scale
+    scaled_height = height >> coordinate_scale
+    if (scaled_height // 4, scaled_width // 4) not in RDO_SUPPORTED_SIZES:
+        return None
+    if coordinate_scale and (scaled_width > 32 or scaled_height > 32):
+        return None
+    if coordinate_scale and ((x >> coordinate_scale) % 4 != 0 or (y >> coordinate_scale) % 4 != 0):
+        return None
+    outer_ctu_x, outer_ctu_y = x // 128, y // 128
+    sub_x, sub_y = (x % 128) // 64, (y % 128) // 64
+    ctu_id = (outer_ctu_y * outer_ctu_columns + outer_ctu_x) * 4 + sub_y * 2 + sub_x
+    return {
+        "ctu_id": ctu_id,
+        "frame_id": int(fields[3]),
+        "coordinates": (x, y, width, height),
+        "rd_delta": rd_delta,
+        "completed": completed,
+        "best_cost": best_cost,
+        "selected": {
+            "NS": 0, "QT": 1, "BTH": 2, "BTV": 3, "TTH": 4, "TTV": 5,
+        }.get(fields[50], -99),
+        "node_id": int(fields[0]),
+    }
+
+
+def iter_dataset_rdo_records(path, picture_width, channel):
+    """Yield all supported RDO rows for dataset conversion."""
+    outer_ctu_columns = (int(picture_width) + 127) // 128
+    awk_program = f'NF==52 && $1!="node_id" && $5=="{channel}" {{print;}}'
+    process = subprocess.Popen(
+        ["awk", "-F", "\t", awk_program, str(path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        for line in process.stdout:
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) != 52:
+                continue
+            record = _parse_dataset_rdo_fields(fields, outer_ctu_columns, 1 if channel == "C" else 0)
+            if record is not None:
+                yield record
+    finally:
+        process.stdout.close()
+    stderr = process.stderr.read()
+    if process.wait() != 0:
+        raise RuntimeError(f"Failed to parse RDO file {path}: {stderr}")
+
+
+def iter_final_dataset_rdo_records(path, picture_width, channel):
+    """Yield nodes on the final selected partition tree only.
+
+    A TSV can contain several searches that visit the same geometry.  The
+    final tree is recovered by walking parent/selected-mode links backwards:
+    a row is active when its parent is a root or its ``via_mode`` equals the
+    parent's selected mode.  Its six candidate costs are then retained.
+    """
+    outer_ctu_columns = (int(picture_width) + 127) // 128
+    mode_names = {"ROOT": -1, "NS": 0, "QT": 1, "BTH": 2, "BTV": 3, "TTH": 4, "TTV": 5}
+    parents, via_modes, selected_modes = [], [], []
+    scan = subprocess.Popen(
+        ["awk", "-F", "\t", 'NF==52 && $1!="node_id" {print $1 "\t" $2 "\t" $3 "\t" $51;}', str(path)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    if scan.stdout is None:
+        raise RuntimeError(f"Failed to scan RDO node links for {path}")
+    for line in scan.stdout:
+        fields = line.rstrip("\n").split("\t")
+        if len(fields) != 4:
+            continue
+        node_id, parent_id = int(fields[0]), int(fields[1])
+        while len(parents) <= node_id:
+            parents.append(-2)
+            via_modes.append(-2)
+            selected_modes.append(-2)
+        parents[node_id] = parent_id
+        via_modes[node_id] = mode_names.get(fields[2], -99)
+        selected_modes[node_id] = mode_names.get(fields[3], -99)
+    scan_stderr = scan.stderr.read() if scan.stderr is not None else ""
+    if scan.wait() != 0:
+        raise RuntimeError(f"Failed to scan RDO node links for {path}: {scan_stderr}")
+    active = [False] * len(parents)
+    for node_id, parent_id in enumerate(parents):
+        if parent_id == -2:
+            continue
+        if parent_id < 0:
+            active[node_id] = True
+        elif parent_id < len(active):
+            active[node_id] = active[parent_id] and via_modes[node_id] == selected_modes[parent_id]
+
+    awk_program = f'NF==52 && $1!="node_id" && $5=="{channel}" {{print;}}'
+    awk_process = subprocess.Popen(
+        ["awk", "-F", "\t", awk_program, str(path)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    if awk_process.stdout is None:
+        raise RuntimeError(f"Failed to open final-tree RDO stream for {path}")
+    try:
+        for line in awk_process.stdout:
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) != 52:
+                continue
+            node_id = int(fields[0])
+            if node_id >= len(active) or not active[node_id]:
+                continue
+            record = _parse_dataset_rdo_fields(fields, outer_ctu_columns, 1 if channel == "C" else 0)
+            if record is not None:
+                yield record
+    finally:
+        awk_process.stdout.close()
+    awk_stderr = awk_process.stderr.read()
+    if awk_process.wait() != 0:
+        raise RuntimeError(f"Failed to parse final RDO tree {path}: {awk_stderr}")
+
+
+def convert_component_rdocost_to_cache(
+    data_type,
+    dataset_name,
+    component,
+    rdo_root,
+    sequence_list,
+    output_split=None,
+):
+    """Convert completed VTM RDO TSVs to a CU-tree-aligned pkl/npy cache."""
+    if component not in ("Luma", "Chroma"):
+        raise ValueError(f"unsupported component: {component}")
+    if output_split is None:
+        output_split = resolve_output_split_dir(data_type)
+    dataset_dir = paths.dataset_root() / dataset_name / output_split
+    tree_path = dataset_dir / f"{component}_CU_Tree.pkl"
+    if not tree_path.exists():
+        raise FileNotFoundError(f"CU tree metadata not found: {tree_path}")
+    with open(tree_path, "rb") as fp:
+        tree = pickle.load(fp)
+    nodes_path = tree_path.with_name(tree["array_file"])
+    nodes = np.load(nodes_path, mmap_mode="r")
+    samples = tree["samples"]
+    offsets = np.asarray(tree["offsets"], dtype=np.int64)
+    sample_rows = list(samples.itertuples(index=False))
+    widths = load_rdo_sequence_widths(sequence_list)
+    node_key_to_global = {}
+    for row in sample_rows:
+        sample_index = int(row.sample_index)
+        start = int(offsets[sample_index])
+        end = int(offsets[sample_index + 1])
+        if hasattr(row, "block_x"):
+            block_x, block_y = int(row.block_x), int(row.block_y)
+        else:
+            block_x, block_y = block_origin_from_ctu_id(int(row.ctu_id), widths.get(str(row.sequence_name), 0), component)
+        for i, node in enumerate(nodes[start:end]):
+            grid_y, grid_x, grid_h, grid_w = (int(v) for v in node[:4])
+            node_key = (
+                str(row.sequence_name), int(row.qp), int(row.frame_id), int(row.ctu_id),
+                block_x + grid_x * 4, block_y + grid_y * 4, grid_w * 4, grid_h * 4,
+            )
+            if node_key in node_key_to_global:
+                raise RuntimeError(f"Duplicate CU-tree node key: {node_key}")
+            node_key_to_global[node_key] = start + i
+
+    channel = "L" if component == "Luma" else "C"
+    coordinate_scale = 1 if component == "Chroma" else 0
+    total_nodes = int(nodes.shape[0])
+    rd_delta = np.full((total_nodes, 6), np.inf, dtype=np.float32)
+    rd_completed = np.zeros((total_nodes, 6), dtype=np.bool_)
+    rd_valid = np.zeros((total_nodes,), dtype=np.bool_)
+    matched = mismatched = missing = duplicate = 0
+    discarded_outer_nodes = 0
+    tree_block_size = int(tree.get("block_size", 0))
+    rd_dtype = np.dtype([("rd_delta", np.float32, (6,)), ("completed", np.bool_, (6,)), ("valid", np.bool_)])
+    array_path = dataset_dir / f"{component}_CU_RDCost.npy"
+    metadata_path = dataset_dir / f"{component}_CU_RDCost.pkl"
+    previous_matched = 0
+    if array_path.exists() and metadata_path.exists():
+        previous = np.load(array_path, mmap_mode="r")
+        if previous.shape != (total_nodes,):
+            raise RuntimeError(f"Existing {array_path} has incompatible shape {previous.shape}")
+        rd_delta = np.asarray(previous["rd_delta"], dtype=np.float32).copy()
+        rd_completed = np.asarray(previous["completed"], dtype=np.bool_).copy()
+        rd_valid = np.asarray(previous["valid"], dtype=np.bool_).copy()
+        with open(metadata_path, "rb") as fp:
+            previous_payload = pickle.load(fp)
+        previous_matched = int(previous_payload.get("matched", 0))
+
+    for path, sequence, qp in discover_rdo_files_for_dataset(rdo_root):
+        if sequence not in widths:
+            continue
+        log_progress(f"RDCost {component}: parsing {path.name}")
+        matched_file = 0
+        for record in iter_final_dataset_rdo_records(path, widths[sequence], channel=channel):
+            ctu_id = int(record["ctu_id"])
+            x, y, width, height = record["coordinates"]
+            # The minimum luma CU is not a classifier decision sample and is
+            # intentionally absent from the compact CU tree.
+            if component == "Luma" and (width, height) == (4, 4):
+                continue
+            if coordinate_scale:
+                x, y, width, height = x // 2, y // 2, width // 2, height // 2
+            frame_id = int(record["frame_id"])
+            node_key = (str(sequence), int(qp), frame_id, ctu_id, x, y, width, height)
+            global_index = node_key_to_global.get(node_key)
+            if global_index is None:
+                if component == "Luma" and tree_block_size == 32 and (width, height) == (64, 64):
+                    discarded_outer_nodes += 1
+                    continue
+                mismatched += 1
+                continue
+            if rd_valid[global_index]:
+                raise RuntimeError(
+                    "Duplicate final-tree RDCost key; expected one selected node: "
+                    f"{node_key} in {path}"
+                )
+            best_cost = float(record["best_cost"])
+            denom = max(abs(best_cost), 1e-12)
+            rd_delta[global_index] = record["rd_delta"] / denom
+            rd_completed[global_index] = record["completed"]
+            rd_valid[global_index] = True
+            matched += 1
+            matched_file += 1
+        log_progress(f"RDCost {component}: matched {matched_file:,} rows from {path.name}")
+
+    if matched == 0:
+        raise RuntimeError("No RDO-cost rows matched the target CU tree")
+    # The compact tree contains only nodes that still require a partition
+    # decision; therefore every remaining node must have an RDCost row.
+    missing_trainable = int(np.count_nonzero(~rd_valid))
+    # The TSV also contains search nodes that are not part of the compact
+    # final tree.  They are intentionally discarded: the training contract
+    # is that every trainable tree node has one RDCost record.  Only missing
+    # tree nodes or duplicate records for a tree node invalidate the cache.
+    if duplicate != 0 or missing_trainable != 0:
+        raise RuntimeError(
+            f"RDCost validation failed: mismatched={mismatched}, duplicate={duplicate}, "
+            f"missing_trainable_nodes={missing_trainable}"
+        )
+    array = np.lib.format.open_memmap(array_path, mode="w+", dtype=rd_dtype, shape=(total_nodes,))
+    array["rd_delta"] = rd_delta
+    array["completed"] = rd_completed
+    array["valid"] = rd_valid
+    array.flush()
+    del array
+    payload = {
+        "format": "cu_rdcost_numpy",
+        "component": component,
+        "id_columns": list(tree["id_columns"]),
+        "node_key_columns": ["sequence_name", "qp", "frame_id", "ctu_id", "cu_x", "cu_y", "cu_width", "cu_height"],
+        "node_order": f"identical to {component}_CU_Tree.npy global node order",
+        "node_columns": ["rd_delta[6]", "completed[6]", "valid"],
+        "array_file": array_path.name,
+        "array_shape": (total_nodes,),
+        "array_dtype": rd_dtype.descr,
+        "offsets": offsets,
+        "class_order": ["NO_SPLIT", "QT", "BTH", "BTV", "TTH", "TTV"],
+        "rd_delta_definition": "(candidate_cost - best_cost) / max(abs(best_cost), 1e-12)",
+        "source_rdo_root": str(rdo_root),
+        "source_sequence_list": str(sequence_list),
+        "matched": matched + previous_matched,
+        "duplicate_rows": duplicate,
+        "mismatched": mismatched,
+        "missing_sample": missing,
+        "discarded_outer_nodes": discarded_outer_nodes,
+        "ignored_non_tree_rows": mismatched,
+        "missing_trainable_nodes": missing_trainable,
+    }
+    with open(metadata_path, "wb") as fp:
+        pickle.dump(payload, fp, protocol=pickle.HIGHEST_PROTOCOL)
+    log_progress(f"saved {component} CU RD-cost array to {array_path} (matched={matched:,})")
+    log_progress(f"saved {component} CU RD-cost metadata to {metadata_path}")
+    return metadata_path
 
 
 def classifier_i_logical_gridmap(grid_h, grid_w, class_id):
@@ -845,11 +1184,12 @@ def select_block_size_map(block_size_map, component):
     return {name: block_size_map[name] for name in selected_components}
 
 
-def convert_partition_to_gridmap(data_type, block_size_map=None, dataset_name=None, component="both"):
+def convert_partition_to_gridmap(data_type, block_size_map=None, dataset_name=None, component="both", output_split=None, source_dataset=None):
     dataset_name = resolve_dataset_name(data_type, dataset_name)
     partition_split_dir = resolve_split_dir(data_type)
-    output_split_dir = resolve_output_split_dir(data_type)
-    partition_dir = paths.partition_dataset_root(dataset_name) / partition_split_dir
+    output_split_dir = output_split or resolve_output_split_dir(data_type)
+    source_dataset = source_dataset or dataset_name
+    partition_dir = paths.partition_dataset_root(source_dataset) / partition_split_dir
     save_dir = paths.ensure_dir(paths.dataset_root() / dataset_name / output_split_dir)
     if block_size_map is None:
         block_size_map = DEFAULT_BLOCK_SIZE_MAP
@@ -877,13 +1217,31 @@ def sequence_info_to_metadata(data_type, dataset_name=None, sequence_list=None):
         if len(row) < 5:
             raise ValueError(f"Sequence metadata requires at least 5 fields: {row}")
         sequence_name = str(row[0])
+        width = int(row[2])
+        height = int(row[3])
+        explicit_is10bit = bool(int(row[6])) if len(row) > 6 and row[6] not in (None, "") else None
+        # CUSTOM lists may use the sixth field for FPS (for example 59.94),
+        # while older lists use it for an integer temporal subsample ratio.
+        # FPS is descriptive metadata and must not affect frame indexing.
+        subsample_ratio = 1
+        if len(row) > 5 and row[5] not in (None, ""):
+            try:
+                subsample_ratio = int(row[5])
+            except (TypeError, ValueError):
+                subsample_ratio = 1
         metadata[sequence_name] = {
             "file_name": str(row[1]),
-            "width": int(row[2]),
-            "height": int(row[3]),
+            "width": width,
+            "height": height,
             "frame_count": int(row[4]),
-            "subsample_ratio": int(row[5]) if len(row) > 5 and row[5] not in (None, "") else 1,
-            "is10bit": bool(int(row[6])) if len(row) > 6 and row[6] not in (None, "") else False,
+            "subsample_ratio": subsample_ratio,
+            # VVC CTC A1/A2 are stored as 10-bit 16-bit samples.  The
+            # historical six-column lists do not carry a bit-depth field.
+            "is10bit": (
+                explicit_is10bit
+                if explicit_is10bit is not None
+                else dataset_name.upper() == "VVC_CTC" and width == 3840 and height == 2160
+            ),
         }
     return metadata
 
@@ -976,7 +1334,7 @@ def crop_with_edge_padding(frame, x, y, crop_size):
     return block.astype(np.uint8, copy=False)
 
 
-def save_component_input(component, ids, metadata, dataset_name, split_dir, block_size, input_size):
+def save_component_input(component, ids, metadata, output_dataset, source_dataset, split_dir, block_size, input_size):
     components = YUV420_COMPONENTS[component]
     context_margin = input_size - block_size
     if context_margin < 0:
@@ -985,7 +1343,7 @@ def save_component_input(component, ids, metadata, dataset_name, split_dir, bloc
     input_shape = (len(ids), len(components), input_size, input_size)
     log_progress(f"start {component} input: allocate array shape={input_shape}")
     input_blocks = np.zeros(input_shape, dtype=np.uint8)
-    video_root = paths.video_dataset_root(dataset_name)
+    video_root = paths.video_dataset_root(source_dataset)
     total_groups = ids[["sequence_name", "frame_id"]].drop_duplicates().shape[0]
     processed_groups = 0
     processed_samples = 0
@@ -1028,7 +1386,7 @@ def save_component_input(component, ids, metadata, dataset_name, split_dir, bloc
                 f"{processed_samples:,}/{len(ids):,} samples, {processed_samples / elapsed:,.0f} samples/s"
             )
 
-    save_dir = paths.ensure_dir(paths.dataset_root() / dataset_name / split_dir)
+    save_dir = paths.ensure_dir(paths.dataset_root() / output_dataset / split_dir)
     save_path = save_dir / f"{component}_Input.pkl"
     npy_path = save_path.with_suffix(".npy")
     np.save(npy_path, input_blocks)
@@ -1051,17 +1409,27 @@ def save_component_input(component, ids, metadata, dataset_name, split_dir, bloc
     return save_path
 
 
-def convert_yuv_to_input(data_type, block_size_map=None, input_size_map=None, dataset_name=None, sequence_list=None, component="both"):
+def convert_yuv_to_input(
+    data_type,
+    block_size_map=None,
+    input_size_map=None,
+    dataset_name=None,
+    sequence_list=None,
+    component="both",
+    output_split=None,
+    source_dataset=None,
+):
     require_pandas()
     dataset_name = resolve_dataset_name(data_type, dataset_name)
-    split_dir = resolve_output_split_dir(data_type)
+    split_dir = output_split or resolve_output_split_dir(data_type)
     if block_size_map is None:
         block_size_map = DEFAULT_BLOCK_SIZE_MAP
     if input_size_map is None:
         input_size_map = DEFAULT_INPUT_SIZE_MAP
     block_size_map = select_block_size_map(block_size_map, component)
     input_size_map = select_block_size_map(input_size_map, component)
-    metadata = sequence_info_to_metadata(data_type, dataset_name, sequence_list)
+    source_dataset = source_dataset or dataset_name
+    metadata = sequence_info_to_metadata(data_type, source_dataset, sequence_list)
 
     output_paths = []
     for component, block_size in block_size_map.items():
@@ -1071,7 +1439,8 @@ def convert_yuv_to_input(data_type, block_size_map=None, input_size_map=None, da
                 component=component,
                 ids=ids,
                 metadata=metadata,
-                dataset_name=dataset_name,
+                output_dataset=dataset_name,
+                source_dataset=source_dataset,
                 split_dir=split_dir,
                 block_size=block_size,
                 input_size=input_size_map[component],
@@ -1080,16 +1449,378 @@ def convert_yuv_to_input(data_type, block_size_map=None, input_size_map=None, da
     return output_paths
 
 
+LUMA32_ID_COLUMNS = ID_COLUMNS + ["sub_block_id"]
+SUB_BLOCK_OFFSETS = (
+    (0, 0),
+    (32, 0),
+    (0, 32),
+    (32, 32),
+)
+
+def resolve_dataset_name(data_type, dataset_name=None):
+    if dataset_name is not None:
+        return dataset_name
+    return DATA_TYPE_TO_DATASET[data_type]
+
+
+def output_dataset_name(source_dataset_name, output_dataset=None):
+    if output_dataset is not None:
+        return output_dataset
+    return source_dataset_name
+
+
+def luma64_origin_from_ctu_id(ctu_id, source_width):
+    luma_ctu_size = 128
+    luma_block_size = 64
+    sub_blocks_per_row = luma_ctu_size // luma_block_size
+    ctu_per_row = (source_width + luma_ctu_size - 1) // luma_ctu_size
+    outer_ctu_id = ctu_id // (sub_blocks_per_row * sub_blocks_per_row)
+    sub_id = ctu_id % (sub_blocks_per_row * sub_blocks_per_row)
+    outer_ctu_x = outer_ctu_id % ctu_per_row
+    outer_ctu_y = outer_ctu_id // ctu_per_row
+    sub_x = sub_id % sub_blocks_per_row
+    sub_y = sub_id // sub_blocks_per_row
+    return outer_ctu_x * luma_ctu_size + sub_x * luma_block_size, outer_ctu_y * luma_ctu_size + sub_y * luma_block_size
+
+
+def crop_with_clamped_edge(frame, x, y, crop_size):
+    frame_h, frame_w = frame.shape
+    ys = np.clip(np.arange(y, y + crop_size), 0, frame_h - 1)
+    xs = np.clip(np.arange(x, x + crop_size), 0, frame_w - 1)
+    return frame[np.ix_(ys, xs)].astype(np.uint8, copy=False)
+
+
+def record_intersects_block(record, x, y, size):
+    return (
+        record["cu_x"] < x + size
+        and record["cu_x"] + record["cu_width"] > x
+        and record["cu_y"] < y + size
+        and record["cu_y"] + record["cu_height"] > y
+    )
+
+
+def record_leaf_node(record):
+    return (record["cu_x"], record["cu_y"], record["cu_width"], record["cu_height"])
+
+
+def luma64_origin_from_records(records):
+    return (
+        min(record["cu_x"] for record in records) // 64 * 64,
+        min(record["cu_y"] for record in records) // 64 * 64,
+    )
+
+
+def label_at_node_for_record(record, target_node):
+    root_size = 128
+    target_x, target_y, _, _ = target_node
+    node = (target_x // root_size * root_size, target_y // root_size * root_size, root_size, root_size)
+    leaf = record_leaf_node(record)
+
+    for split_idx in range(8):
+        label = classifier_label_from_part_split(record[f"split_{split_idx}"])
+        if label is None:
+            continue
+        if node == target_node:
+            return label
+        if label == 0:
+            return None
+        next_node = None
+        for child in split_node_children_abs(*node, label):
+            if child_contains_leaf(child, leaf):
+                next_node = child
+                break
+        if next_node is None:
+            return None
+        node = next_node
+    return None
+
+
+def luma64_split_label(records, block_x, block_y):
+    target_node = (block_x, block_y, 64, 64)
+    counts = {}
+    for record in records:
+        label = label_at_node_for_record(record, target_node)
+        if label is not None:
+            counts[label] = counts.get(label, 0) + 1
+    if not counts:
+        return None
+    return max(counts.items(), key=lambda item: (item[1], item[0] != 0, item[0]))[0]
+
+
+def collect_luma32_samples(key, records):
+    origin_x, origin_y = luma64_origin_from_records(records)
+    if luma64_split_label(records, origin_x, origin_y) != 1:
+        return []
+
+    samples = []
+    for sub_block_id, (dx, dy) in enumerate(SUB_BLOCK_OFFSETS):
+        block_x = origin_x + dx
+        block_y = origin_y + dy
+        block_node = (block_x, block_y, 32, 32)
+        local_records = [
+            record for record in records
+            if node_contains_node(block_node, record_leaf_node(record))
+        ]
+        if local_records:
+            samples.append((key, sub_block_id, block_x, block_y, local_records))
+    return samples
+
+
+def build_luma32_gridmap(local_records):
+    return build_ctu_gridmap_from_records(local_records, 32)
+
+
+def reconstruct_luma32_nodes(local_records, block_x, block_y):
+    export_node = (block_x, block_y, 32, 32)
+    root_size = 128
+    node_labels = {}
+    conflicts = []
+
+    for record in local_records:
+        node = (block_x // root_size * root_size, block_y // root_size * root_size, root_size, root_size)
+        leaf = record_leaf_node(record)
+
+        for split_idx in range(8):
+            label = classifier_label_from_part_split(record[f"split_{split_idx}"])
+            if label is None:
+                continue
+
+            if node_contains_node(export_node, node):
+                if node in node_labels and node_labels[node] != label:
+                    conflicts.append((node, node_labels[node], label, record))
+                    break
+                node_labels[node] = label
+
+            if label == 0:
+                break
+
+            next_node = None
+            for child in split_node_children_abs(*node, label):
+                if child_contains_leaf(child, leaf):
+                    next_node = child
+                    break
+            if next_node is None:
+                raise RuntimeError(
+                    "Cannot follow Luma32 split path for leaf "
+                    f"{leaf} at node {node} with label {label} in "
+                    f"{record['sequence_name']} qp={record['qp']} "
+                    f"frame={record['frame_id']} ctu={record['ctu_id']}"
+                )
+            node = next_node
+
+    if conflicts:
+        node, old_label, new_label, record = conflicts[0]
+        raise RuntimeError(
+            "Conflicting Luma32 split labels while reconstructing tree: "
+            f"node={node}, old={old_label}, new={new_label}, "
+            f"sample={(record['sequence_name'], record['qp'], record['frame_id'], record['ctu_id'])}"
+        )
+
+    node_values = []
+    stack = [(block_x, block_y, 32, 32)]
+    seen = set()
+    while stack:
+        x, y, w, h = stack.pop()
+        node = (x, y, w, h)
+        if node in seen or node not in node_labels:
+            continue
+        seen.add(node)
+        label = node_labels[node]
+        # A 4x4 luma CU has no remaining partition decision to learn.
+        if w == 4 and h == 4:
+            continue
+        node_values.append(((y - block_y) // 4, (x - block_x) // 4, h // 4, w // 4, label))
+        if label != 0:
+            for child in reversed(split_node_children_abs(x, y, w, h, label)):
+                if node_contains_node(export_node, child):
+                    stack.append(child)
+    return node_values
+
+
+def convert_luma32_gridmap(data_type, source_dataset, output_dataset, output_split):
+    partition_split = DATA_TYPE_TO_SPLIT_DIR[data_type]
+    save_split = output_split or DATA_TYPE_TO_OUTPUT_SPLIT_DIR[data_type]
+    partition_info_path = paths.partition_dataset_root(source_dataset) / partition_split / "Luma_Partition_Info.txt"
+    save_dir = paths.ensure_dir(paths.dataset_root() / output_dataset / save_split)
+    save_path = save_dir / "Luma_Gridmap.pkl"
+
+    ids = []
+    gridmaps = []
+    for key, records in iter_partition_groups(partition_info_path):
+        for _, sub_block_id, block_x, block_y, local_records in collect_luma32_samples(key, records):
+            ids.append((*key, sub_block_id, block_x, block_y))
+            gridmaps.append(build_luma32_gridmap(local_records))
+
+    if not gridmaps:
+        raise RuntimeError(f"No Luma32 QT child samples generated from {partition_info_path}")
+
+    id_df = pd.DataFrame(ids, columns=LUMA32_ID_COLUMNS + ["block_x", "block_y"])
+    id_df["sample_index"] = np.arange(len(id_df), dtype=np.int64)
+    id_df = id_df.set_index(LUMA32_ID_COLUMNS, drop=False)
+    arr = np.stack(gridmaps, axis=0)
+    npy_path = save_path.with_suffix(".npy")
+    np.save(npy_path, arr)
+    pd.to_pickle({
+        "component": "Luma",
+        "block_size": 32,
+        "grid_size": 8,
+        "id_columns": LUMA32_ID_COLUMNS,
+        "ids": id_df,
+        "array_file": npy_path.name,
+        "array_key": "gridmap",
+        "array_shape": tuple(arr.shape),
+        "array_dtype": str(arr.dtype),
+    }, save_path)
+    log_progress(f"saved Luma32 gridmap array to {npy_path}")
+    return save_path
+
+
+def convert_luma32_cu_tree(data_type, source_dataset, output_dataset, output_split):
+    partition_split = DATA_TYPE_TO_SPLIT_DIR[data_type]
+    save_split = output_split or DATA_TYPE_TO_OUTPUT_SPLIT_DIR[data_type]
+    partition_info_path = paths.partition_dataset_root(source_dataset) / partition_split / "Luma_Partition_Info.txt"
+    save_dir = paths.ensure_dir(paths.dataset_root() / output_dataset / save_split)
+    save_path = save_dir / "Luma_CU_Tree.pkl"
+    nodes_path = save_path.with_suffix(".npy")
+    raw_nodes_path = save_path.with_name("Luma_CU_Tree_Nodes.tmp.i2.bin")
+
+    rows = []
+    offsets = [0]
+    total_nodes = 0
+    sample_index = 0
+    start_time = time.time()
+    with open(raw_nodes_path, "wb") as fp:
+        for key, records in iter_partition_groups(partition_info_path):
+            for _, sub_block_id, block_x, block_y, local_records in collect_luma32_samples(key, records):
+                nodes = reconstruct_luma32_nodes(local_records, block_x, block_y)
+                rows.append({
+                    "sequence_name": key[0],
+                    "qp": key[1],
+                    "frame_id": key[2],
+                    "ctu_id": key[3],
+                    "sub_block_id": sub_block_id,
+                    "block_x": block_x,
+                    "block_y": block_y,
+                    "sample_index": sample_index,
+                    "node_start": total_nodes,
+                    "node_end": total_nodes + len(nodes),
+                    "node_count": len(nodes),
+                })
+                np.asarray(nodes, dtype=np.int16).tofile(fp)
+                total_nodes += len(nodes)
+                offsets.append(total_nodes)
+                sample_index += 1
+            if sample_index % 200000 == 0:
+                elapsed = max(time.time() - start_time, 1e-6)
+                log_progress(f"Luma32 CU tree {sample_index:,} samples, {total_nodes:,} nodes, {total_nodes / elapsed:,.0f} nodes/s")
+
+    if total_nodes == 0:
+        raise RuntimeError(f"No Luma32 CU tree nodes generated from {partition_info_path}")
+
+    raw_nodes = np.memmap(raw_nodes_path, mode="r", dtype=np.int16, shape=(int(total_nodes), 5))
+    node_array = np.lib.format.open_memmap(nodes_path, mode="w+", dtype=np.int16, shape=(int(total_nodes), 5))
+    node_array[:] = raw_nodes[:]
+    node_array.flush()
+    del node_array
+    del raw_nodes
+    raw_nodes_path.unlink()
+
+    samples = pd.DataFrame(rows).set_index(LUMA32_ID_COLUMNS, drop=False)
+    pd.to_pickle({
+        "format": "cu_tree_numpy",
+        "component": "Luma",
+        "block_size": 32,
+        "grid_size": 8,
+        "id_columns": LUMA32_ID_COLUMNS,
+        "samples": samples,
+        "node_columns": ["grid_y", "grid_x", "grid_h", "grid_w", "label"],
+        "array_file": nodes_path.name,
+        "array_key": "cu_tree_nodes",
+        "array_shape": (int(total_nodes), 5),
+        "array_dtype": "int16",
+        "offsets": np.asarray(offsets, dtype=np.int64),
+        "class_order": ["NO_SPLIT", "QT", "BTH", "BTV", "TTH", "TTV"],
+    }, save_path)
+    log_progress(f"saved Luma32 CU tree to {save_path}")
+    return save_path
+
+
+def convert_luma32_input(data_type, source_dataset, output_dataset, output_split, sequence_list=None):
+    save_split = output_split or DATA_TYPE_TO_OUTPUT_SPLIT_DIR[data_type]
+    save_dir = paths.ensure_dir(paths.dataset_root() / output_dataset / save_split)
+    gridmap_payload = pd.read_pickle(save_dir / "Luma_Gridmap.pkl")
+    ids = gridmap_payload["ids"]
+    metadata = sequence_info_to_metadata(data_type, source_dataset, sequence_list)
+    save_path = save_dir / "Luma_Input.pkl"
+    npy_path = save_path.with_suffix(".npy")
+    input_blocks = np.lib.format.open_memmap(npy_path, mode="w+", dtype=np.uint8, shape=(len(ids), 1, 48, 48))
+    video_root = paths.video_dataset_root(source_dataset)
+    total_groups = ids[["sequence_name", "frame_id"]].drop_duplicates().shape[0]
+    processed_groups = 0
+    processed_samples = 0
+    start_time = time.time()
+
+    for (sequence_name, frame_id), group in ids.groupby(level=["sequence_name", "frame_id"], sort=False):
+        processed_groups += 1
+        seq_meta = metadata[str(sequence_name)]
+        y_frame, _, _ = read_yuv420_frame(
+            video_root / seq_meta["file_name"],
+            seq_meta["width"],
+            seq_meta["height"],
+            int(frame_id),
+            seq_meta["is10bit"],
+        )
+        for row in group.itertuples(index=False):
+            block_x = int(row.block_x)
+            block_y = int(row.block_y)
+            input_blocks[int(row.sample_index), 0] = crop_with_clamped_edge(y_frame, block_x - 16, block_y - 16, 48)
+            processed_samples += 1
+        if processed_groups == 1 or processed_groups % 50 == 0 or processed_groups == total_groups:
+            elapsed = max(time.time() - start_time, 1e-6)
+            log_progress(
+                f"Luma32 input {processed_groups:,}/{total_groups:,} sequence-frame groups, "
+                f"{processed_samples:,}/{len(ids):,} samples, {processed_samples / elapsed:,.0f} samples/s"
+            )
+
+    input_shape = tuple(input_blocks.shape)
+    input_dtype = str(input_blocks.dtype)
+    input_blocks.flush()
+    del input_blocks
+    pd.to_pickle({
+        "component": "Luma",
+        "block_size": 32,
+        "input_size": 48,
+        "context_margin": 16,
+        "padding": "edge",
+        "id_columns": LUMA32_ID_COLUMNS,
+        "ids": ids.copy(),
+        "array_file": npy_path.name,
+        "array_key": "input",
+        "array_shape": input_shape,
+        "array_dtype": input_dtype,
+    }, save_path)
+    log_progress(f"saved Luma32 input to {save_path}")
+    return save_path
+
 def build_argparser():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data-type', type=int, choices=[1, 2, 3], default=1)
     parser.add_argument('--dataset', type=str, default=None)
+    parser.add_argument('--source-dataset', type=str, default=None)
     parser.add_argument('--sequence-list', type=str, default=None)
-    parser.add_argument('--luma-block-size', type=int, default=64)
-    parser.add_argument('--chroma-block-size', type=int, default=32)
-    parser.add_argument('--luma-input-size', type=int, default=96)
-    parser.add_argument('--chroma-input-size', type=int, default=48)
-    parser.add_argument('--component', choices=['both', 'luma', 'chroma'], default='both')
+    parser.add_argument(
+        '--output-split',
+        type=str,
+        default=None,
+        help='Override output split directory under data/dataset/<dataset>/ without changing partition input split.',
+    )
+    parser.add_argument('--luma-block-size', type=int, default=32)
+    parser.add_argument('--chroma-block-size', type=int, default=16)
+    parser.add_argument('--luma-input-size', type=int, default=48)
+    parser.add_argument('--chroma-input-size', type=int, default=32)
+    parser.add_argument('--component', choices=['both', 'luma', 'chroma'], default='luma')
+    parser.add_argument('--rdo-root', type=str, default=None)
+    parser.add_argument('--rdo-sequence-list', type=str, default=None)
     parser.add_argument('--show', action='store_true')
     parser.add_argument('--show-output', type=str, default=None)
     parser.add_argument('--show-sample-index', type=int, default=None)
@@ -1105,6 +1836,7 @@ def build_argparser():
             'gridmap-input',
             'cu-tree',
             'gridmap-input-cu-tree',
+            'rdocost',
             'preview',
             'classifier-pretrain',
         ],
@@ -1115,6 +1847,27 @@ def build_argparser():
 
 if __name__ == '__main__':
     args = build_argparser().parse_args()
+    # Luma samples are 32x32 blocks extracted from QT children of the
+    # original 128x128 CTU.
+    source_dataset = args.source_dataset or args.dataset
+    output_dataset = args.dataset or source_dataset
+    if source_dataset is None:
+        source_dataset = resolve_dataset_name(args.data_type)
+    if output_dataset is None:
+        output_dataset = source_dataset
+    luma_actions = {'gridmap', 'input', 'gridmap-input', 'cu-tree', 'gridmap-input-cu-tree'}
+    if args.component in ('luma', 'both') and args.action in luma_actions:
+        if args.action in ('gridmap', 'gridmap-input', 'gridmap-input-cu-tree'):
+            convert_luma32_gridmap(args.data_type, source_dataset, output_dataset, args.output_split)
+        if args.action in ('input', 'gridmap-input', 'gridmap-input-cu-tree'):
+            convert_luma32_input(
+                args.data_type, source_dataset, output_dataset, args.output_split, args.sequence_list
+            )
+        if args.action in ('cu-tree', 'gridmap-input-cu-tree'):
+            convert_luma32_cu_tree(args.data_type, source_dataset, output_dataset, args.output_split)
+        if args.component == 'luma':
+            raise SystemExit(0)
+        args.component = 'chroma'
     block_size_map = {
         "Luma": args.luma_block_size,
         "Chroma": args.chroma_block_size,
@@ -1129,6 +1882,8 @@ if __name__ == '__main__':
             block_size_map=block_size_map,
             dataset_name=args.dataset,
             component=args.component,
+            output_split=args.output_split,
+            source_dataset=args.source_dataset,
         )
     if args.action in ('input', 'gridmap-input', 'gridmap-input-cu-tree'):
         convert_yuv_to_input(
@@ -1138,6 +1893,8 @@ if __name__ == '__main__':
             dataset_name=args.dataset,
             sequence_list=args.sequence_list,
             component=args.component,
+            output_split=args.output_split,
+            source_dataset=args.source_dataset,
         )
     if args.action in ('cu-tree', 'gridmap-input-cu-tree'):
         convert_partition_to_cu_tree(
@@ -1145,7 +1902,23 @@ if __name__ == '__main__':
             block_size_map=block_size_map,
             dataset_name=args.dataset,
             component=args.component,
+            output_split=args.output_split,
+            source_dataset=args.source_dataset,
         )
+    if args.action == 'rdocost':
+        if args.dataset is None:
+            raise ValueError('--dataset is required for --action rdocost')
+        if args.rdo_root is None or args.rdo_sequence_list is None:
+            raise ValueError('--rdo-root and --rdo-sequence-list are required for --action rdocost')
+        for rdo_component in COMPONENT_ALIASES[args.component]:
+            convert_component_rdocost_to_cache(
+                data_type=args.data_type,
+                dataset_name=args.dataset,
+                component=rdo_component,
+                rdo_root=args.rdo_root,
+                sequence_list=args.rdo_sequence_list,
+                output_split=args.output_split,
+            )
     if args.action == 'classifier-pretrain':
         create_classifier_i_pretrain_logical_dataset()
     if args.show or args.action == 'preview':
