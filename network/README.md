@@ -1,6 +1,6 @@
 # network
 
-`network/` 是 FastPartitionVTM 的神经网络工作区，负责把标准 VTM 导出的划分信息转换为训练数据集，并完成模型训练、单样本推理、TorchScript 导出和实验结果查看。
+`network/` 是 FastPartitionVTM 的神经网络工作区，负责把标准 VTM 导出的划分信息转换为训练数据集，并完成模型训练、单样本推理、ONNX 导出、量化和实验结果查看。
 
 Luma 输入为 `1x48x48`，gridmap 标签为 `2x8x8`；Chroma 输入为 `2x32x32`，gridmap 标签为 `2x4x4`。`Classifier_I` 在局部 gridmap ROI 上预测 CU 划分类型，类别顺序为 `[NO_SPLIT, QT, BTH, BTV, TTH, TTV]`。
 
@@ -21,7 +21,7 @@ network/
 | --- | --- |
 | `src/` | 源码：路径管理、数据集生成、模型定义、训练、推理、导出和工具函数。 |
 | `script/` | 临时脚本。 |
-| `checkpoints/` | 训练 checkpoint 和导出的 TorchScript 模型。 |
+| `checkpoints/` | 训练 checkpoint 和导出的 ONNX 模型。 |
 | `output/` | 训练日志、loss、TensorBoard 事件文件和实验输出。 |
 | `figures/` | 数据集预览、推理可视化图和文档配图。 |
 
@@ -39,11 +39,11 @@ network/
    - `Chroma_Input.npy` / `Chroma_Input.pkl`
    - `Chroma_Gridmap.npy` / `Chroma_Gridmap.pkl`
    - `Chroma_CU_Tree.npy` / `Chroma_CU_Tree.pkl`
-3. `network/src/createDataset.py --action classifier-pretrain` 生成 `Classifier_I` 逻辑预训练数据。
-4. `network/src/train.py` 训练 `Classifier_I`，或联合训练 Swin gridmap 网络与 `Classifier_I`。
+3. 准备与 CU tree 节点对齐的 RD cost 数据；现有缓存直接复用。
+4. `network/src/train.py` 使用 gridmap、分类标签与 RD cost 联合训练 Swin 和 `Classifier_I`。
 5. checkpoint 写入 `network/checkpoints/<outDir>/<jobID>/`，日志和 TensorBoard 写入 `network/output/<outDir>/<jobID>/`。
 6. `network/src/inference.py` 加载 checkpoint，对一个样本推理并保存 label/prediction 对比图。
-7. `network/src/saveModel.py` 将 `.pth` 导出为 C++ 可加载的 TorchScript `.pt`，可使用 Netron 查看结构。
+7. `network/src/saveModel.py --task onnx_bundle` 将 `.pth` 导出为 FP32 ONNX；同文件的 `--task quantize_onnx_bundle` 可进一步生成部分 INT8 的部署版本。当前 VTM 主线使用 ONNX Runtime，旧 TorchScript/native JSON 入口仅保留兼容。
 
 ## `src/` 文件说明
 
@@ -52,9 +52,9 @@ network/
 | `paths.py` | 统一管理项目路径和数据集路径。 | 项目根目录、dataset 名称、split 名称。 | `Path` 对象。 |
 | `createDataset.py` | 32x32 Luma 和 16x16 Chroma 数据集生成与预览。 | VTM 划分文本、YUV 视频、序列清单；或内置逻辑划分规则。 | `data/dataset/<dataset>/<split>/` 下的 input/gridmap/CU tree；或 `network/figures/` 下预览图。 |
 | `model.py` | 48x48 输入、32x32 目标的 Swin gridmap 网络和 `Classifier_I` 定义。 | 训练/推理脚本传入的张量。 | gridmap 预测、分类 logits/probability。 |
-| `train.py` | 32x32 主线训练入口。 | 数据集 `.npy/.pkl`、可选预训练 checkpoint。 | `.pth` checkpoint、日志、loss、TensorBoard。 |
+| `train.py` | 32x32 RD cost 联合训练唯一入口。 | 数据集 `.npy/.pkl`、可选预训练 checkpoint。 | `.pth` checkpoint、日志、loss、TensorBoard。 |
 | `inference.py` | 32x32 单样本推理与可视化。 | Swin checkpoint、数据集样本 index 或样本 id。 | `network/figures/<name>.png`。 |
-| `saveModel.py` | 32x32 模型导出。 | `.pth` checkpoint。 | TorchScript `.pt`。 |
+| `saveModel.py` | 模型导出与 ONNX 量化。 | `.pth` checkpoint 或 FP32 ONNX bundle。 | FP32 ONNX、部分 INT8 ONNX；另保留旧导出接口。 |
 | `utils.py` | Dataset、样本对齐、CU tree 读取、loss、训练/验证循环、可视化辅助函数。 | 数据集文件、模型输出和标签。 | batch、loss、指标、TensorBoard 图像。 |
 
 ## 数据集生成
@@ -129,132 +129,94 @@ python network/src/createDataset.py \
 
 ## 模型训练
 
-预训练 `Classifier_I`：
+唯一入口为 `network/src/train.py`，原 `train2.py` 的 RD cost 训练和必要辅助函数已合并到这里。
+旧普通训练及独立逻辑分类器预训练入口已删除。逻辑数据生成工具仍保留，但不是当前主线必需步骤。
+
+以下命令从项目根目录、在 FastPartitionVTM 环境执行。本机解释器是
+`/home/qiujp/vtm240_extracted/.venvs/FastPartitionVTM/bin/python`，示例中的 `python` 指该解释器。
+
+### 数据和尺寸
+
+当前主线用 CUSTOM_32 的 training/validating，VVC 测试帧不参与训练。
+每个 split 的 `data/dataset/CUSTOM_32/<split>/` 包含 Luma Input、Gridmap、CU Tree 的
+`.npy/.pkl` 文件，以及 `Luma_CU_RDCost.npy/.pkl`。
+RD 数据按 CU tree 节点顺序对齐，读取时校验节点数和 offsets。
+相对 RD 差为 `(candidate_cost - best_cost) / max(abs(best_cost), 1e-12)`，未完成候选由独立标记区分。
+`--rdCache` 为历史兼容参数，当前读取实际使用各 split 内的 `Luma_CU_RDCost` 文件。
+
+目标是 48×48 输入右下角的原图 32×32，即 `[16:48,16:48]`，Swin 输出为 `N×2×8×8`。
+原图尺寸按宽×高描述，分类头和 tensor 空间尺寸按高×宽：原图 32×16 对应 grid 4×8。
+预览背景也按右下角目标区域裁剪。
+
+现有 RD cache 直接复用。确需生成时，training/validating 分别执行以下命令并传入对应 split 的真实路径：
+
+```bash
+python network/src/train.py --prepareRdCacheOnly 1 \
+  --dataset CUSTOM_32 --trainSplit training \
+  --rdoRoot /absolute/path/to/training_rdo_dumps \
+  --sequenceList /absolute/path/to/training_sequences.txt \
+  --jobID prepare_custom_training
+```
+
+仅准备缓存时依赖 `VVCSoftware_VTM/script/ThSearch_RdoCost.py` 的解析器；正常训练不导入该脚本。
+`--rdoRoot`、`--sequenceList` 的历史默认值是 DIV2K，准备 CUSTOM 缓存时须明确指定。
+前面的 DIV2K 数据生成命令是接口示例，不是当前主线训练数据来源。
+
+### 主线命令与损失
 
 ```bash
 python network/src/train.py \
-  --task pretrain_classifier_logical \
-  --outDir classifier_i_pretrain \
-  --jobID logical \
-  --epoch 50 \
-  --batchSize 128 \
-  --lr 1e-3 \
-  --device cuda:0
+  --dataset CUSTOM_32 --trainSplit training --valSplit validating \
+  --outDir swin_luma32_custom_rd_delta_safety --jobID custom_rd_new_run \
+  --epoch 45 --batchSize 256 --lr 1e-4 --dr 20 \
+  --jointStage1Epoch 15 \
+  --stage1GridLossWeight 1 --stage1ClsLossWeight 0.05 \
+  --stage2GridLossWeight 0.5 --stage2ClsLossWeight 1 \
+  --gridLossType BCE --rdLossType delta \
+  --hardCeWeight 1 --rdPenaltyWeight 1 --rdDeltaClamp 0.2 \
+  --rdSafetyWeight 0 --rdTopKWeight 0 \
+  --classifierSafetyTauLarge 0.1 --classifierSafetyLossWeight 0.5 \
+  --classifierSafetyThresholdPreset table3_lambda2000 \
+  --classifierSafetyThresholdOnlyShapes 0 \
+  --useContextMask --fasttrain 1 --numWorkers 0 \
+  --checkpointInterval 1 --device cuda:0
 ```
 
-联合训练 Swin gridmap 网络和 `Classifier_I`：
-
-```bash
-python network/src/train.py \
-  --task swin_luma \
-  --dataset DIV2K \
-  --trainSplit training \
-  --valSplit validating \
-  --outDir swin_luma64_joint \
-  --jobID exp001 \
-  --epoch 50 \
-  --batchSize 256 \
-  --lr 1e-4 \
-  --dr 20 \
-  --jointStage1Epoch 25 \
-  --stage1Lr 1e-4 \
-  --stage2Lr 1e-4 \
-  --stage1GridLossWeight 1.0 \
-  --stage1ClsLossWeight 0.02 \
-  --stage2GridLossWeight 0.5 \
-  --stage2ClsLossWeight 1.0 \
-  --gridLossType BCE \
-  --classifierCkpt network/checkpoints/classifier_i_pretrain/logical/model-final.pth \
-  --device cuda:0
-```
-
-训练输出：
-
-```text
-network/checkpoints/<outDir>/<jobID>/
-  swin-<epoch>.pth
-  classifier-<epoch>.pth
-  swin-final.pth
-  classifier-final.pth
-
-network/output/<outDir>/<jobID>/
-  train.log
-  loss.txt
-  tensorboard/
-```
-
-联合训练中常调参数：
+这些训练参数已设为默认配置。新实验使用新的 `--jobID`，避免覆盖历史权重。
+不传 `--swinCkpt`、`--classifierCkpt` 时从头训练。
+前 15 轮侧重 gridmap，后 30 轮调整两部分权重；分类损失为硬标签 CE + RD delta 惩罚 + 0.5 倍真实类别安全损失。
 
 | 参数 | 作用 |
 | --- | --- |
-| `--epoch` | 总训练轮数。 |
-| `--batchSize` | mini-batch 大小，显存不足时优先减小。 |
-| `--lr` | 默认基础学习率。 |
-| `--dr` | 学习率衰减间隔。 |
-| `--jointStage1Epoch` | 第一阶段 epoch 数；之后进入第二阶段。 |
-| `--stage1Lr` / `--stage2Lr` | 两阶段学习率。 |
-| `--stage1GridLossWeight` / `--stage2GridLossWeight` | 两阶段 gridmap loss 权重。 |
-| `--stage1ClsLossWeight` / `--stage2ClsLossWeight` | 两阶段 classifier loss 权重。 |
-| `--gridLossType` | gridmap loss 类型：`BCE`、`BCE_L1`、`WBCE`、`L1`、`HUBER`、`MSE`。 |
-| `--fasttrain` | `1` 启用推荐快速训练配置：全部节点、向量化 ROI、CUDA AMP、4 个 DataLoader workers、每 50 batch 更新进度；不会进行节点采样。`0` 使用原有的 legacy FP32 路径。 |
-| `--swinCkpt` | 可选 Swin checkpoint。 |
-| `--classifierCkpt` | 可选 `Classifier_I` checkpoint。 |
-| `--tbTrainImageSamples` | TensorBoard training 图像样本，默认 `simple:1989496,medium:819088,complex:320136`。 |
-| `--tbValImageSamples` | TensorBoard validation 图像样本，默认 `simple:116602,medium:54490,complex:121714`。 |
-| `--tbImageSampleIndex` | 可选覆盖参数；若提供，training 和 validation 都只写这一个样本。 |
+| `--rdLossType soft` | 切换到 RD soft-target 损失；`--rdSoftWeight` 仅此模式生效。 |
+| `--rdSafetyWeight` | RD 安全损失权重，主线为 0；不同于真实类别安全损失。 |
+| `--rdTopKWeight` | 可选 Top-K 排序损失，默认 0；不是 VTM 剪枝策略开关。 |
+| `--freezeSwin 1` | 冻结 Swin，仅微调分类器。 |
+| `--no-useContextMask` | 关闭默认启用的 context mask，供消融使用。 |
+| `--fasttrain 1` | CUDA 上启用 AMP。 |
+| `--numWorkers` | DataLoader 进程数，默认 0。 |
+| `--evalDataset VVC_CTC --evalSplit testing` | 增加测试指标记录，不参与反向传播；默认不启用。 |
 
-推荐快速训练配置：
+训练安全阈值表不等于部署时的四档阈值。部署阈值须使用对应 ONNX 版本估计。
 
-```bash
---batchSize 256 \
---fasttrain 1
-```
+### 输出、恢复与现用权重
 
-`--fasttrain 1` 内部固定使用全节点向量化 ROI、无分块、4 个 DataLoader workers、
-每 50 batch 更新一次 tqdm，并为 Swin 主干启用 CUDA AMP。Classifier 与 BCE/grid loss
-仍保持 FP32。训练过程中不会采样或丢弃 Classifier 节点。
+每轮 checkpoint 包括 `swin-epochNNN.pth`、`classifier-epochNNN.pth`、`checkpoint-epochNNN.pth`，
+保存在 `network/checkpoints/<outDir>/<jobID>/`，结束时另存对应 `*-final.pth`。
+日志目录为 `network/output/<outDir>/<jobID>/`，包含 `train.log`、`loss.txt`、`summary.txt` 和 `tensorboard/`。
 
-训练和验证结束时会打印峰值 CUDA allocated memory，并写入 TensorBoard 的
-`Memory/train_peak_allocated_mb` 与 `Memory/val_peak_allocated_mb`。
+`--resume <完整 checkpoint.pth>` 恢复模型、优化器和已完成轮数，仍需提供原实验训练参数；
+参数不会自动从 checkpoint 恢复。`--epoch` 是目标总轮数。
+`--swinCkpt`、`--classifierCkpt` 仅加载网络权重，不恢复优化器。
 
-## TensorBoard
-
-TensorBoard 默认写入：
-
-```text
-network/output/<outDir>/<jobID>/tensorboard/
-```
-
-启动方式：
+当前冻结主线目录是
+`network/checkpoints/swin_luma32_custom_rd_delta_safety/custom_stage15_stage2_30_table3_safety_bs256_ep45/`，
+共训练 45 轮，依据 CUSTOM 验证损失选择第 18 轮。
+历史日志中的 `train2.py` 指合并前入口；本次整理未重新训练或修改已有权重。
 
 ```bash
-tensorboard \
-  --logdir network/output/<outDir>/<jobID>/tensorboard \
-  --host 127.0.0.1 \
-  --port 6006
+tensorboard --logdir network/output/<outDir>/<jobID>/tensorboard --host 127.0.0.1 --port 6006
 ```
-
-联合训练会记录总 loss、gridmap loss、classifier loss、gridmap precision/recall、classifier accuracy、loss 权重和学习率；同时按 `Classifier_I` 的 ROI 形状记录：
-
-```text
-Classifier/train/<HxW>/loss
-Classifier/train/<HxW>/acc
-Classifier/val/<HxW>/loss
-Classifier/val/<HxW>/acc
-```
-
-每个 epoch 还会写入固定样本的 gridmap 对比图：
-
-```text
-Gridmap/train/simple
-Gridmap/train/medium
-Gridmap/train/complex
-Gridmap/val/simple
-Gridmap/val/medium
-Gridmap/val/complex
-```
-
-每张图包含 label 划分图、label gridmap 数值矩阵、prediction 划分图和 prediction gridmap 数值矩阵。
 
 ## 单样本推理
 
@@ -264,26 +226,12 @@ Gridmap/val/complex
 
 ```bash
 python network/src/inference.py \
-  --checkpoint network/checkpoints/swin_luma64_joint/exp001/swin-final.pth \
-  --dataset DIV2K \
-  --split validating \
-  --sampleIndex 116602 \
-  --visualizeOutput inference_sample.png
+  --checkpoint network/checkpoints/swin_luma32_custom_rd_delta_safety/custom_stage15_stage2_30_table3_safety_bs256_ep45/swin-epoch018.pth \
+  --dataset CUSTOM_32 --split validating --sampleIndex 0 \
+  --visualizeOutput custom_preview.png
 ```
 
-按完整样本 id 推理：
-
-```bash
-python network/src/inference.py \
-  --checkpoint network/checkpoints/swin_luma64_joint/exp001/swin-final.pth \
-  --dataset DIV2K \
-  --split training \
-  --sequence 0367 \
-  --qp 27 \
-  --frameID 0 \
-  --ctuID 400 \
-  --visualizeOutput inference_0367_qp27_f0_ctu400.png
-```
+也可用 `--sequence`、`--qp`、`--frameID`、`--ctuID` 指定完整样本 ID。
 
 输出图像写入：
 
@@ -293,33 +241,32 @@ network/figures/<visualizeOutput>
 
 ## 模型导出
 
-导出 Swin TorchScript：
+仓库提供的固定部署模型位于 `checkpoints/onnx/final/`，来自 CUSTOM_32 的主线 RD-cost 联合训练 epoch 18。目录包含 `swin.onnx`、32×32及以下形状的 `classifier_*.onnx` ；Swin 为部分动态 INT8，classifier 为 FP32。VTM 评估默认加载这一目录。其他训练 checkpoint 和导出模型保留在本地，不提交。
+
+当前Classifier仅保留原图32×32及以下的分类头，已去掉grid 16×16（原图64×64）旧头。历史checkpoint加载时仅跳过该旧头的参数，其余参数仍严格校验；RD联合训练恢复时同步移除对应优化器状态。新ONNX导出不含 `classifier_16x16.onnx`，需使用已同步精简加载列表的新编译VTM。现有冻结实验bundle和旧二进制保持原样，不能把新bundle直接交给仍强制加载旧头的历史二进制。
+
+当前主线统一由 `src/saveModel.py` 负责：
 
 ```bash
-python network/src/saveModel.py \
-  --task swin_luma \
-  --checkpoint network/checkpoints/swin_luma64_joint/exp001/swin-final.pth \
-  --device cpu
+# .pth -> FP32 ONNX；--checkpoint 为包含同轮 Swin/classifier 权重的目录。
+python network/src/saveModel.py --task onnx_bundle \
+  --checkpoint network/checkpoints/swin_luma32_custom_rd_delta_safety/custom_stage15_stage2_30_table3_safety_bs256_ep45 \
+  --epoch 18 --output /tmp/custom_ep018_export
+
+# FP32 ONNX -> 部分 INT8 ONNX；--checkpoint 在此任务中为 FP32 ONNX 目录。
+python network/src/saveModel.py --task quantize_onnx_bundle \
+  --checkpoint /tmp/custom_ep018_export --output /tmp/custom_ep018_int8_export
 ```
 
-默认导出到 checkpoint 同目录，文件名为 `swin-final.pt`。
+量化任务调用 `quantize_onnx_bundle(source_dir, output_dir)`，只量化 Swin 中具有常量权重的 MatMul（动态量化、逐通道 QInt8），Classifier保持FP32。直接读取源目录的 ONNX 文件，检查模型格式，拒绝覆盖已有量化目录。FP32 导出与 INT8 量化均只输出 ONNX 文件，不生成或读取模型 manifest。它不读取 `.pth` 或重新训练。上例是重新导出的示例路径，现有正式bundle无需重新生成；实际运行需使用项目的FastPartitionVTM环境。
 
-导出 `Classifier_I` native JSON：
+VTM 主线通过 ONNX Runtime CPU 加载 bundle，使用绝对路径配置：
 
-```bash
-python network/src/saveModel.py \
-  --task export_classifier_json \
-  --checkpoint network/checkpoints/classifier_i_pretrain/logical/model-final.pth \
-  --output network/checkpoints/classifier_i_pretrain/logical/model-final.native.json \
-  --device cpu
+```text
+--FastPartitionSwinModel=/absolute/path/to/bundle/swin.onnx
+--FastPartitionClassifierModel=/absolute/path/to/bundle
+--FastPartitionLumaModelScale=32
 ```
 
-VTM 通过 `--FastPartitionClassifierModel=<path>` 直接加载导出的 `.native.json` 文件。
-
-导出完成后，使用独立命令启动 Netron 查看 `.pt` 结构：
-
-```bash
-netron network/checkpoints/swin_luma64_joint/exp001/swin-final.pt \
-  --host 127.0.0.1 \
-  --port 8080
-```
+FP32 bundle 也可直接部署，阈值另行配置。
+`saveModel.py` 仍保留 `swin_luma`（TorchScript）和 `export_classifier_json` 的历史导出接口；当前部署流程使用 ONNX。
