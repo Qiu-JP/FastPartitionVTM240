@@ -4,7 +4,7 @@
 
 Luma 输入为 `1x48x48`，gridmap 标签为 `2x8x8`；Chroma 输入为 `2x32x32`，gridmap 标签为 `2x4x4`。`Classifier_I` 在局部 gridmap ROI 上预测 CU 划分类型，类别顺序为 `[NO_SPLIT, QT, BTH, BTV, TTH, TTV]`。
 
-当前主线数据尺寸为：Luma block `32x32`、输入 `48x48`；Chroma block `16x16`、输入 `32x32`。两者均由 `createDataset.py` 直接生成，不需要额外的合并脚本。
+当前训练与 VTM 部署主线为 Luma block `32x32`、输入 `48x48`。数据工具另支持 Chroma block `16x16`、输入 `32x32`，用于辅助数据和预览，不代表部署了色度网络。
 
 ## 目录结构
 
@@ -125,15 +125,14 @@ python network/src/createDataset.py \
 | `--component` | `luma`、`chroma` 或 `both`。 |
 | `--action` | `gridmap`、`input`、`cu-tree`、`gridmap-input-cu-tree`、`preview`、`classifier-pretrain` 等。 |
 | `--show-sample-index` | 预览时按当前数据集 sample index 选样本。 |
-| `--show-sequence/--show-qp/--show-frame-id/--show-ctu-id` | 预览时按完整样本 id 选样本。 |
+| `--source-dataset`、`--output-split` | 原始数据集名称、输出 split；例如源 CUSTOM，输出 dataset 为 CUSTOM_32。 |
 
 ## 模型训练
 
 唯一入口为 `network/src/train.py`，原 `train2.py` 的 RD cost 训练和必要辅助函数已合并到这里。
 旧普通训练及独立逻辑分类器预训练入口已删除。逻辑数据生成工具仍保留，但不是当前主线必需步骤。
 
-以下命令从项目根目录、在 FastPartitionVTM 环境执行。本机解释器是
-`/home/qiujp/vtm240_extracted/.venvs/FastPartitionVTM/bin/python`，示例中的 `python` 指该解释器。
+以下命令从项目根目录、在 FastPartitionVTM Python 环境执行。训练需要 PyTorch，导出需要 `onnx` 和 `onnxruntime`。
 
 ### 数据和尺寸
 
@@ -209,9 +208,9 @@ python network/src/train.py \
 参数不会自动从 checkpoint 恢复。`--epoch` 是目标总轮数。
 `--swinCkpt`、`--classifierCkpt` 仅加载网络权重，不恢复优化器。
 
-当前冻结主线目录是
+本地保存的主线训练目录是
 `network/checkpoints/swin_luma32_custom_rd_delta_safety/custom_stage15_stage2_30_table3_safety_bs256_ep45/`，
-共训练 45 轮，依据 CUSTOM 验证损失选择第 18 轮。
+共训练 45 轮，依据 CUSTOM 验证损失选择第 18 轮。这些 `.pth` 和日志不随仓库提供；下述推理/导出命令需要本地已有 checkpoint。仓库内可直接部署的是 `checkpoints/onnx/final/`。
 历史日志中的 `train2.py` 指合并前入口；本次整理未重新训练或修改已有权重。
 
 ```bash
@@ -241,7 +240,7 @@ network/figures/<visualizeOutput>
 
 ## 模型导出
 
-仓库提供的固定部署模型位于 `checkpoints/onnx/final/`，来自 CUSTOM_32 的主线 RD-cost 联合训练 epoch 18。目录包含 `swin.onnx`、32×32及以下形状的 `classifier_*.onnx` ；Swin 为部分动态 INT8，classifier 为 FP32。VTM 评估默认加载这一目录。其他训练 checkpoint 和导出模型保留在本地，不提交。
+仓库提供的固定部署模型位于 `checkpoints/onnx/final/`，来自 CUSTOM_32 的主线 RD-cost 联合训练 epoch 18。目录包含 `swin.onnx`、32×32及以下形状的 `classifier_*.onnx`；Swin 为部分动态 INT8，classifier 为 FP32。VTM 评估默认加载这一目录。其他训练 checkpoint 和导出模型保留在本地，不提交。
 
 当前Classifier仅保留原图32×32及以下的分类头，已去掉grid 16×16（原图64×64）旧头。历史checkpoint加载时仅跳过该旧头的参数，其余参数仍严格校验；RD联合训练恢复时同步移除对应优化器状态。新ONNX导出不含 `classifier_16x16.onnx`，需使用已同步精简加载列表的新编译VTM。现有冻结实验bundle和旧二进制保持原样，不能把新bundle直接交给仍强制加载旧头的历史二进制。
 

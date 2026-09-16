@@ -1,54 +1,55 @@
 # FastPartitionVTM
 
-FastPartitionVTM 是一个面向 **VVC 标准参考软件 VTM 24.0** 的神经网络快速划分研究与开发仓库。
+基于 VTM 24.0 的 VVC intra 快速划分。Swin Transformer 提取特征，各形状 classifier 预测划分概率，再按原图尺寸和划分类别的独立阈值剪枝，最终候选由 VTM 的 RD 搜索决定。
 
-本仓库按职责拆分为几个相互独立的部分：
+## 目录
 
-```text
-ref_model/        标准 VTM 基线与划分标签生成
-data/             视频、生成的 cfg、划分标签、训练数据集和日志
-network/          模型代码、数据转换、训练、推理和模型导出
-VVCSoftware_VTM/  实验性 VTM 集成与编码器侧验证
-docs/             原理说明、模型细节和集成文档
-deps/             ONNX Runtime CPU C/C++ 依赖
+| 目录 | 内容与使用说明 |
+| --- | --- |
+| [ref_model/](ref_model/README.md) | 标准 anchor、划分与 RD cost 导出程序，以及训练数据生成脚本。 |
+| [data/](data/README.md) | 原始视频、划分标签、RD cost 和训练数据；数据文件不随仓库提供。 |
+| [network/](network/README.md) | 数据集转换、RD 联合训练、推理、ONNX 导出与量化。 |
+| [VVCSoftware_VTM/](VVCSoftware_VTM/README.md) | 完整 VTM 源码、快速划分、阈值搜索与编码评估。 |
+| [deps/](deps/README.md) | 随仓库提供的 Linux x86-64 ONNX Runtime CPU C/C++ 依赖。 |
+
+本地 `docs/` 保存实验记录和工作笔记，不随仓库提交。
+
+## 模型与尺寸
+
+当前主线仅部署亮度模型，尺寸统一按原图宽×高描述：
+
+| 项目 | 尺寸或含义 |
+| --- | --- |
+| 目标块 | 原图 32×32 像素。 |
+| 网络输入 | 含上方、左方邻域的 48×48，目标位于右下角 `[16:48,16:48]`。 |
+| Swin 输出 | 每样本 `2×8×8` grid map；一个网格单元对应原图 4×4 像素。 |
+| 分类器 ROI | tensor 空间顺序为高×宽；例如原图 32×16 对应 grid 4×8。 |
+| 类别顺序 | `NO_SPLIT, QT, BTH, BTV, TTH, TTV`。 |
+| VTM 推理 | 每个 128×128 CTU 提前批量处理 16 个目标块，递归搜索按需使用缓存特征。 |
+
+固定部署权重位于 `network/checkpoints/onnx/final/`，包括 `swin.onnx` 和 `classifier_*.onnx`。
+该版本来自 CUSTOM_32 的 epoch 18，Swin 部分动态 INT8 量化，分类器 FP32。训练使用 PyTorch，VTM 部署使用 ONNX Runtime CPU，不需要 LibTorch、CUDA 或模型 manifest。
+
+## 直接评估
+
+在兼容的 Linux x86-64 环境，可使用 `VVCSoftware_VTM/script/bin/` 的预编译程序。
+准备 `ref_model/script/Testing_Sequences_VVC.txt` 对应的 YUV，放入 `data/video/VVC_CTC/`，并在 Python 环境安装评估依赖后运行：
+
+```bash
+python VVCSoftware_VTM/script/evaluate.py \
+  --bundle network/checkpoints/onnx/final \
+  --thresholds VVCSoftware_VTM/script/thresholds_fast.cfg \
+  --workdir VVCSoftware_VTM/script/output/fast_run
 ```
 
-## 目录入口
+默认评估首帧及 QP 22/27/32/37，串行比较 `ref_model/bin/vtm240/` anchor 和快速划分程序，输出 BD-rate、time saving 和 4×4 compute saving。
+阈值需显式指定。构建指令、依赖、其他参数及四档命令见 [VTM 说明](VVCSoftware_VTM/README.md)。
 
-| 目录 | 作用 | 继续阅读 |
-| --- | --- | --- |
-| `data/` | 存放外部输入数据与实验生成数据，主要被 `ref_model/` 和 `network/` 使用。 | [data/README.md](data/README.md) |
-| `network/` | 存放 Python 模型定义、数据集转换、训练、推理、可视化和模型导出工具。 | [network/README.md](network/README.md) |
-| `ref_model/` | 存放最小化标准 VTM 24.0 可执行基线、cfg 模板、序列清单和标签生成脚本。 | [ref_model/README.md](ref_model/README.md) |
-| `VVCSoftware_VTM/` | 用于快速划分方法接入和验证的 VTM 主开发目录。 | [VVCSoftware_VTM/README.md](VVCSoftware_VTM/README.md) |
-| `docs/` | 存放更详细的数据流、模型设计、分类器说明、VTM 集成和实现细节。 | [docs/README.md](docs/README.md) |
+## 从数据到部署
 
-## 主流程
-
-本仓库的完整使用流程可以按“标准标签生成 -> 数据集创建 -> 模型训练 -> 模型导出 -> VTM 集成验证”理解。
-
-1. 使用 `ref_model/` 生成标准 VTM 划分标签
-
-   `ref_model/` 保存标准 VTM 24.0 的最小可运行基线和标签生成脚本。使用时先根据序列清单和 cfg 模板生成逐序列编码配置，再调用 `dumpPartition` 版本的 VTM 编码器/解码器运行标准编码流程。该步骤的输入是 `data/video/` 中的原始 YUV 序列和 `ref_model/script/` 中的序列清单；输出主要为标准 VTM 编码得到的 CU 划分文本，保存到 `data/partition/` 下，运行日志与临时产物分别保存到 `data/logs/` 和 `data/codec_run/` 下。
-
-2. 使用 `network/src/createDataset.py` 创建网络训练数据集
-
-   标准划分文本生成后，进入 `network/` 侧的数据处理流程。`createDataset.py` 会把 `data/video/` 中的原始 YUV 像素和 `data/partition/` 中的 VTM 划分记录整理成两个网络需要的训练数据：一部分是 Swin gridmap 预测网络使用的 Luma/Chroma input 及其 gridmap 标签，其中 Luma 为 64x64 input 和 2 通道、16x16 gridmap，Chroma 为 32x32 input 和 2 通道、8x8 gridmap；另一部分是 `Classifier_I` 使用的局部 gridmap ROI 及其对应的 CU 划分类型标签。生成 input 时需要根据序列清单读取原始 YUV 的文件名、宽高和帧数等元信息；生成 gridmap 和划分类型标签时主要依赖标准 VTM 导出的划分记录。最终数据统一保存到 `data/dataset/`，供后续训练、验证和推理读取。
-
-3. 使用 `network/src/train.py` 训练划分预测模型
-
-   当前网络侧流程主要围绕 64x64 亮度块的 gridmap 预测和 CU 划分分类。`SwinTransformer_Unet` 预测 2 通道、16x16 的 gridmap；`Classifier_I` 将局部 gridmap ROI 映射为划分类别：
-
-```text
-[NO_SPLIT, QT, BTH, BTV, TTH, TTV]
-```
-
-   训练入口位于 `network/src/train.py`。训练脚本从 `data/dataset/` 读取数据，将训练日志、loss 记录和可视化/评估输出写入 `network/output/<outDir>/<jobID>/`，将模型权重保存到 `network/checkpoints/<outDir>/<jobID>/`。
-
-4. 导出 VTM 可加载的模型文件
-
-   训练得到的 `.pth` checkpoint 是 PyTorch 训练权重，主要用于继续训练、推理测试或模型分析。若要在 VTM C++ 侧加载模型，需要使用 `network/src/saveModel.py` 将 checkpoint 导出为 TorchScript `.pt` 文件。导出的 `.pt` 模型通常继续保存在对应的 `network/checkpoints/<outDir>/<jobID>/` 目录中，作为后续 VTM 集成的部署输入。
-
-5. 在 `VVCSoftware_VTM/` 中加载模型并执行快速划分
-
-   `VVCSoftware_VTM/` 是实验性 VTM 主开发目录。集成流程中，VTM 编码器通过 libtorch 加载 `network/checkpoints/` 中导出的 TorchScript 模型，在编码过程中对当前 CTU/CU 提取亮度输入，先由 Swin 网络预测 gridmap，再由 `Classifier_I` 给出当前 CU 的划分模式概率。VTM 侧仍以 RDO 流程为主，网络输出用于辅助判断进行剪枝，根据阈值决策模式跳过部分候选划分模式。最终使用 `VVCSoftware_VTM/script/` 中的评测脚本对 anchor 和快速划分版本进行编码时间、码率失真和 BD-rate 等指标对比。
+1. 使用 `ref_model/script/gencfg.sh` 和 `run.sh` 生成划分标签；RD 训练需选择 `dumpRDCost` 编解码器。
+2. 使用 `network/src/createDataset.py` 生成 Input、Gridmap、CU Tree 和对齐的 RD cost `.npy/.pkl`。
+3. 使用唯一训练入口 `network/src/train.py` 联合训练 Swin 与分类器。
+4. 使用 `network/src/saveModel.py` 将 `.pth` 导出为 FP32 ONNX，按需进一步量化为 INT8。
+5. 使用 `collect_threshold_probabilities.py` 从数据集与模型生成概率缓存，再用 `ThSearch_Ratio.py` 或 `ThSearch_RdoCost.py` 搜索阈值；也支持直接推理后搜索。无需 CTU recipe。
+6. 将生成的 `.cfg` 传给 `evaluate.py` 实测。数据集顺序组批的动态 INT8 概率不保证与 VTM CTU 组批逐项一致，离线搜索结果不能代替编码评估。
