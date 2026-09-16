@@ -369,12 +369,12 @@ void CodingUnit::initData()
 
 const bool CodingUnit::isSepTree() const
 {
-  return treeType != TREE_D || (slice->isIntra() && !cs->pcv->ISingleTree);
+  return treeType != TREE_D || CS::isDualITree( *cs );
 }
 
 const bool CodingUnit::isLocalSepTree() const
 {
-  return treeType != TREE_D && !(slice->isIntra() && !cs->pcv->ISingleTree);
+  return treeType != TREE_D && !CS::isDualITree(*cs);
 }
 
 const bool CodingUnit::checkCCLMAllowed() const
