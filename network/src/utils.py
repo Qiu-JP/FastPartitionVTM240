@@ -167,12 +167,13 @@ def yuv_to_rgb(yuv):
     return np.clip(rgb, 0.0, 255.0)
 
 
-def center_crop_array(image, crop_size):
+def crop_target_array(image, crop_size):
     h, w = image.shape[:2]
     if h < crop_size or w < crop_size:
         raise ValueError(f"Cannot crop {crop_size}x{crop_size} from image {image.shape}")
-    y0 = (h - crop_size) // 2
-    x0 = (w - crop_size) // 2
+    # Context is above and left; the target occupies the bottom-right.
+    y0 = h - crop_size
+    x0 = w - crop_size
     return image[y0:y0 + crop_size, x0:x0 + crop_size, ...]
 
 
@@ -208,7 +209,7 @@ def build_tensorboard_preview_background(dataset, sample_index):
     luma = dataset.input_array[dataset.input_positions[sample_index]][0]
     gridmap = dataset.gridmap_array[dataset.gridmap_positions[sample_index]]
     preview_size = int(gridmap.shape[-1]) * 4
-    luma_lcu = center_crop_array(luma, preview_size)
+    luma_lcu = crop_target_array(luma, preview_size)
 
     try:
         chroma_ids, chroma_array = load_chroma_input_for_preview(dataset)
@@ -220,8 +221,8 @@ def build_tensorboard_preview_background(dataset, sample_index):
     chroma = chroma_array[chroma_pos]
     chroma_lcu = np.stack(
         (
-            center_crop_array(chroma[0], CHROMA_LCU_SIZE),
-            center_crop_array(chroma[1], CHROMA_LCU_SIZE),
+            crop_target_array(chroma[0], preview_size // 2),
+            crop_target_array(chroma[1], preview_size // 2),
         ),
         axis=0,
     )

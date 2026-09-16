@@ -329,12 +329,13 @@ def yuv_to_rgb(yuv):
     return np.clip(rgb, 0.0, 255.0)
 
 
-def center_crop(image, crop_size):
+def crop_target(image, crop_size):
     h, w = image.shape[:2]
     if h < crop_size or w < crop_size:
         raise ValueError(f"Cannot crop {crop_size}x{crop_size} from image {image.shape}")
-    y0 = (h - crop_size) // 2
-    x0 = (w - crop_size) // 2
+    # Context is above and left; the target occupies the bottom-right.
+    y0 = h - crop_size
+    x0 = w - crop_size
     return image[y0:y0 + crop_size, x0:x0 + crop_size, ...]
 
 
@@ -394,12 +395,12 @@ def build_preview_background(dataset_dir, sample_id):
         raise KeyError(f"Sample id not found in Chroma input: {sample_id}")
 
     luma = luma_array[sample_position(luma_ids, sample_id=sample_id)][0]
-    luma_lcu = center_crop(luma, DEFAULT_BLOCK_SIZE_MAP["Luma"])
+    luma_lcu = crop_target(luma, DEFAULT_BLOCK_SIZE_MAP["Luma"])
     chroma = chroma_array[sample_position(chroma_ids, sample_id=sample_id)]
     chroma_lcu = np.stack(
         (
-            center_crop(chroma[0], DEFAULT_BLOCK_SIZE_MAP["Chroma"]),
-            center_crop(chroma[1], DEFAULT_BLOCK_SIZE_MAP["Chroma"]),
+            crop_target(chroma[0], DEFAULT_BLOCK_SIZE_MAP["Chroma"]),
+            crop_target(chroma[1], DEFAULT_BLOCK_SIZE_MAP["Chroma"]),
         ),
         axis=0,
     )
