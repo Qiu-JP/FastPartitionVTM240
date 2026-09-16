@@ -343,8 +343,7 @@ def gridmap_comparison_image(background, label_gridmap, pred_gridmap, title=None
     fig.tight_layout()
     canvas = FigureCanvasAgg(fig)
     canvas.draw()
-    w, h = canvas.get_width_height()
-    image = np.frombuffer(canvas.tostring_rgb(), dtype=np.uint8).reshape(h, w, 3)
+    image = np.asarray(canvas.buffer_rgba())[:, :, :3].copy()
     plt.close(fig)
     return image
 
