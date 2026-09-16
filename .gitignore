@@ -27,3 +27,7 @@ docs/**
 /VVCSoftware_VTM/bin/
 /VVCSoftware_VTM/lib/
 /VVCSoftware_VTM/deps/
+/network/checkpoints/*
+!/network/checkpoints/onnx/
+/network/checkpoints/onnx/*
+!/network/checkpoints/onnx/final/
