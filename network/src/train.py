@@ -192,154 +192,15 @@ def classifier_safety_threshold_table(args, device):
     return thresholds
 
 
-def rd_cache_default_path(dataset_name, split_name, component):
-    return paths.data_root() / "rdo_cost" / dataset_name / f"{split_name}_{component}_rd_cache.npz"
-
-
-def build_rd_cache(dataset, rdo_root, sequence_list, cache_path, max_files=0):
-    vtm_script_dir = paths.project_root() / "VVCSoftware_VTM" / "script"
-    if str(vtm_script_dir) not in sys.path:
-        sys.path.insert(0, str(vtm_script_dir))
-    from ThSearch_RdoCost import discover_rdo_files, load_sequence_widths, parse_selected_file
-
-    cache_path = Path(cache_path)
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    total_nodes = int(dataset.node_memmap.shape[0])
-    rd_delta = np.full((total_nodes, 6), np.inf, dtype=np.float32)
-    rd_completed = np.zeros((total_nodes, 6), dtype=np.bool_)
-    rd_valid = np.zeros((total_nodes,), dtype=np.bool_)
-
-    sample_starts = {}
-    sample_ends = {}
-    available_sequence_qps = set()
-    for aligned_idx, key in enumerate(dataset.common_ids):
-        sequence, qp, frame_id, ctu_id = key
-        available_sequence_qps.add((str(sequence), int(qp)))
-        sample_index = int(dataset.tree_sample_indices[aligned_idx])
-        start = int(dataset.node_offsets[sample_index])
-        end = int(dataset.node_offsets[sample_index + 1])
-        sample_key = (str(sequence), int(qp), int(frame_id), int(ctu_id))
-        sample_starts[sample_key] = start
-        sample_ends[sample_key] = end
-
-    widths = load_sequence_widths(Path(sequence_list))
-    files = discover_rdo_files(Path(rdo_root), int(max_files))
-    matched = 0
-    mismatched = 0
-    missing_sample = 0
-
-    for file_index, (path, sequence, qp) in enumerate(files, start=1):
-        if (str(sequence), int(qp)) not in available_sequence_qps:
-            print(f"[{file_index}/{len(files)}] skip {path.name}: not present in dataset split")
-            continue
-        if sequence not in widths:
-            print(f"[{file_index}/{len(files)}] skip {path.name}: missing width for sequence {sequence}")
-            continue
-        print(f"[{file_index}/{len(files)}] build RD cache from {path.name}")
-        parsed = parse_selected_file(path, widths[sequence])
-        metadata = parsed["metadata"]
-        if metadata.shape[0] == 0:
-            continue
-
-        rows_by_ctu = {}
-        for row_idx, meta in enumerate(metadata):
-            ctu_id = int(meta[0])
-            coord = tuple(int(v) for v in meta[1:5])
-            rows_by_ctu.setdefault(ctu_id, {})[coord] = row_idx
-
-        file_matched = 0
-        file_mismatched = 0
-        for ctu_id, rows in rows_by_ctu.items():
-            key = (str(sequence), int(qp), 0, int(ctu_id))
-            if key not in sample_starts:
-                missing_sample += len(rows)
-                continue
-            start = sample_starts[key]
-            end = sample_ends[key]
-            nodes = np.asarray(dataset.node_memmap[start:end])
-            node_lookup = {
-                tuple(int(v) for v in node[:4]): start + node_idx
-                for node_idx, node in enumerate(nodes)
-            }
-            for coord, row_idx in rows.items():
-                node_global_idx = node_lookup.get(coord)
-                if node_global_idx is None:
-                    file_mismatched += 1
-                    mismatched += 1
-                    continue
-                best_cost = float(parsed["best_cost"][row_idx])
-                denom = max(abs(best_cost), 1e-12)
-                rd_delta[node_global_idx] = parsed["rd_delta"][row_idx] / denom
-                rd_completed[node_global_idx] = parsed["completed"][row_idx]
-                rd_valid[node_global_idx] = True
-                file_matched += 1
-                matched += 1
-        print(f"  matched={file_matched:,}; mismatched={file_mismatched:,}")
-
-    print(
-        "RD cache matched nodes: {:,}; mismatched rows: {:,}; missing sample rows: {:,}".format(
-            matched, mismatched, missing_sample
-        )
-    )
-    if matched == 0:
-        raise RuntimeError("No RD-cost rows matched the CU-tree dataset")
-    dataset_dir = dataset.cu_tree_path.parent
-    component = dataset.component
-    array_path = dataset_dir / f"{component}_CU_RDCost.npy"
-    metadata_path = dataset_dir / f"{component}_CU_RDCost.pkl"
-    rd_dtype = np.dtype([
-        ("rd_delta", np.float32, (6,)),
-        ("completed", np.bool_, (6,)),
-        ("valid", np.bool_),
-    ])
-    rd_array = np.lib.format.open_memmap(
-        array_path,
-        mode="w+",
-        dtype=rd_dtype,
-        shape=(total_nodes,),
-    )
-    rd_array["rd_delta"] = rd_delta
-    rd_array["completed"] = rd_completed
-    rd_array["valid"] = rd_valid
-    rd_array.flush()
-    del rd_array
-
-    payload = {
-        "format": "cu_rdcost_numpy",
-        "component": component,
-        "id_columns": list(dataset.id_columns),
-        "node_key_columns": ["sequence_name", "qp", "frame_id", "ctu_id", "cu_x", "cu_y", "cu_width", "cu_height"],
-        "node_order": "identical to CU_Tree.npy global node order",
-        "node_columns": ["rd_delta[6]", "completed[6]", "valid"],
-        "array_file": array_path.name,
-        "array_key": "cu_rdcost",
-        "array_shape": (total_nodes,),
-        "array_dtype": rd_dtype.descr,
-        "offsets": np.asarray(dataset.node_offsets, dtype=np.int64),
-        "sample_keys": list(dataset.common_ids),
-        "class_order": ["NO_SPLIT", "QT", "BTH", "BTV", "TTH", "TTV"],
-        "rd_delta_definition": "(candidate_cost - best_cost) / max(abs(best_cost), 1e-12)",
-        "source_rdo_root": str(rdo_root),
-        "source_sequence_list": str(sequence_list),
-        "matched": int(matched),
-        "mismatched": int(mismatched),
-        "missing_sample": int(missing_sample),
-    }
-    with open(metadata_path, "wb") as fp:
-        pickle.dump(payload, fp, protocol=pickle.HIGHEST_PROTOCOL)
-    print("Wrote CU RD-cost array:", array_path)
-    print("Wrote CU RD-cost metadata:", metadata_path)
-
-
 class RDAwareGridmapCuTreeDataset(IdAlignedGridmapCuTreeDataset):
-    def __init__(self, *args, rd_cache_path=None, **kwargs):
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         dataset_dir = self.cu_tree_path.parent
         self.rd_cache_path = dataset_dir / f"{self.component}_CU_RDCost.pkl"
         if not self.rd_cache_path.exists():
             raise FileNotFoundError(
                 f"CU RD-cost cache not found: {self.rd_cache_path}. "
-                "Run train.py with --prepareRdCacheOnly 1 first."
+                "Generate the dataset RD files with createDataset.py --action rdocost first."
             )
         with open(self.rd_cache_path, "rb") as fp:
             cache = pickle.load(fp)
@@ -1051,13 +912,11 @@ def train_rd(args):
         dataset_name=args.dataset,
         type=args.trainSplit,
         component=args.component,
-        rd_cache_path=args.rdCache,
     )
     val_dataset = RDAwareGridmapCuTreeDataset(
         dataset_name=args.dataset,
         type=args.valSplit,
         component=args.component,
-        rd_cache_path=args.rdCache,
     )
     loader_worker_args = {}
     if num_workers > 0:
@@ -1387,11 +1246,6 @@ def main():
     parser.add_argument("--classifierSafetyThresholdOnlyShapes", type=int, choices=[0, 1], default=0)
     parser.add_argument("--freezeSwin", type=int, choices=[0, 1], default=0,
                         help="Freeze the Swin feature extractor and fine-tune only Classifier_I")
-    parser.add_argument("--rdCache", type=str, default=None)
-    parser.add_argument("--rdoRoot", type=str, default=str(paths.data_root() / "rdo_cost" / "DIV2K" / "validating"))
-    parser.add_argument("--sequenceList", type=str, default=str(paths.ref_model_root() / "script" / "Validating_Sequences_DIV2K.txt"))
-    parser.add_argument("--rdMaxFiles", type=int, default=0)
-    parser.add_argument("--prepareRdCacheOnly", type=int, choices=[0, 1], default=0)
     parser.add_argument("--evalDataset", type=str, default=None)
     parser.add_argument("--evalSplit", type=str, default="testing")
     parser.add_argument(
@@ -1400,25 +1254,7 @@ def main():
     )
     args = parser.parse_args()
 
-    if args.rdCache is None:
-        args.rdCache = str(rd_cache_default_path(args.dataset, args.trainSplit, args.component))
-
     setup_log_file(args)
-    if args.prepareRdCacheOnly:
-        dataset = IdAlignedGridmapCuTreeDataset(
-            dataset_name=args.dataset,
-            type=args.trainSplit,
-            component=args.component,
-        )
-        build_rd_cache(
-            dataset=dataset,
-            rdo_root=args.rdoRoot,
-            sequence_list=args.sequenceList,
-            cache_path=args.rdCache,
-            max_files=args.rdMaxFiles,
-        )
-        return
-
     train_rd(args)
 
 

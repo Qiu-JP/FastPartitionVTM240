@@ -141,24 +141,22 @@ python network/src/createDataset.py \
 `.npy/.pkl` 文件，以及 `Luma_CU_RDCost.npy/.pkl`。
 RD 数据按 CU tree 节点顺序对齐，读取时校验节点数和 offsets。
 相对 RD 差为 `(candidate_cost - best_cost) / max(abs(best_cost), 1e-12)`，未完成候选由独立标记区分。
-`--rdCache` 为历史兼容参数，当前读取实际使用各 split 内的 `Luma_CU_RDCost` 文件。
+训练直接读取各 split 内的 `Luma_CU_RDCost.npy/.pkl`，不在训练入口解析原始 RD dump。
 
 目标是 48×48 输入右下角的原图 32×32，即 `[16:48,16:48]`，Swin 输出为 `N×2×8×8`。
 原图尺寸按宽×高描述，分类头和 tensor 空间尺寸按高×宽：原图 32×16 对应 grid 4×8。
 预览背景也按右下角目标区域裁剪。
 
-现有 RD cache 直接复用。确需生成时，training/validating 分别执行以下命令并传入对应 split 的真实路径：
+现有 RD cache 直接复用。确需生成时，training 使用下面命令；validating 改为 `--data-type 3`、验证集 RD 目录和验证序列清单：
 
 ```bash
-python network/src/train.py --prepareRdCacheOnly 1 \
-  --dataset CUSTOM_32 --trainSplit training \
-  --rdoRoot /absolute/path/to/training_rdo_dumps \
-  --sequenceList /absolute/path/to/training_sequences.txt \
-  --jobID prepare_custom_training
+python network/src/createDataset.py \
+  --data-type 1 --dataset CUSTOM_32 --component luma --action rdocost \
+  --rdo-root data/rdo_cost/CUSTOM/training \
+  --rdo-sequence-list ref_model/script/Training_Sequences_CUSTOM.txt
 ```
 
-仅准备缓存时依赖 `VVCSoftware_VTM/script/ThSearch_RdoCost.py` 的解析器；正常训练不导入该脚本。
-`--rdoRoot`、`--sequenceList` 的历史默认值是 DIV2K，准备 CUSTOM 缓存时须明确指定。
+RD 数据准备统一使用 `createDataset.py --action rdocost`；`train.py` 仅负责训练及训练期间的验证。
 前面的 DIV2K 数据生成命令是接口示例，不是当前主线训练数据来源。
 
 ### 主线命令与损失
