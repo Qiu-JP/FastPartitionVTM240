@@ -63,7 +63,8 @@ def window_reverse(windows, window_size: int, H: int, W: int):
     Returns:
         x: (B, H, W, C)
     """
-    B = int(windows.shape[0] / (H * W / window_size / window_size))
+    # Keep batch size symbolic when tracing/exporting (VTM batches 16 blocks).
+    B = windows.shape[0] // ((H // window_size) * (W // window_size))
     # view: [B*num_windows, Mh, Mw, C] -> [B, H//Mh, W//Mw, Mh, Mw, C]
     x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
     # permute: [B, H//Mh, W//Mw, Mh, Mw, C] -> [B, H//Mh, Mh, W//Mw, Mw, C]

@@ -45,16 +45,11 @@ def load_checkpoint_state_dict(checkpoint_path, device):
 
 def load_model_weights(model, checkpoint_path, device):
     source_dict = load_checkpoint_state_dict(checkpoint_path, device)
-    dest_dict = model.state_dict()
-    trained_dict = {
-        key: value
-        for key, value in source_dict.items()
-        if key in dest_dict and value.shape == dest_dict[key].shape
-    }
-    missing = sorted(set(dest_dict.keys()) - set(trained_dict.keys()))
-    unexpected = sorted(set(source_dict.keys()) - set(dest_dict.keys()))
-    model.load_state_dict({**dest_dict, **trained_dict})
-    return missing, unexpected
+    # Deployment must never fill missing trained parameters with random values.
+    # PyTorch reports missing/unexpected keys and shape mismatches explicitly.
+    model.load_state_dict(source_dict, strict=True)
+    model.to(device)
+    return [], []
 
 
 def serve_netron(model_path, host, port):
@@ -132,16 +127,96 @@ def export_swin_luma(checkpoint_path, output_path, device, use_context_mask):
     return missing, unexpected
 
 
+class ClassifierOnnxBranch(torch.nn.Module):
+    def __init__(self, classifier):
+        super().__init__()
+        self.classifier = classifier
+
+    def forward(self, roi):
+        return self.classifier(roi, return_probs=True)
+
+
+def export_onnx_bundle(checkpoint_dir, output_dir, epoch, use_context_mask):
+    """Export both stages and verify CPU ORT against eager PyTorch before use."""
+    import numpy as np
+    import onnx
+    import onnxruntime as ort
+
+    torch.set_num_threads(2)
+    torch.manual_seed(0)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    suffix = f"epoch{epoch:03d}.pth"
+    swin_path = checkpoint_dir / ("swin-" + suffix)
+    classifier_path = checkpoint_dir / ("classifier-" + suffix)
+    swin = SwinTransformer_Unet(use_context_mask=use_context_mask).eval()
+    classifier = Classifier_I().eval()
+    load_model_weights(swin, swin_path, "cpu")
+    load_model_weights(classifier, classifier_path, "cpu")
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = 1
+    options.inter_op_num_threads = 1
+    options.enable_mem_pattern = False
+
+    def export(model, name, example, names, output_name, batches):
+        path = output_dir / name
+        dynamic = {n: {0: "batch"} for n in names + [output_name]}
+        torch.onnx.export(model, example, str(path), input_names=names,
+                          output_names=[output_name], opset_version=17,
+                          dynamic_axes=dynamic, dynamo=False)
+        onnx.checker.check_model(str(path))
+        session = ort.InferenceSession(str(path), sess_options=options,
+                                      providers=["CPUExecutionProvider"])
+        with torch.inference_mode():
+            for batch in batches:
+                values = tuple(t.repeat(batch, *([1]*(t.ndim-1))) for t in example)
+                expected = model(*values).numpy()
+                actual = session.run(None, {n: t.numpy() for n,t in zip(names, values)})[0]
+                np.testing.assert_allclose(actual, expected, atol=2e-5, rtol=2e-4)
+
+    export(swin, "swin.onnx", (torch.rand(1,1,48,48)*255, torch.tensor([[22/51]])),
+           ["input", "qp"], "gridmap", [1,16])
+    for h,w in CLASSIFIER_I_GRID_SIZES + ((1,1),):
+        export(ClassifierOnnxBranch(classifier).eval(), f"classifier_{h}x{w}.onnx",
+               (torch.rand(1,2,h,w),), ["roi"], "probabilities", [1,7])
+    return [], []
+
+
+def quantize_onnx_bundle(source_dir, output_dir):
+    """Quantize FP32 ONNX Swin MatMul weights; keep classifiers in FP32."""
+    import shutil
+    import onnx
+    from onnxruntime.quantization import quantize_dynamic, QuantType
+
+    source, out = Path(source_dir).resolve(), Path(output_dir).resolve()
+    if out.exists():
+        raise RuntimeError(f'Refusing to overwrite existing bundle: {out}')
+    names = ['swin.onnx'] + [f'classifier_{h}x{w}.onnx'
+                            for h, w in CLASSIFIER_I_GRID_SIZES + ((1, 1),)]
+    for name in names:
+        onnx.checker.check_model(str(source / name))
+    out.mkdir(parents=True)
+    for name in names:
+        if name != 'swin.onnx':
+            shutil.copy2(source / name, out / name)
+    quantize_dynamic(source / 'swin.onnx', out / 'swin.onnx',
+                     op_types_to_quantize=['MatMul'], per_channel=True,
+                     weight_type=QuantType.QInt8,
+                     extra_options={'MatMulConstBOnly': True})
+    onnx.checker.check_model(str(out / 'swin.onnx'))
+    return [], []
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Export 48x48 trained checkpoints for C++ deployment.")
     parser.add_argument(
         "--task",
-        choices=("export_classifier_json", "swin_luma"),
+        choices=("export_classifier_json", "swin_luma", "onnx_bundle", "quantize_onnx_bundle"),
         required=True,
     )
-    parser.add_argument("--checkpoint", required=True, help="Path to a .pth checkpoint under network/checkpoints.")
-    parser.add_argument("--output", required=True, help="Output .pt or .native.json path.")
+    parser.add_argument("--checkpoint", required=True, help=".pth file for legacy tasks; checkpoint directory for onnx_bundle; FP32 ONNX bundle directory for quantize_onnx_bundle.")
+    parser.add_argument("--output", required=True, help="Output file for legacy tasks, or output directory for ONNX export/quantization. Quantization refuses an existing directory.")
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--epoch", type=int, default=45, help="Epoch for onnx_bundle; --checkpoint is its directory.")
     parser.add_argument("--useContextMask", action="store_true", default=True, help="Use the context-mask variant for SwinTransformer_Unet.")
     parser.add_argument("--viewNetron", action="store_true", help="Start a Netron server for the exported .pt model.")
     parser.add_argument("--netronHost", default="127.0.0.1", help="Host address for --viewNetron.")
@@ -164,6 +239,11 @@ if __name__ == "__main__":
         missing, unexpected = export_classifier_json(checkpoint_path, output_path, device)
     elif args.task == "swin_luma":
         missing, unexpected = export_swin_luma(checkpoint_path, output_path, device, args.useContextMask)
+    elif args.task == "onnx_bundle":
+        missing, unexpected = export_onnx_bundle(checkpoint_path, output_path, args.epoch, args.useContextMask)
+
+    elif args.task == "quantize_onnx_bundle":
+        missing, unexpected = quantize_onnx_bundle(checkpoint_path, output_path)
 
     print("Saved:", output_path)
     if missing:
