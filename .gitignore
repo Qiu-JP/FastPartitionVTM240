@@ -20,3 +20,10 @@ __pycache__/
 .vscode/
 AGENTS.md
 /build/
+network/script/**
+!network/script/.gitkeep
+docs/**
+/VVCSoftware_VTM/build/
+/VVCSoftware_VTM/bin/
+/VVCSoftware_VTM/lib/
+/VVCSoftware_VTM/deps/
