@@ -10,7 +10,6 @@ from model import SwinTransformer_Unet
 
 
 CLASSIFIER_I_GRID_SIZES = (
-    (16, 16),
     (8, 8),
     (8, 4),
     (4, 8),

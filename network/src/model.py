@@ -828,7 +828,6 @@ class Classifier_I(nn.Module):
         # Hidden size follows the paper note: 32 channels for CU area >= 512,
         # otherwise 16 channels.
         branch_specs = {
-            (16, 16): 32,  # historical large ROI
             (8, 8): 32,    # 32x32
             (8, 4): 32,    # 16x32
             (4, 8): 32,    # 32x16
@@ -858,7 +857,6 @@ class Classifier_I(nn.Module):
         # Static intra masks derived from docs/network/vtm_split_mask_notes.md.
         # Order: [NO_SPLIT, QT, BTH, BTV, TTH, TTV].
         static_masks = {
-            (16, 16): [1, 1, 0, 0, 0, 0],
             (8, 8): [1, 1, 1, 1, 1, 1],
             (8, 4): [1, 0, 1, 1, 1, 1],
             (4, 8): [1, 0, 1, 1, 1, 1],
@@ -884,6 +882,19 @@ class Classifier_I(nn.Module):
             )
 
         self.apply(self._init_weights)
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        # Old Luma32 checkpoints also stored an unused 64x64-pixel head.
+        # Ignore only its known keys; all active heads still load strictly.
+        legacy_keys = {"mask_16x16", "branches.16x16.0.weight",
+                       "branches.16x16.0.bias", "branches.16x16.2.weight",
+                       "branches.16x16.2.bias"}
+        cleaned = state_dict.copy()
+        if hasattr(state_dict, "_metadata"):
+            cleaned._metadata = state_dict._metadata
+        for key in legacy_keys:
+            cleaned.pop(key, None)
+        return super().load_state_dict(cleaned, strict=strict, assign=assign)
 
     @staticmethod
     def _size_key(grid_h, grid_w):
