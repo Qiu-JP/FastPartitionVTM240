@@ -206,6 +206,14 @@ private:
   };
   std::vector<AccessUnitNestedSliSeiInfo> m_accessUnitNestedSliSeiInfo;
   int m_accessUnitSpsNumSubpic[MAX_VPS_LAYERS];
+  struct NalUnitInfo
+  {
+    NalUnitType     m_nalUnitType; ///< nal_unit_type
+    uint32_t        m_nuhLayerId;  ///< nuh_layer_id
+    uint32_t        m_firstCTUinSlice; /// the first CTU in slice, specified with raster scan order ctu address
+    int             m_POC;             /// the picture order
+  };
+  std::vector<NalUnitInfo> m_nalUnitInfo[MAX_VPS_LAYERS];
   EnumArray<std::vector<int>, ApsType> m_accessUnitApsNals;
   std::vector<int> m_accessUnitSeiTids;
   std::vector<bool> m_accessUnitNoOutputPriorPicFlags;
@@ -432,4 +440,3 @@ protected:
 //! \}
 
 #endif // __DECTOP__
-

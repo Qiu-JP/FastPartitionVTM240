@@ -3688,7 +3688,13 @@ bool DecLib::xDecodeSlice(InputNALUnit &nalu, int &iSkipFrame, int iPOCLastDispl
   //---------------
   pcSlice->setRefPOCList();
 
+  NalUnitInfo naluInfo;
+  naluInfo.m_nalUnitType     = nalu.m_nalUnitType;
+  naluInfo.m_nuhLayerId      = nalu.m_nuhLayerId;
+  naluInfo.m_firstCTUinSlice = pcSlice->getFirstCtuRsAddrInSlice();
+  naluInfo.m_POC             = pcSlice->getPOC();
   xCheckMixedNalUnit(pcSlice, sps, nalu);
+  m_nalUnitInfo[naluInfo.m_nuhLayerId].push_back(naluInfo);
   SEIMessages drapSEIs = getSeisByType(m_pcPic->SEIs, SEI::PayloadType::DEPENDENT_RAP_INDICATION);
   if (!drapSEIs.empty())
   {
