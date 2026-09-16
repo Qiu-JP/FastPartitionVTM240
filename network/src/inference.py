@@ -52,18 +52,11 @@ def resolve_project_path(path_value):
 
 
 def dataset_index_from_id(dataset, sample_id):
-    try:
-        loc = dataset.common_ids.get_loc(sample_id)
-    except KeyError as exc:
-        raise KeyError(f"Sample id not found in aligned input/gridmap ids: {sample_id}") from exc
-
-    if isinstance(loc, slice):
-        return loc.start
-    if isinstance(loc, np.ndarray):
-        matches = np.flatnonzero(loc) if loc.dtype == bool else loc
-        if len(matches) == 0:
-            raise KeyError(f"Sample id resolved to no dataset position: {sample_id}")
-        return int(matches[0])
+    if len(sample_id) != dataset.common_ids.nlevels:
+        raise ValueError(f"Sample ID requires {dataset.common_ids.names}; include --subBlockID for Luma32")
+    loc = dataset.common_ids.get_loc(sample_id)
+    if not isinstance(loc, (int, np.integer)):
+        raise ValueError(f"Sample ID is not unique: {sample_id}")
     return int(loc)
 
 
@@ -80,11 +73,13 @@ def select_sample(dataset, args):
         return sample_index, dataset.common_ids[sample_index]
 
     id_fields = (args.sequence, args.qp, args.frameID, args.ctuID)
+    if "sub_block_id" in dataset.common_ids.names:
+        id_fields += (args.subBlockID,)
     if all(value is not None for value in id_fields):
         sample_id = id_fields
         return dataset_index_from_id(dataset, sample_id), sample_id
 
-    raise ValueError("Use --sampleIndex, --randomSample, or provide --sequence/--qp/--frameID/--ctuID.")
+    raise ValueError("Use --sampleIndex, --randomSample, or provide the full ID: --sequence/--qp/--frameID/--ctuID/--subBlockID.")
 
 
 def save_visualization(image, output_name):
@@ -124,7 +119,13 @@ def run_inference(args):
         pred_gridmap=pred_gridmap.numpy(),
         title=f"{args.dataset} {args.split} {sample_id} sample={sample_index}",
     )
-    output_path = save_visualization(image, args.visualizeOutput)
+    output_name = args.visualizeOutput
+    if output_name is None:
+        identity = dict(zip(dataset.common_ids.names, sample_id))
+        suffix = f"_sub{identity['sub_block_id']}" if "sub_block_id" in identity else ""
+        output_name = (f"{args.dataset}_{args.split}_{identity['sequence_name']}"
+                       f"_qp{identity['qp']}_f{identity['frame_id']}_ctu{identity['ctu_id']}{suffix}_inference.png")
+    output_path = save_visualization(image, output_name)
 
     print("checkpoint:", checkpoint_path)
     print("dataset:", args.dataset, args.split, args.component)
@@ -150,12 +151,13 @@ def parse_args():
     parser.add_argument("--qp", type=int, default=None)
     parser.add_argument("--frameID", type=int, default=None)
     parser.add_argument("--ctuID", type=int, default=None)
+    parser.add_argument("--subBlockID", type=int, choices=range(4), default=None)
     parser.add_argument("--sampleIndex", type=int, default=None)
     parser.add_argument("--randomSample", action="store_true")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--useContextMask", action="store_true", default=True)
-    parser.add_argument("--visualizeOutput", default="inference_gridmap.png", help="Preview image name under network/figures/.")
+    parser.add_argument("--visualizeOutput", default=None, help="Preview name under network/figures/; default includes the complete sample ID.")
     return parser.parse_args()
 
 

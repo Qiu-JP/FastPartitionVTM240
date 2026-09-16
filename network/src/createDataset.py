@@ -361,9 +361,14 @@ def read_payload_array(dataset_dir, component, kind):
 
 def sample_position(ids, sample_id=None, sample_index=None):
     if sample_id is not None:
+        if len(sample_id) != ids.index.nlevels:
+            raise ValueError(f"Full sample ID required: {ids.index.names}; use --show-sub-block-id for Luma32")
         if sample_id not in ids.index:
             raise KeyError(f"Sample id not found: {sample_id}")
-        return int(ids.loc[sample_id, "sample_index"])
+        position = ids.loc[sample_id, "sample_index"]
+        if not np.isscalar(position):
+            raise ValueError(f"Ambiguous sample ID: {sample_id}")
+        return int(position)
     if sample_index is None:
         raise ValueError("Either sample_id or sample_index must be provided")
     if sample_index < 0 or sample_index >= len(ids):
@@ -379,33 +384,35 @@ def select_preview_sample(gridmap_payload, gridmap_array, sample_id=None, sample
         edge_counts = gridmap_array[:, 0].sum(axis=(1, 2)) + gridmap_array[:, 1].sum(axis=(1, 2))
         pos = int(np.argmax(edge_counts))
     row = ids.iloc[pos]
-    resolved_id = tuple(row[column] for column in ID_COLUMNS)
+    resolved_id = tuple(row[column] for column in gridmap_payload.get("id_columns", ids.index.names))
     return resolved_id, pos
 
 
-def build_preview_background(dataset_dir, sample_id):
-    luma_payload, luma_array = read_payload_array(dataset_dir, "Luma", "Input")
-    chroma_payload, chroma_array = read_payload_array(dataset_dir, "Chroma", "Input")
-    luma_ids = luma_payload["ids"]
-    chroma_ids = chroma_payload["ids"]
-    if sample_id not in luma_ids.index:
-        raise KeyError(f"Sample id not found in Luma input: {sample_id}")
-    if sample_id not in chroma_ids.index:
-        raise KeyError(f"Sample id not found in Chroma input: {sample_id}")
+def build_preview_background(dataset_dir, sample_id, component="Luma", gridmap=None):
+    from types import SimpleNamespace
+    from utils import build_tensorboard_preview_background
 
-    luma = luma_array[sample_position(luma_ids, sample_id=sample_id)][0]
-    luma_lcu = crop_target(luma, DEFAULT_BLOCK_SIZE_MAP["Luma"])
-    chroma = chroma_array[sample_position(chroma_ids, sample_id=sample_id)]
-    chroma_lcu = np.stack(
-        (
-            crop_target(chroma[0], DEFAULT_BLOCK_SIZE_MAP["Chroma"]),
-            crop_target(chroma[1], DEFAULT_BLOCK_SIZE_MAP["Chroma"]),
-        ),
-        axis=0,
-    )
-    u = upsample_nearest(chroma_lcu[0], luma_lcu.shape)
-    v = upsample_nearest(chroma_lcu[1], luma_lcu.shape)
-    return yuv_to_rgb(np.stack((luma_lcu, u, v), axis=-1))
+    payload, array = read_payload_array(dataset_dir, component, "Input")
+    pos = sample_position(payload["ids"], sample_id=sample_id)
+    if gridmap is None:
+        _, gridmaps = read_payload_array(dataset_dir, component, "Gridmap")
+        gridmap = gridmaps[pos]
+    if component == "Luma":
+        dataset = SimpleNamespace(
+            common_ids=payload["ids"].index[pos:pos+1], dataset_dir=Path(dataset_dir),
+            input_array=array, input_positions=[pos], gridmap_array=[gridmap], gridmap_positions=[0])
+        # Shared rendering with training/inference ensures identical sub-block crops.
+        class PreviewSample:
+            def __len__(self): return 1
+        view = PreviewSample()
+        view.__dict__.update(dataset.__dict__)
+        return build_tensorboard_preview_background(view, 0)
+    # Chroma labels may have no matching luma sample (the parent need not QT).
+    # Show the actual U/V target using neutral luminance instead of an unrelated block.
+    size = int(gridmap.shape[-1]) * 4
+    chroma = array[pos]
+    u, v = (crop_target(channel, size) for channel in chroma)
+    return yuv_to_rgb(np.stack((np.full_like(u, 128), u, v), axis=-1))
 
 
 def format_gridmap_values(gridmap):
@@ -490,12 +497,14 @@ def visualize_dataset_gridmap(data_type, dataset_name=None, component="luma", sa
         sample_id=sample_id,
         sample_index=sample_index,
     )
-    image = build_preview_background(dataset_dir, resolved_id)
     gridmap = gridmap_array[gridmap_pos]
+    image = build_preview_background(dataset_dir, resolved_id, component_name, gridmap)
 
     if output_name is None:
-        seq, qp, frame_id, ctu_id = resolved_id
-        output_name = f"{dataset_name}_{split_dir}_{component_name}_{seq}_qp{qp}_f{frame_id}_ctu{ctu_id}_gridmap.png"
+        identity = dict(zip(gridmap_payload["ids"].index.names, resolved_id))
+        seq, qp, frame_id, ctu_id = (identity[name] for name in ID_COLUMNS)
+        suffix = f"_sub{identity['sub_block_id']}" if "sub_block_id" in identity else ""
+        output_name = f"{dataset_name}_{split_dir}_{component_name}_{seq}_qp{qp}_f{frame_id}_ctu{ctu_id}{suffix}_gridmap.png"
     output_path = paths.ensure_dir(paths.network_root() / "figures") / Path(output_name).name
 
     fig, (ax, value_ax) = plt.subplots(
@@ -1828,6 +1837,7 @@ def build_argparser():
     parser.add_argument('--show-qp', type=int, default=None)
     parser.add_argument('--show-frame-id', type=int, default=None)
     parser.add_argument('--show-ctu-id', type=int, default=None)
+    parser.add_argument('--show-sub-block-id', type=int, choices=range(4), default=None)
     parser.add_argument(
         '--action',
         choices=[
@@ -1926,9 +1936,13 @@ if __name__ == '__main__':
         show_id_values = [value is not None for value in show_id_fields]
         if any(show_id_values) and not all(show_id_values):
             raise ValueError("--show-sequence, --show-qp, --show-frame-id, and --show-ctu-id must be provided together")
+        if args.show_sub_block_id is not None and not all(show_id_values):
+            raise ValueError("--show-sub-block-id requires the other sample ID fields")
         sample_id = None
         if all(show_id_values):
             sample_id = (args.show_sequence, args.show_qp, args.show_frame_id, args.show_ctu_id)
+            if args.show_sub_block_id is not None:
+                sample_id += (args.show_sub_block_id,)
         preview_component = args.component
         if preview_component == "both":
             preview_component = "luma"

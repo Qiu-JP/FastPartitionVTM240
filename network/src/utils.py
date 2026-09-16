@@ -196,6 +196,7 @@ def load_chroma_input_for_preview(dataset):
     chroma_npy_path = dataset.dataset_dir / chroma_payload["array_file"]
     if not chroma_npy_path.exists():
         raise FileNotFoundError(f"Chroma input npy array not found: {chroma_npy_path}")
+    dataset._preview_chroma_payload = chroma_payload
     dataset._preview_chroma_ids = chroma_payload["ids"]
     dataset._preview_chroma_array = np.load(chroma_npy_path, mmap_mode="r")
     return dataset._preview_chroma_ids, dataset._preview_chroma_array
@@ -214,17 +215,34 @@ def build_tensorboard_preview_background(dataset, sample_index):
         chroma_ids, chroma_array = load_chroma_input_for_preview(dataset)
     except FileNotFoundError:
         return normalize_preview_image(luma_lcu)
-    if sample_id not in chroma_ids.index:
+    metadata = dataset._preview_chroma_payload
+    identity = dict(zip(dataset.common_ids.names, sample_id))
+    chroma_key = tuple(identity[name] for name in chroma_ids.index.names)
+    if chroma_key not in chroma_ids.index:
         return normalize_preview_image(luma_lcu)
-    chroma_pos = int(chroma_ids.loc[sample_id, "sample_index"])
-    chroma = chroma_array[chroma_pos]
-    chroma_lcu = np.stack(
-        (
-            crop_target_array(chroma[0], preview_size // 2),
-            crop_target_array(chroma[1], preview_size // 2),
-        ),
-        axis=0,
-    )
+    chroma_pos = chroma_ids.loc[chroma_key, "sample_index"]
+    if not np.isscalar(chroma_pos):
+        raise ValueError(f"Ambiguous chroma sample: {chroma_key}")
+    chroma = chroma_array[int(chroma_pos)]
+    block = int(metadata["block_size"])
+    size = preview_size // 2
+    offset_x = offset_y = 0
+    if "sub_block_id" in identity and "sub_block_id" not in chroma_ids.index.names:
+        # The four-field chroma record covers the 64x64 luma parent.
+        # Only use it when its metadata confirms that 32x32 chroma footprint.
+        if block != 32 or size != 16:
+            return normalize_preview_image(luma_lcu)
+        sub = int(identity["sub_block_id"])
+        if sub not in range(4):
+            raise ValueError("Invalid sub_block_id")
+        offset_x, offset_y = (sub % 2) * size, (sub // 2) * size
+    elif block != size:
+        return normalize_preview_image(luma_lcu)
+    y = chroma.shape[-2] - block + offset_y
+    x = chroma.shape[-1] - block + offset_x
+    chroma_lcu = chroma[:, y:y+size, x:x+size]
+    if chroma_lcu.shape != (2, size, size):
+        raise ValueError("Chroma input does not cover the target region")
     u = upsample_nearest(chroma_lcu[0], luma_lcu.shape)
     v = upsample_nearest(chroma_lcu[1], luma_lcu.shape)
     return yuv_to_rgb(np.stack((luma_lcu, u, v), axis=-1))

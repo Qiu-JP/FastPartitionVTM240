@@ -100,20 +100,8 @@ python network/src/createDataset.py \
   --show-output div2k_training_luma_819088.png
 ```
 
-也可以用完整样本 id 指定预览对象：
-
-```bash
-python network/src/createDataset.py \
-  --action preview \
-  --data-type 1 \
-  --dataset DIV2K \
-  --component luma \
-  --show-sequence 0367 \
-  --show-qp 27 \
-  --show-frame-id 0 \
-  --show-ctu-id 400 \
-  --show-output div2k_training_luma_0367_qp27_f0_ctu400.png
-```
+当前 Luma32 样本 ID 包含 `sequence_name, qp, frame_id, ctu_id, sub_block_id`。
+预览可使用 `--show-sample-index`，或同时指定 `--show-sequence`、`--show-qp`、`--show-frame-id`、`--show-ctu-id`、`--show-sub-block-id`。子块编号 0/1/2/3 分别是父区域的左上/右上/左下/右下；不完整的 ID 会报错，不会默认选择第一个子块。默认预览文件名含子块编号。
 
 `createDataset.py` 的主要参数：
 
@@ -145,7 +133,7 @@ RD 数据按 CU tree 节点顺序对齐，读取时校验节点数和 offsets。
 
 目标是 48×48 输入右下角的原图 32×32，即 `[16:48,16:48]`，Swin 输出为 `N×2×8×8`。
 原图尺寸按宽×高描述，分类头和 tensor 空间尺寸按高×宽：原图 32×16 对应 grid 4×8。
-预览背景也按右下角目标区域裁剪。
+预览背景也按右下角目标区域裁剪。若色度数据覆盖父区域，按子块编号裁剪对应色度象限；缺失或无法确认对应区域时使用亮度背景。单独预览色度标签时以中性亮度显示目标 U/V。
 
 现有 RD cache 直接复用。确需生成时，training 使用下面命令；validating 改为 `--data-type 3`、验证集 RD 目录和验证序列清单：
 
@@ -228,7 +216,7 @@ python network/src/inference.py \
   --visualizeOutput custom_preview.png
 ```
 
-也可用 `--sequence`、`--qp`、`--frameID`、`--ctuID` 指定完整样本 ID。
+当前 Luma32 可用 `--sampleIndex`、`--randomSample`，或完整的 `--sequence`、`--qp`、`--frameID`、`--ctuID`、`--subBlockID` 五字段指定样本。
 
 输出图像写入：
 
