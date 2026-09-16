@@ -26,6 +26,7 @@ Options:
   --sequence-list PATH     Explicit sequence list path. Overrides automatic lookup.
   --cfg-root PATH          Config root. Default: data/CodecTrainCfg/<dataset>/qp_<qp>.
   --partition-root PATH    Partition output root. Default: data/partition/<dataset>/<split>.
+  --rdo-cost-root PATH     RDO cost TSV root. Default: data/rdo_cost/<dataset>/<split>.
   --log-root PATH          Codec log root. Default: data/logs/<dataset>/qp_<qp>.
   --work-root PATH         Codec output root. Default: data/codec_run/<dataset>/qp_<qp>.
   --encoder PATH           Override encoder binary. Default: ref_model/bin/dumpPartition/EncoderAppStatic.
@@ -45,6 +46,7 @@ seq_type="train"
 sequence_list=""
 cfg_root=""
 partition_root=""
+rdo_cost_root=""
 log_root=""
 work_root=""
 skip_decode="0"
@@ -73,6 +75,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --partition-root)
       partition_root="$2"
+      shift 2
+      ;;
+    --rdo-cost-root)
+      rdo_cost_root="$2"
       shift 2
       ;;
     --log-root)
@@ -133,15 +139,21 @@ case "${seq_type}" in
 esac
 
 if [[ -z "${sequence_list}" ]]; then
-  sequence_list="${SCRIPT_DIR}/${sequence_list_prefix}_Sequences_${dataset}.txt"
+  list_dataset="$dataset"
+  case "$dataset" in
+    VVC_CTC) list_dataset="VVC" ;;
+    HEVC_CTC) list_dataset="HEVC" ;;
+  esac
+  sequence_list="${SCRIPT_DIR}/${sequence_list_prefix}_Sequences_${list_dataset}.txt"
 fi
 
 cfg_root="${cfg_root:-${DATA_ROOT}/CodecTrainCfg/${dataset}/qp_${qp}}"
 partition_root="${partition_root:-${DATA_ROOT}/partition/${dataset}/${split_dir}}"
+rdo_cost_root="${rdo_cost_root:-${DATA_ROOT}/rdo_cost/${dataset}/${split_dir}}"
 log_root="${log_root:-${DATA_ROOT}/logs/${dataset}/qp_${qp}}"
 work_root="${work_root:-${DATA_ROOT}/codec_run/${dataset}/qp_${qp}}"
 
-mkdir -p "${partition_root}" "${log_root}" "${work_root}"
+mkdir -p "${partition_root}" "${rdo_cost_root}" "${log_root}" "${work_root}"
 
 if [[ ! -x "${ENCODER}" ]]; then
   echo "Encoder not found or not executable: ${ENCODER}" >&2
@@ -185,8 +197,13 @@ while IFS= read -r line || [[ -n "${line}" ]]; do
   recon_path="${seq_work_dir}/${str_name}_rec.yuv"
   dec_path="${seq_work_dir}/${str_name}_dec.yuv"
   log_path="${log_root}/${str_name}.log"
+  rdo_cost_path="${rdo_cost_root}/${str_name}_QP${qp}.tsv"
 
-  : > "${log_path}"
+  {
+    echo
+    echo "===== run start $(date '+%Y-%m-%d %H:%M:%S %z') sequence=${str_name} qp=${qp} ====="
+  } >> "${log_path}"
+  rm -f "${rdo_cost_path}" "${rdo_cost_path}.done"
 
   echo "[run] (${num}) encoding ${str_name}"
   echo "[run] cfg: ${cfg_path}"
@@ -194,12 +211,14 @@ while IFS= read -r line || [[ -n "${line}" ]]; do
 
   export FASTPARTITION_DEPTH_DIR="${partition_root}"
   export FASTPARTITION_DEPTH_PREFIX="${str_name}"
+  export VTM_RDO_COST_FILE="${rdo_cost_path}"
 
   {
     echo "[encode]"
     echo "cfg=${cfg_path}"
     echo "bitstream=${bitstream_path}"
     echo "recon=${recon_path}"
+    echo "rdo_cost=${rdo_cost_path}"
   } >> "${log_path}"
 
   "${ENCODER}" \
@@ -207,6 +226,12 @@ while IFS= read -r line || [[ -n "${line}" ]]; do
     -b "${bitstream_path}" \
     -o "${recon_path}" \
     >> "${log_path}" 2>&1
+
+  if [[ -s "${rdo_cost_path}" ]]; then
+    touch "${rdo_cost_path}.done"
+  else
+    rm -f "${rdo_cost_path}"
+  fi
 
   if [[ "${skip_decode}" != "1" ]]; then
     echo "[run] (${num}) decoding ${str_name}"
@@ -253,6 +278,7 @@ done < "${sequence_list}"
 echo "Sequence list : ${sequence_list}"
 echo "Cfg root      : ${cfg_root}"
 echo "Partition root: ${partition_root}"
+echo "RDO cost root : ${rdo_cost_root}"
 echo "Log root      : ${log_root}"
 echo "Work root     : ${work_root}"
 echo "Encoder       : ${ENCODER}"

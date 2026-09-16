@@ -21,6 +21,7 @@ Options:
   --template PATH          Encoder cfg template. Default: ref_model/cfg/encoder_intra_vtm.cfg.
   --sequence-template PATH Sequence cfg header. Default: ref_model/cfg/sequence.cfg.
   --video-root PATH        Video root. Default: data/video/<dataset>.
+  --input-bitdepth N       Override input bit depth (8/10/12/16).
   --output-root PATH       Output cfg root. Default: data/CodecTrainCfg/<dataset>/qp_<qp>.
 
 Sequence list lookup rule:
@@ -38,6 +39,9 @@ set_cfg_value() {
   local cfg_path="$1"
   local key="$2"
   local value="$3"
+  value="${value//\\/\\\\}"
+  value="${value//&/\\&}"
+  value="${value//|/\\|}"
   if ! grep -qE "^${key}[[:space:]]*:" "${cfg_path}"; then
     echo "Template field not found: ${key} in ${cfg_path}" >&2
     exit 1
@@ -53,8 +57,13 @@ template_path="${DEFAULT_TEMPLATE}"
 sequence_template_path="${DEFAULT_SEQUENCE_TEMPLATE}"
 video_root=""
 output_root=""
+input_bitdepth=""
 
 while [[ $# -gt 0 ]]; do
+  if [[ "$1" != "-h" && "$1" != "--help" && $# -lt 2 ]]; then
+    echo "Missing value for $1" >&2
+    exit 1
+  fi
   case "$1" in
     --dataset)
       dataset="$2"
@@ -82,6 +91,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --video-root)
       video_root="$2"
+      shift 2
+      ;;
+    --input-bitdepth)
+      input_bitdepth="$2"
       shift 2
       ;;
     --output-root)
@@ -122,11 +135,26 @@ case "${seq_type}" in
     ;;
 esac
 
-if [[ -z "${sequence_list}" ]]; then
-  sequence_list="${SCRIPT_DIR}/${sequence_list_prefix}_Sequences_${dataset}.txt"
+if [[ ! "$qp" =~ ^[0-9]+$ ]] || (( 10#$qp > 63 )); then
+  echo "QP must be an integer in 0..63" >&2
+  exit 1
 fi
-
-video_root="${video_root:-${DATA_ROOT}/video/${dataset}}"
+if [[ -n "$input_bitdepth" && ! "$input_bitdepth" =~ ^(8|10|12|16)$ ]]; then
+  echo "Input bit depth must be 8, 10, 12 or 16" >&2
+  exit 1
+fi
+# Keep output dataset names consistent with run.sh; only map existing inputs.
+list_dataset="$dataset"
+video_dataset="$dataset"
+case "$dataset" in
+  VVC|VVC_CTC) list_dataset="VVC"; video_dataset="VVC_CTC" ;;
+  HEVC|HEVC_CTC) list_dataset="HEVC"; video_dataset="HEVC_CTC" ;;
+esac
+sequence_list="${sequence_list:-${SCRIPT_DIR}/${sequence_list_prefix}_Sequences_${list_dataset}.txt}"
+video_root="${video_root:-${DATA_ROOT}/video/${video_dataset}}"
+video_root="${video_root/#\~/$HOME}"
+# Store absolute input paths so generated cfg files work from any directory.
+video_root="$(realpath -m -- "$video_root")"
 output_root="${output_root:-${DATA_ROOT}/CodecTrainCfg/${dataset}/qp_${qp}}"
 
 mkdir -p "${output_root}"
@@ -146,16 +174,48 @@ if [[ ! -f "${sequence_list}" ]]; then
   exit 1
 fi
 
+generated=0
+declare -A seen_names=()
 while IFS= read -r line || [[ -n "${line}" ]]; do
-  [[ -z "${line}" ]] && continue
-  [[ "${line}" =~ ^# ]] && continue
+  line="${line%$'\r'}"
+  [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+  [[ "${line}" =~ ^[[:space:]]*# ]] && continue
   [[ "${line}" == *"end!!!!"* ]] && break
 
-  IFS=',' read -r str_name file_name str_sizX str_sizY str_framenum str_fps <<< "${line}"
+  IFS=',' read -r str_name file_name str_sizX str_sizY str_framenum str_fps extra <<< "${line}"
 
-  if [[ -z "${file_name:-}" ]]; then
-    echo "Skip invalid line: ${line}" >&2
-    continue
+  if [[ -z "$str_name" || "$str_name" == *"/"* || -z "$file_name" || -n "$extra" ]]; then
+    echo "Invalid six-column sequence row: $line" >&2
+    exit 1
+  fi
+  for value in "$str_sizX" "$str_sizY" "$str_framenum" "$str_fps"; do
+    if [[ ! "$value" =~ ^[0-9]+$ ]] || (( 10#$value == 0 )); then
+      echo "Invalid positive numeric field in: $line" >&2
+      exit 1
+    fi
+  done
+  if [[ -n "${seen_names[$str_name]:-}" ]]; then
+    echo "Duplicate sequence: $str_name" >&2
+    exit 1
+  fi
+  seen_names[$str_name]=1
+  input_file="${video_root}/${file_name}"
+  if [[ ! -f "$input_file" ]]; then
+    echo "Input YUV not found: $input_file" >&2
+    exit 1
+  fi
+  bitdepth="$input_bitdepth"
+  if [[ -z "$bitdepth" && ( "$dataset" == "VVC" || "$dataset" == "VVC_CTC" ) ]]; then
+    seq_cfg="${PROJECT_ROOT}/VVCSoftware_VTM/cfg/per-sequence/${str_name}.cfg"
+    if [[ ! -f "$seq_cfg" ]]; then
+      echo "No bit-depth metadata for $str_name; specify --input-bitdepth" >&2
+      exit 1
+    fi
+    bitdepth="$(awk '$1 == "InputBitDepth" {print $3; exit}' "$seq_cfg")"
+    if [[ ! "$bitdepth" =~ ^(8|10|12|16)$ ]]; then
+      echo "Invalid InputBitDepth in $seq_cfg" >&2
+      exit 1
+    fi
   fi
 
   cfg_name="${str_name}_intra_vtm.cfg"
@@ -166,20 +226,28 @@ while IFS= read -r line || [[ -n "${line}" ]]; do
     cat "${template_path}"
   } > "${cfg_path}"
 
-  if [[ "${video_root}" == ~* ]]; then
-    input_file="${video_root/#\~/$HOME}/${file_name}"
-  else
-    input_file="${video_root}/${file_name}"
-  fi
   set_cfg_value "${cfg_path}" "InputFile" "${input_file}"
   set_cfg_value "${cfg_path}" "FramesToBeEncoded" "${str_framenum}"
   set_cfg_value "${cfg_path}" "FrameRate" "${str_fps}"
   set_cfg_value "${cfg_path}" "SourceWidth" "${str_sizX}"
   set_cfg_value "${cfg_path}" "SourceHeight" "${str_sizY}"
+  if [[ -n "$bitdepth" ]]; then
+    set_cfg_value "$cfg_path" "InputBitDepth" "$bitdepth"
+  fi
   set_cfg_value "${cfg_path}" "BitstreamFile" "${str_name}.bin"
   set_cfg_value "${cfg_path}" "QP" "${qp}"
-  set_cfg_value "${cfg_path}" "TemporalSubsampleRatio" "20         #set the ratio of Sampled Encoding Frames"
+  temporal_subsample_ratio="20"
+  if [[ "${dataset}" == "CUSTOM" || "${dataset}" == "VVC" || "${dataset}" == "VVC_CTC" ]]; then
+    temporal_subsample_ratio="1"
+  fi
+  set_cfg_value "${cfg_path}" "TemporalSubsampleRatio" "${temporal_subsample_ratio}         #set the ratio of Sampled Encoding Frames"
+  generated=$((generated + 1))
 done < "${sequence_list}"
+
+if (( generated == 0 )); then
+  echo "No sequences found in $sequence_list" >&2
+  exit 1
+fi
 
 echo "Sequence list : ${sequence_list}"
 echo "Video root    : ${video_root}"

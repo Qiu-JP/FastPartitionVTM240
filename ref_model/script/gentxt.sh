@@ -2,67 +2,53 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-DATA_ROOT="${PROJECT_ROOT}/data"
+# Run in FastPartitionVTM, or explicitly select its interpreter.
+"${FASTPARTITION_PYTHON:-python}" - "${SCRIPT_DIR}" "$@" <<'PY'
+import argparse
+import os
+from pathlib import Path
+import sys
+import tempfile
 
-usage() {
-  cat <<EOF
-Usage:
-  $(basename "$0") --input-dir DIR --output-file FILE [--frames N] [--fps N]
+from PIL import Image
 
-Generate a DIV2K-style sequence list by scanning image files and inferring width/height via ffprobe.
-EOF
-}
-
-input_dir=""
-output_file="${SCRIPT_DIR}/Training_Sequences_DIV2K.txt"
-frames=1
-fps=1
-
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --input-dir)
-      input_dir="$2"
-      shift 2
-      ;;
-    --output-file)
-      output_file="$2"
-      shift 2
-      ;;
-    --frames)
-      frames="$2"
-      shift 2
-      ;;
-    --fps)
-      fps="$2"
-      shift 2
-      ;;
-    -h|--help)
-      usage
-      exit 0
-      ;;
-    *)
-      echo "Unknown argument: $1" >&2
-      usage >&2
-      exit 1
-      ;;
-  esac
-done
-
-if [[ -z "${input_dir}" ]]; then
-  echo "--input-dir is required." >&2
-  usage >&2
-  exit 1
-fi
-
-: > "${output_file}"
-
-shopt -s nullglob
-for img in "${input_dir}"/*.png; do
-  base="$(basename "${img}" .png)"
-  width="$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of default=nw=1:nk=1 "${img}")"
-  height="$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of default=nw=1:nk=1 "${img}")"
-  echo "${base},${base}_${width}x${height}.yuv,${width},${height},${frames},${fps}" >> "${output_file}"
-done
-
-echo "Generated sequence list: ${output_file}"
+script_dir = Path(sys.argv.pop(1))
+parser = argparse.ArgumentParser(description="Generate a sequence list from PNG dimensions; does not convert images to YUV.")
+parser.add_argument('--input-dir', type=Path, required=True)
+parser.add_argument('--output-file', type=Path, default=script_dir / 'Training_Sequences_DIV2K.txt')
+parser.add_argument('--frames', type=int, default=1)
+parser.add_argument('--fps', type=int, default=1)
+args = parser.parse_args()
+if not args.input_dir.is_dir():
+    parser.error('input directory does not exist')
+if args.frames <= 0 or args.fps <= 0:
+    parser.error('frames and fps must be positive')
+images = sorted(p for p in args.input_dir.iterdir() if p.is_file() and p.suffix.lower() == '.png')
+if not images:
+    parser.error('input directory contains no PNG images; existing output is unchanged')
+rows = []
+names = set()
+for image in images:
+    name = image.stem
+    if any(c in name for c in ',\r\n#') or name in names:
+        parser.error(f'unsupported or duplicate sequence name: {name!r}')
+    names.add(name)
+    with Image.open(image) as img:
+        width, height = img.size
+        img.verify()
+    if width % 2 or height % 2:
+        parser.error(f'{image.name}: YUV420 requires even width and height')
+    rows.append(f'{name},{name}_{width}x{height}.yuv,{width},{height},{args.frames},{args.fps}\n')
+args.output_file.parent.mkdir(parents=True, exist_ok=True)
+# Replace only after every image has been validated.
+tmp_name = None
+try:
+    with tempfile.NamedTemporaryFile(mode='w', dir=args.output_file.parent, delete=False) as tmp:
+        tmp_name = tmp.name
+        tmp.writelines(rows)
+    os.replace(tmp_name, args.output_file)
+finally:
+    if tmp_name and os.path.exists(tmp_name):
+        os.unlink(tmp_name)
+print(f'Generated {len(rows)} sequences: {args.output_file}')
+PY
