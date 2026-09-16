@@ -29,7 +29,7 @@ endif()
 
 set( EXTENSION_360_VIDEO OFF CACHE BOOL "If EXTENSION_360_VIDEO is on, 360Lib will be added" )
 set( EXTENSION_HDRTOOLS OFF CACHE BOOL "If EXTENSION_HDRTOOLS is on, HDRLib will be added" )
-set( FAST_PARTITION_LIBTORCH_ROOT "$ENV{HOME}/qiujp/libtorch" CACHE PATH "Path to libtorch root" )
+set( FAST_PARTITION_ONNXRUNTIME_ROOT "${CMAKE_SOURCE_DIR}/../deps/onnxruntime-linux-x64-1.30.0" CACHE PATH "Path to ONNX Runtime CPU package (include and lib)" )
 
 if (DEFINED ENABLE_TRACING)
   set( ENABLE_TRACING OFF CACHE BOOL "ENABLE_TRACING will be set to this value" )
@@ -59,12 +59,19 @@ if( FAST_PARTITION_DEFINE MATCHES "^[ \t]*#[ \t]*define[ \t]+FastPartition[ \t]+
 endif()
 
 if( FAST_PARTITION_ENABLED )
-  if( FAST_PARTITION_LIBTORCH_ROOT )
-    list( APPEND CMAKE_PREFIX_PATH "${FAST_PARTITION_LIBTORCH_ROOT}" )
+  # Both build/bin and script/bin resolve the bundled runtime relative to the executable.
+  list( APPEND CMAKE_BUILD_RPATH "$ORIGIN/../../../deps/onnxruntime-linux-x64-1.30.0/lib" )
+  find_path( ONNXRUNTIME_INCLUDE_DIR onnxruntime_cxx_api.h
+             HINTS "${FAST_PARTITION_ONNXRUNTIME_ROOT}/include" )
+  find_library( ONNXRUNTIME_LIBRARY onnxruntime
+                HINTS "${FAST_PARTITION_ONNXRUNTIME_ROOT}/lib" )
+  if( NOT ONNXRUNTIME_INCLUDE_DIR OR NOT ONNXRUNTIME_LIBRARY )
+    message( FATAL_ERROR "Set FAST_PARTITION_ONNXRUNTIME_ROOT to an ONNX Runtime CPU package" )
   endif()
-  find_package( Torch REQUIRED )
-  set( CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}" )
-  list(APPEND CMAKE_BUILD_RPATH "${FAST_PARTITION_LIBTORCH_ROOT}/lib")
+  add_library( FastPartitionOnnxRuntime SHARED IMPORTED )
+  set_target_properties( FastPartitionOnnxRuntime PROPERTIES
+    IMPORTED_LOCATION "${ONNXRUNTIME_LIBRARY}"
+    INTERFACE_INCLUDE_DIRECTORIES "${ONNXRUNTIME_INCLUDE_DIR}" )
 endif()
 
 # set verbose compile options
@@ -137,6 +144,16 @@ if( XCODE )
   # add custom target to install LLDB files.
   add_subdirectory( "lldb" )
 endif()
+
+# Keep generated artifacts inside the selected build directory.
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
+foreach(config DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
+  set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${config} "${CMAKE_BINARY_DIR}/bin")
+  set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_${config} "${CMAKE_BINARY_DIR}/lib")
+  set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY_${config} "${CMAKE_BINARY_DIR}/lib")
+endforeach()
 
 # add needed subdirectories
 add_subdirectory( "source/Lib/CommonLib" )

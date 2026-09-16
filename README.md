@@ -10,6 +10,7 @@ data/             视频、生成的 cfg、划分标签、训练数据集和日�
 network/          模型代码、数据转换、训练、推理和模型导出
 VVCSoftware_VTM/  实验性 VTM 集成与编码器侧验证
 docs/             原理说明、模型细节和集成文档
+deps/             ONNX Runtime CPU C/C++ 依赖
 ```
 
 ## 目录入口

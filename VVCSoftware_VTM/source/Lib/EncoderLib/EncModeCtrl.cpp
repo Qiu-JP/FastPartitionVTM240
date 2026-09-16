@@ -52,6 +52,8 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cctype>
+#include <string>
 
 static constexpr double UNSET_IMV_COST = MAX_DOUBLE * 0.125;   // Some large, unique value
 
@@ -68,19 +70,6 @@ enum FastPartitionClass
   FP_TTV      = 5,
   FP_NUM_CLASS = 6
 };
-
-PartSplit getFastPartitionClassSplit(int cls)
-{
-  switch (cls)
-  {
-  case FP_QT:  return CU_QUAD_SPLIT;
-  case FP_BTH: return CU_HORZ_SPLIT;
-  case FP_BTV: return CU_VERT_SPLIT;
-  case FP_TTH: return CU_TRIH_SPLIT;
-  case FP_TTV: return CU_TRIV_SPLIT;
-  default:     return CU_DONT_SPLIT;
-  }
-}
 
 const char* getFastPartitionClassName(int cls)
 {
@@ -120,11 +109,24 @@ bool fastPartitionDumpBoundaryCtu()
   return enabled;
 }
 
+bool fastPartitionDumpAll()
+{
+  static const bool enabled = [] {
+    const char* value = std::getenv("FASTPARTITION_DUMP_ALL");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+  }();
+  return enabled;
+}
+
 bool isFastPartitionFirstLcuDumpArea(const CodingStructure& cs)
 {
   if (cs.slice == nullptr || cs.slice->getPOC() != 0)
   {
     return false;
+  }
+  if (fastPartitionDumpAll())
+  {
+    return true;
   }
   const bool firstLcu = fastPartitionDumpFirstLcu() && cs.area.lx() < 128 && cs.area.ly() < 128;
   const bool boundaryCtu = fastPartitionDumpBoundaryCtu()
@@ -147,6 +149,7 @@ struct FastPartitionDebugStats
   uint64_t initCalls = 0;
   uint64_t activeCalls = 0;
   uint64_t fallbackCalls = 0;
+  uint64_t allRejectedCalls = 0;
   uint64_t decisions[FP_NUM_CLASS] = {};
   uint64_t modeCountSum = 0;
 
@@ -164,6 +167,8 @@ struct FastPartitionDebugStats
                  (unsigned long long)activeCalls,
                  (unsigned long long)fallbackCalls,
                  avgModes);
+    std::fprintf(stderr, "[FastPartitionStats] allRejected=%llu\n",
+                 (unsigned long long)allRejectedCalls);
     for (int cls = 0; cls < FP_NUM_CLASS; cls++)
     {
       std::fprintf(stderr,
@@ -1336,25 +1341,13 @@ bool EncModeCtrlMTnoRQT::xFastPartitionGetAllowedClasses(Partitioner& partitione
   }
 
   const bool luma = isLuma(partitioner.chType);
-  const FastPartitionCtuCache* lumaCache = luma ? m_fastPartitionCtuCache : nullptr;
-  EncFastPartitionClassifierInfer* lumaClassifier = luma ? m_fastPartitionClassifierInfer : nullptr;
-  const FastPartitionChromaCtuCache* chromaCache = luma ? nullptr : m_fastPartitionChromaCtuCache;
-  EncFastPartitionClassifierInfer* chromaClassifier = luma ? nullptr : m_fastPartitionChromaClassifierInfer;
-
-  if (luma)
+  const auto* luma32Cache = m_fastPartitionLuma32CtuCache;
+  auto* lumaClassifier = m_fastPartitionClassifierInfer;
+  if (!luma || luma32Cache == nullptr || !luma32Cache->valid
+      || lumaClassifier == nullptr || !lumaClassifier->isInitialized())
   {
-    if (lumaCache == nullptr || lumaClassifier == nullptr || !lumaClassifier->isInitialized())
-    {
-      return false;
-    }
-  }
-  else if (chromaCache == nullptr || chromaClassifier == nullptr
-           || !chromaCache->valid || !chromaClassifier->isInitialized())
-  {
-    // No complete chroma model pair was configured: preserve the original chroma RDO flow.
     return false;
   }
-
   const Position cuPos = luma ? partitioner.currArea().lumaPos() : partitioner.currArea().chromaPos();
   const Size cuSize = luma ? partitioner.currArea().lumaSize() : partitioner.currArea().chromaSize();
   const int cuX = cuPos.x;
@@ -1362,60 +1355,23 @@ bool EncModeCtrlMTnoRQT::xFastPartitionGetAllowedClasses(Partitioner& partitione
   const int cuWidth = int(cuSize.width);
   const int cuHeight = int(cuSize.height);
   const int rootSize = luma ? 128 : 64;
-  const int modelBlockSize = luma ? 64 : 32;
+  const int modelBlockSize = 32;
   const int pictureWidth = luma ? cs.picture->lwidth() : int(cs.picture->getOrigBuf(COMPONENT_Cb).width);
   const int pictureHeight = luma ? cs.picture->lheight() : int(cs.picture->getOrigBuf(COMPONENT_Cb).height);
   const PartSplit implicitSplit = partitioner.getImplicitSplit(cs);
   const bool isBoundaryCu = cuX + cuWidth > pictureWidth || cuY + cuHeight > pictureHeight;
 
-  if (cuWidth == rootSize && cuHeight == rootSize)
+  // Boundary and forced decisions belong to the native mode controller.
+  // In particular, the CTU root has no corresponding classifier prediction.
+  if ((cuWidth == rootSize && cuHeight == rootSize)
+      || implicitSplit != CU_DONT_SPLIT || isBoundaryCu
+      || (m_ComprCUCtxList.back().minDepth > partitioner.currQtDepth
+          && partitioner.canSplit(CU_QUAD_SPLIT, cs)))
   {
-    if (implicitSplit != CU_DONT_SPLIT)
-    {
-      const int rootClass = implicitSplit == CU_HORZ_SPLIT ? FP_BTH
-                          : implicitSplit == CU_VERT_SPLIT ? FP_BTV
-                          : implicitSplit == CU_QUAD_SPLIT ? FP_QT : -1;
-      if (rootClass >= 0 && partitioner.canSplit(implicitSplit, cs))
-      {
-        allowedClasses[rootClass] = true;
-        if (isFastPartitionFirstLcuDumpArea(cs))
-        {
-          FILE* statFile = fastPartitionStatFile();
-          if (statFile != nullptr)
-          {
-            std::fprintf(statFile,
-                         "[FastPartitionPred] poc=%d cu=%d,%d,%dx%d depth=%u qt=%u bt=%u root=implicit:%s\n",
-                         cs.slice->getPOC(), cuX, cuY, cuWidth, cuHeight,
-                         partitioner.currDepth, partitioner.currQtDepth, partitioner.currBtDepth,
-                         getFastPartitionSplitName(implicitSplit));
-            std::fflush(statFile);
-          }
-        }
-        return true;
-      }
-      return false;
-    }
-    if (partitioner.canSplit(CU_QUAD_SPLIT, cs))
-    {
-      allowedClasses[FP_QT] = true;
-      if (isFastPartitionFirstLcuDumpArea(cs))
-      {
-        FILE* statFile = fastPartitionStatFile();
-        if (statFile != nullptr)
-        {
-          std::fprintf(statFile,
-                       "[FastPartitionPred] poc=%d cu=%d,%d,%dx%d depth=%u qt=%u bt=%u root=fixed:QT\n",
-                       cs.slice->getPOC(), cuX, cuY, cuWidth, cuHeight,
-                       partitioner.currDepth, partitioner.currQtDepth, partitioner.currBtDepth);
-          std::fflush(statFile);
-        }
-      }
-      return true;
-    }
     return false;
   }
 
-  const bool cacheValid = luma ? lumaCache->valid : chromaCache->valid;
+  const bool cacheValid = luma32Cache->valid;
   if (!cacheValid || cuWidth > modelBlockSize || cuHeight > modelBlockSize || cuWidth < 4 || cuHeight < 4)
   {
     return false;
@@ -1423,39 +1379,32 @@ bool EncModeCtrlMTnoRQT::xFastPartitionGetAllowedClasses(Partitioner& partitione
 
   std::array<bool, FP_NUM_CLASS> legalClasses;
   legalClasses.fill(false);
-  legalClasses[FP_NO_SPLIT] = true;
+  legalClasses[FP_NO_SPLIT] = partitioner.canSplit(CU_DONT_SPLIT, cs);
   legalClasses[FP_QT]  = partitioner.canSplit(CU_QUAD_SPLIT, cs);
   legalClasses[FP_BTH] = partitioner.canSplit(CU_HORZ_SPLIT, cs);
   legalClasses[FP_BTV] = partitioner.canSplit(CU_VERT_SPLIT, cs);
   legalClasses[FP_TTH] = partitioner.canSplit(CU_TRIH_SPLIT, cs);
   legalClasses[FP_TTV] = partitioner.canSplit(CU_TRIV_SPLIT, cs);
 
-  if (implicitSplit != CU_DONT_SPLIT)
+  if (m_ComprCUCtxList.back().maxDepth <= partitioner.currQtDepth)
   {
-    for (int cls = 0; cls < FP_NUM_CLASS; cls++)
-    {
-      legalClasses[cls] = getFastPartitionClassSplit(cls) == implicitSplit;
-    }
+    legalClasses[FP_QT] = false;
   }
-  else
+
+  // Resolve size-aware thresholds before running the classifier.  Shape
+  // ablations intentionally omit inactive CU sizes; those sizes must bypass
+  // FastPartition inference entirely, otherwise a threshold of 1.0 still
+  // pays the full model-inference cost.
+  const std::array<double, FP_NUM_CLASS>* perSizeThresholds =
+    m_pcEncCfg->getFastPartitionThresholdsForSize(cuWidth, cuHeight);
+  if (perSizeThresholds == nullptr || std::count(legalClasses.begin(), legalClasses.end(), true) <= 1)
   {
-    ComprCUCtx& cuECtx = m_ComprCUCtxList.back();
-    if (cuECtx.minDepth > partitioner.currQtDepth && partitioner.canSplit(CU_QUAD_SPLIT, cs))
-    {
-      legalClasses.fill(false);
-      legalClasses[FP_QT] = true;
-    }
-    else if (cuECtx.maxDepth <= partitioner.currQtDepth)
-    {
-      legalClasses[FP_QT] = false;
-    }
+    return false;
   }
 
   std::array<float, FP_NUM_CLASS> probabilities;
   probabilities.fill(0.0f);
-  const bool inferSucceeded = luma
-    ? lumaClassifier->inferCu(*lumaCache, cuX, cuY, cuWidth, cuHeight, probabilities)
-    : chromaClassifier->inferCu(*chromaCache, cuX, cuY, cuWidth, cuHeight, probabilities);
+  const bool inferSucceeded = lumaClassifier->inferCu(*luma32Cache, cuX, cuY, cuWidth, cuHeight, probabilities);
   if (!inferSucceeded)
   {
     return false;
@@ -1464,53 +1413,37 @@ bool EncModeCtrlMTnoRQT::xFastPartitionGetAllowedClasses(Partitioner& partitione
   int bestClass = -1;
   float bestProbability = -1.0f;
   int legalAllowedCount = 0;
-  const double thresholdOverride = m_pcEncCfg->getFastPartitionThreshold();
-  const std::array<double, FP_NUM_CLASS>* perSizeThresholds =
-    m_pcEncCfg->getFastPartitionThresholdsForSize(cuWidth, cuHeight);
-  const bool usePerSizeThresholds = perSizeThresholds != nullptr;
-  const bool usePerClassThresholds = m_pcEncCfg->getFastPartitionThresholdsEnabled();
-  const std::array<double, FP_NUM_CLASS>& perClassThresholds = m_pcEncCfg->getFastPartitionThresholds();
-
   for (int cls = 0; cls < FP_NUM_CLASS; cls++)
   {
     if (legalClasses[cls] && probabilities[cls] > bestProbability)
     {
-      bestProbability = probabilities[cls];
       bestClass = cls;
+      bestProbability = probabilities[cls];
     }
-    const double threshold = usePerSizeThresholds ? (*perSizeThresholds)[cls]
-                             : (usePerClassThresholds ? perClassThresholds[cls]
-                                                       : (thresholdOverride >= 0.0 ? thresholdOverride : 0.1));
-    if (probabilities[cls] >= threshold)
-    {
-      allowedClasses[cls] = true;
-      if (legalClasses[cls])
-      {
-        legalAllowedCount++;
-      }
-    }
-  }
-
-  if (bestClass < 0)
-  {
-    return false;
+    allowedClasses[cls] = legalClasses[cls] && probabilities[cls] >= (*perSizeThresholds)[cls];
+    legalAllowedCount += allowedClasses[cls] ? 1 : 0;
   }
   if (legalAllowedCount == 0)
   {
-    allowedClasses[bestClass] = true;
+    // A threshold is a rejection criterion, not an implicit top-1 policy.
+    // Keep the native candidate search when every legal class was rejected.
+    g_fastPartitionDebugStats.allRejectedCalls++;
+    allowedClasses = legalClasses;
   }
   if (isFastPartitionFirstLcuDumpArea(cs))
   {
     FILE* statFile = fastPartitionStatFile();
     if (statFile != nullptr)
     {
+      const char* thresholdModeName = "per-size";
       std::fprintf(statFile,
-                   "[FastPartitionPred] poc=%d cu=%d,%d,%dx%d depth=%u qt=%u bt=%u boundary=%d implicit=%s thresholdMode=%s bestLegal=%s prob=%.6f probs=",
+                   "[FastPartitionPred] poc=%d cu=%d,%d,%dx%d depth=%u qt=%u mt=%u bt=%u ch=%c boundary=%d implicit=%s thresholdMode=%s bestLegal=%s prob=%.6f probs=",
                    cs.slice->getPOC(), cuX, cuY, cuWidth, cuHeight,
-                   partitioner.currDepth, partitioner.currQtDepth, partitioner.currBtDepth,
+                   partitioner.currDepth, partitioner.currQtDepth, partitioner.currMtDepth, partitioner.currBtDepth,
+                   luma ? 'L' : 'C',
                    isBoundaryCu ? 1 : 0,
                    getFastPartitionSplitName(implicitSplit),
-                   usePerSizeThresholds ? "per-size" : (usePerClassThresholds ? "per-class" : "single"),
+                   thresholdModeName,
                    getFastPartitionClassName(bestClass), bestProbability);
       for (int cls = 0; cls < FP_NUM_CLASS; cls++)
       {
@@ -1519,9 +1452,7 @@ bool EncModeCtrlMTnoRQT::xFastPartitionGetAllowedClasses(Partitioner& partitione
       std::fprintf(statFile, " thresholds=");
       for (int cls = 0; cls < FP_NUM_CLASS; cls++)
       {
-        const double threshold = usePerSizeThresholds ? (*perSizeThresholds)[cls]
-                                 : (usePerClassThresholds ? perClassThresholds[cls]
-                                                           : (thresholdOverride >= 0.0 ? thresholdOverride : 0.1));
+        const double threshold = (*perSizeThresholds)[cls];
         std::fprintf(statFile, "%s%s:%.6f", cls == 0 ? "" : ",", getFastPartitionClassName(cls), threshold);
       }
       printFastPartitionClassFlags(statFile, " legal=", legalClasses);
@@ -1530,7 +1461,16 @@ bool EncModeCtrlMTnoRQT::xFastPartitionGetAllowedClasses(Partitioner& partitione
       std::fflush(statFile);
     }
   }
-  return true;
+  // Installing an unchanged legal set can still alter native search state.
+  // Activate the learned decision only when it actually rejects a candidate.
+  for (int cls = 0; cls < FP_NUM_CLASS; cls++)
+  {
+    if (legalClasses[cls] && !allowedClasses[cls])
+    {
+      return true;
+    }
+  }
+  return false;
 }
 #endif
 
@@ -1704,12 +1644,13 @@ void EncModeCtrlMTnoRQT::initCULevel( Partitioner &partitioner, const CodingStru
   fastPartitionAllowedClasses.fill(true);
   g_fastPartitionDebugStats.initCalls++;
   const bool useFastPartitionDecision = xFastPartitionGetAllowedClasses(partitioner, cs, fastPartitionAllowedClasses);
-  const bool fastPartitionAllowNoSplit = !useFastPartitionDecision || fastPartitionAllowedClasses[FP_NO_SPLIT];
-  const bool fastPartitionAllowQT      = !useFastPartitionDecision || fastPartitionAllowedClasses[FP_QT];
-  const bool fastPartitionAllowBTH     = !useFastPartitionDecision || fastPartitionAllowedClasses[FP_BTH];
-  const bool fastPartitionAllowBTV     = !useFastPartitionDecision || fastPartitionAllowedClasses[FP_BTV];
-  const bool fastPartitionAllowTTH     = !useFastPartitionDecision || fastPartitionAllowedClasses[FP_TTH];
-  const bool fastPartitionAllowTTV     = !useFastPartitionDecision || fastPartitionAllowedClasses[FP_TTV];
+  const bool enforceFastPartitionDecision = useFastPartitionDecision;
+  const bool fastPartitionAllowNoSplit = !enforceFastPartitionDecision || fastPartitionAllowedClasses[FP_NO_SPLIT];
+  const bool fastPartitionAllowQT      = !enforceFastPartitionDecision || fastPartitionAllowedClasses[FP_QT];
+  const bool fastPartitionAllowBTH     = !enforceFastPartitionDecision || fastPartitionAllowedClasses[FP_BTH];
+  const bool fastPartitionAllowBTV     = !enforceFastPartitionDecision || fastPartitionAllowedClasses[FP_BTV];
+  const bool fastPartitionAllowTTH     = !enforceFastPartitionDecision || fastPartitionAllowedClasses[FP_TTH];
+  const bool fastPartitionAllowTTV     = !enforceFastPartitionDecision || fastPartitionAllowedClasses[FP_TTV];
   if (useFastPartitionDecision)
   {
     g_fastPartitionDebugStats.activeCalls++;
@@ -1725,28 +1666,21 @@ void EncModeCtrlMTnoRQT::initCULevel( Partitioner &partitioner, const CodingStru
   {
     g_fastPartitionDebugStats.fallbackCalls++;
   }
-#else
-  const bool fastPartitionAllowNoSplit = true;
-  const bool fastPartitionAllowQT      = true;
-  const bool fastPartitionAllowBTH     = true;
-  const bool fastPartitionAllowBTV     = true;
-  const bool fastPartitionAllowTTH     = true;
-  const bool fastPartitionAllowTTV     = true;
+  cuECtx.fastPartitionRejected = {{ !fastPartitionAllowNoSplit, !fastPartitionAllowQT,
+                                    !fastPartitionAllowBTH, !fastPartitionAllowBTV,
+                                    !fastPartitionAllowTTH, !fastPartitionAllowTTV }};
 #endif
 
   if( !cuECtx.get<bool>( QT_BEFORE_BT ) )
   {
-    if (fastPartitionAllowQT)
+    for( int qp = maxQP; qp >= minQP; qp-- )
     {
-      for( int qp = maxQP; qp >= minQP; qp-- )
-      {
-        m_ComprCUCtxList.back().testModes.push_back( { ETM_SPLIT_QT, ETO_STANDARD,
-                                                      qp, deltaQPForLambda });
-      }
+      m_ComprCUCtxList.back().testModes.push_back( { ETM_SPLIT_QT, ETO_STANDARD,
+                                                    qp, deltaQPForLambda });
     }
   }
 
-  if( fastPartitionAllowTTV && partitioner.canSplit( CU_TRIV_SPLIT, cs ) )
+  if( partitioner.canSplit( CU_TRIV_SPLIT, cs ) )
   {
     // add split modes
     for( int qp = maxQP; qp >= minQP; qp-- )
@@ -1757,7 +1691,7 @@ void EncModeCtrlMTnoRQT::initCULevel( Partitioner &partitioner, const CodingStru
     }
   }
 
-  if( fastPartitionAllowTTH && partitioner.canSplit( CU_TRIH_SPLIT, cs ) )
+  if( partitioner.canSplit( CU_TRIH_SPLIT, cs ) )
   {
     // add split modes
     for( int qp = maxQP; qp >= minQP; qp-- )
@@ -1772,7 +1706,7 @@ void EncModeCtrlMTnoRQT::initCULevel( Partitioner &partitioner, const CodingStru
   xGetMinMaxQP(minQP, maxQP,
                deltaQPForLambda,
                cs, partitioner, baseQP, *cs.sps, *cs.pps, CU_BT_SPLIT);
-  if( fastPartitionAllowBTV && partitioner.canSplit( CU_VERT_SPLIT, cs ) )
+  if( partitioner.canSplit( CU_VERT_SPLIT, cs ) )
   {
     // add split modes
     for( int qp = maxQP; qp >= minQP; qp-- )
@@ -1788,7 +1722,7 @@ void EncModeCtrlMTnoRQT::initCULevel( Partitioner &partitioner, const CodingStru
     m_ComprCUCtxList.back().set( DID_VERT_SPLIT, false );
   }
 
-  if( fastPartitionAllowBTH && partitioner.canSplit( CU_HORZ_SPLIT, cs ) )
+  if( partitioner.canSplit( CU_HORZ_SPLIT, cs ) )
   {
     // add split modes
     for( int qp = maxQP; qp >= minQP; qp-- )
@@ -1805,20 +1739,14 @@ void EncModeCtrlMTnoRQT::initCULevel( Partitioner &partitioner, const CodingStru
 
   if( cuECtx.get<bool>( QT_BEFORE_BT ) )
   {
-    if (fastPartitionAllowQT)
+    for( int qp = maxQPq; qp >= minQPq; qp-- )
     {
-      for( int qp = maxQPq; qp >= minQPq; qp-- )
-      {
-        m_ComprCUCtxList.back().testModes.push_back( { ETM_SPLIT_QT, ETO_STANDARD,
-                                                      qp, deltaQPForLambda });
-      }
+      m_ComprCUCtxList.back().testModes.push_back( { ETM_SPLIT_QT, ETO_STANDARD,
+                                                    qp, deltaQPForLambda });
     }
   }
 
-  if (fastPartitionAllowNoSplit)
-  {
-    m_ComprCUCtxList.back().testModes.push_back( { ETM_POST_DONT_SPLIT } );
-  }
+  m_ComprCUCtxList.back().testModes.push_back( { ETM_POST_DONT_SPLIT } );
 
   xGetMinMaxQP(minQP, maxQP,
                deltaQPForLambda,
@@ -1841,50 +1769,47 @@ void EncModeCtrlMTnoRQT::initCULevel( Partitioner &partitioner, const CodingStru
   }
   checkIbc &= tryIBCRdo;
 
-  if (fastPartitionAllowNoSplit)
+  for( int qpLoop = maxQP; qpLoop >= minQP; qpLoop-- )
   {
-    for( int qpLoop = maxQP; qpLoop >= minQP; qpLoop-- )
-    {
-      const int  qp       = std::max( qpLoop, lowestQP );
+    const int  qp       = std::max( qpLoop, lowestQP );
 #if REUSE_CU_RESULTS
-      const bool isReusingCu = isValid( cs, partitioner, qp );
-      cuECtx.set( IS_REUSING_CU, isReusingCu );
-      if( isReusingCu )
-      {
-        m_ComprCUCtxList.back().testModes.push_back( {ETM_RECO_CACHED, ETO_STANDARD,
-                                                      qp, deltaQPForLambda });
-      }
+    const bool isReusingCu = isValid( cs, partitioner, qp );
+    cuECtx.set( IS_REUSING_CU, isReusingCu );
+    if( isReusingCu )
+    {
+      m_ComprCUCtxList.back().testModes.push_back( {ETM_RECO_CACHED, ETO_STANDARD,
+                                                    qp, deltaQPForLambda });
+    }
 #endif
-      // add intra modes
-      if( tryIntraRdo )
+    // add intra modes
+    if( tryIntraRdo )
+    {
+      if (cs.slice->getSPS()->getPLTMode()
+          && (partitioner.treeType != TREE_D || cs.slice->isIntra()
+              || (cs.area.lwidth() == 4 && cs.area.lheight() == 4))
+          && getPltEnc())
       {
-        if (cs.slice->getSPS()->getPLTMode()
-            && (partitioner.treeType != TREE_D || cs.slice->isIntra()
-                || (cs.area.lwidth() == 4 && cs.area.lheight() == 4))
-            && getPltEnc())
-        {
-          m_ComprCUCtxList.back().testModes.push_back({ ETM_PALETTE, ETO_STANDARD,
-                                                        qp, deltaQPForLambda });
-        }
-        m_ComprCUCtxList.back().testModes.push_back({ ETM_INTRA, ETO_STANDARD,
+        m_ComprCUCtxList.back().testModes.push_back({ ETM_PALETTE, ETO_STANDARD,
                                                       qp, deltaQPForLambda });
-        if (cs.slice->getSPS()->getPLTMode() && partitioner.treeType == TREE_D && !cs.slice->isIntra()
-            && !(cs.area.lwidth() == 4 && cs.area.lheight() == 4) && getPltEnc())
-        {
-          m_ComprCUCtxList.back().testModes.push_back({ ETM_PALETTE, ETO_STANDARD,
-                                                        qp, deltaQPForLambda });
-        }
       }
-      // add ibc mode to intra path
-      if (cs.sps->getIBCFlag() && checkIbc)
+      m_ComprCUCtxList.back().testModes.push_back({ ETM_INTRA, ETO_STANDARD,
+                                                    qp, deltaQPForLambda });
+      if (cs.slice->getSPS()->getPLTMode() && partitioner.treeType == TREE_D && !cs.slice->isIntra()
+          && !(cs.area.lwidth() == 4 && cs.area.lheight() == 4) && getPltEnc())
       {
-        m_ComprCUCtxList.back().testModes.push_back({ ETM_IBC,         ETO_STANDARD,
+        m_ComprCUCtxList.back().testModes.push_back({ ETM_PALETTE, ETO_STANDARD,
                                                       qp, deltaQPForLambda });
-        if (isLuma(partitioner.chType))
-        {
-          m_ComprCUCtxList.back().testModes.push_back({ ETM_IBC_MERGE,   ETO_STANDARD,
-                                                        qp, deltaQPForLambda });
-        }
+      }
+    }
+    // add ibc mode to intra path
+    if (cs.sps->getIBCFlag() && checkIbc)
+    {
+      m_ComprCUCtxList.back().testModes.push_back({ ETM_IBC,         ETO_STANDARD,
+                                                    qp, deltaQPForLambda });
+      if (isLuma(partitioner.chType))
+      {
+        m_ComprCUCtxList.back().testModes.push_back({ ETM_IBC_MERGE,   ETO_STANDARD,
+                                                      qp, deltaQPForLambda });
       }
     }
   }
@@ -1938,6 +1863,13 @@ void EncModeCtrlMTnoRQT::initCULevel( Partitioner &partitioner, const CodingStru
       }
     }
   }
+
+  // A rejected BT will not run. Make that fact visible even when QT is
+  // searched first, without changing the native candidate queue or cache setup.
+#if FastPartition
+  if (cuECtx.fastPartitionRejected[FP_BTH]) cuECtx.set(DID_HORZ_SPLIT, false);
+  if (cuECtx.fastPartitionRejected[FP_BTV]) cuECtx.set(DID_VERT_SPLIT, false);
+#endif
 
   // ensure to skip unprobable modes
 #if FastPartition
@@ -2015,6 +1947,28 @@ bool EncModeCtrlMTnoRQT::tryMode( const EncTestMode& encTestmode, const CodingSt
   {
     return partitioner.canSplit( CU_QUAD_SPLIT, cs );
   }
+
+#if FastPartition
+  // Native boundary handling above and mandatory QT take precedence. Filter
+  // candidate modes only; ETM_POST_DONT_SPLIT must execute its native control path.
+  if (!(cuECtx.minDepth > partitioner.currQtDepth && partitioner.canSplit(CU_QUAD_SPLIT, cs)))
+  {
+    int cls = -1;
+    switch (encTestmode.type)
+    {
+    case ETM_SPLIT_QT:   cls = FP_QT; break;
+    case ETM_SPLIT_BT_H: cls = FP_BTH; break;
+    case ETM_SPLIT_BT_V: cls = FP_BTV; break;
+    case ETM_SPLIT_TT_H: cls = FP_TTH; break;
+    case ETM_SPLIT_TT_V: cls = FP_TTV; break;
+    default: if (isModeNoSplit(encTestmode)) cls = FP_NO_SPLIT; break;
+    }
+    if (cls >= 0 && cuECtx.fastPartitionRejected[cls])
+    {
+      return false;
+    }
+  }
+#endif
 
 #if REUSE_CU_RESULTS
   if( cuECtx.get<bool>( IS_REUSING_CU ) )
@@ -2260,23 +2214,6 @@ bool EncModeCtrlMTnoRQT::tryMode( const EncTestMode& encTestmode, const CodingSt
       return false;
     }
 
-    if( m_pcEncCfg->getSplitStructurePruning() )
-    {
-      if( split == CU_HORZ_SPLIT || split == CU_VERT_SPLIT )
-      {
-        if( partitioner.currMtDepth != partitioner.currBtDepth || partitioner.currBtDepth >= 2 )
-        {
-          return false;
-        }
-      }
-      else if( split == CU_TRIH_SPLIT || split == CU_TRIV_SPLIT )
-      {
-        if( partitioner.currMtDepth != 0 )
-        {
-          return false;
-        }
-      }
-    }
 
     if( m_pcEncCfg->getUseContentBasedFastQtbt() )
     {

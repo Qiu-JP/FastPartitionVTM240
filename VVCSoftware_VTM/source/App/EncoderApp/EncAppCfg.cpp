@@ -1241,7 +1241,6 @@ bool EncAppCfg::parseCfg( int argc, char* argv[] )
   ("E0023FastEnc",                                    m_e0023FastEnc,                                    true, "Fast encoding setting for QTBT (proposal E0023)")
   ("MTTSkipping",                                     m_useMttSkip,                                     false, "MTT split modes early termination")
   ("ContentBasedFastQtbt",                            m_contentBasedFastQtbt,                           false, "Signal based QTBT speed-up")
-  ("SplitStructurePruning",                           m_splitStructurePruning,                          false, "Restrict split structure: BT depth <= 2, TT depth <= 1, and no BT/TT nesting")
   ("UseNonLinearAlfLuma",                             m_useNonLinearAlfLuma,                             true, "Non-linear adaptive loop filters for Luma Channel")
   ("UseNonLinearAlfChroma",                           m_useNonLinearAlfChroma,                           true, "Non-linear adaptive loop filters for Chroma Channels")
   ("MaxNumAlfAlternativesChroma",                     m_maxNumAlfAlternativesChroma,
@@ -1431,14 +1430,10 @@ bool EncAppCfg::parseCfg( int argc, char* argv[] )
   ("ScalingList",                                     m_useScalingListId,                    SCALING_LIST_OFF, "0/off: no scaling list, 1/default: default scaling lists, 2/file: scaling lists specified in ScalingListFile")
   ("ScalingListFile",                                 m_scalingListFileName,                       std::string(""), "Scaling list file name. Use an empty string to produce help.")
 #if FastPartition
-  ("FastPartitionSwinModel",                          m_fastPartitionSwinModel,                    std::string(""), "FastPartition SwinTransformer_Unet_Luma96 TorchScript model file name")
-  ("FastPartitionClassifierModel",                    m_fastPartitionClassifierModel,              std::string(""), "FastPartition Classifier_I native JSON model file name")
-  ("FastPartitionChromaSwinModel",                    m_fastPartitionChromaSwinModel,              std::string(""), "FastPartition 2x48x48 chroma Swin TorchScript model file name; empty disables chroma fast partition")
-  ("FastPartitionChromaClassifierModel",              m_fastPartitionChromaClassifierModel,        std::string(""), "FastPartition chroma Classifier_I native JSON model file name; empty disables chroma fast partition")
-  ("FastPartitionPreset",                             m_fastPartitionPreset,                       std::string("all"), "FastPartition classifier preset: all, fast, or middle")
-  ("FastPartitionThreshold",                          m_fastPartitionThreshold,                    -1.0, "FastPartition classifier threshold override. Negative values use FastPartitionPreset.")
-  ("FastPartitionTh",                                 m_fastPartitionTh,                            std::string(""), "FastPartition thresholds [NO_SPLIT,QT,BTH,BTV,TTH,TTV]")
-  ("FastPartitionThBySize",                           m_fastPartitionThBySize,                      std::string(""), "FastPartition size-aware thresholds, e.g. \"64x64:[NO_SPLIT,QT,BTH,BTV,TTH,TTV];32x32:[...]\"")
+  ("FastPartitionSwinModel",                          m_fastPartitionSwinModel,                    std::string(""), "FastPartition Swin luma ONNX model file name")
+  ("FastPartitionClassifierModel",                    m_fastPartitionClassifierModel,              std::string(""), "FastPartition Classifier_I ONNX bundle directory")
+  ("FastPartitionLumaModelScale",                      m_fastPartitionLumaModelScale,                32, "FastPartition target size: 32 (48x48 input, 2x8x8 gridmap)")
+  ("FastPartitionThBySize",                           m_fastPartitionThBySize,                      std::string(""), "Per-pixel-WxH six-class thresholds: 32x16:[NO_SPLIT,QT,BTH,BTV,TTH,TTV];16x32:[...]. Keep p>=T; missing sizes or all rejected use native search.")
 #endif
   ("DisableScalingMatrixForLFNST",                    m_disableScalingMatrixForLfnstBlks,                true, "Disable scaling matrices, when enabled, for LFNST-coded blocks")
   ("DisableScalingMatrixForAlternativeColourSpace",   m_disableScalingMatrixForAlternativeColourSpace,  false, "Disable scaling matrices when the colour space is not equal to the designated colour space of scaling matrix")
@@ -6856,7 +6851,6 @@ void EncAppCfg::xPrintParameter()
   msg( VERBOSE, "AMaxBT:%d ", m_useAMaxBT );
   msg( VERBOSE, "E0023FastEnc:%d ", m_e0023FastEnc );
   msg( VERBOSE, "ContentBasedFastQtbt:%d ", m_contentBasedFastQtbt );
-  msg( VERBOSE, "SplitStructurePruning:%d ", m_splitStructurePruning );
   msg( VERBOSE, "UseNonLinearAlfLuma:%d ", m_useNonLinearAlfLuma );
   msg( VERBOSE, "UseNonLinearAlfChroma:%d ", m_useNonLinearAlfChroma );
   msg( VERBOSE, "MaxNumAlfAlternativesChroma:%d ", m_maxNumAlfAlternativesChroma );

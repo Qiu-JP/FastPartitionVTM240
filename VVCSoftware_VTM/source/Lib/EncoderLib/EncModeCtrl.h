@@ -236,6 +236,9 @@ struct ComprCUCtx
   unsigned                 cuX, cuY, cuW, cuH, partIdx;
   std::vector<EncTestMode> testModes;
   EncTestMode              lastTestMode;
+#if FastPartition
+  std::array<bool, 6>       fastPartitionRejected{};
+#endif
   CodingStructure         *bestCS{ nullptr };
   CodingUnit              *bestCU{ nullptr };
   TransformUnit           *bestTU{ nullptr };
@@ -315,10 +318,8 @@ public:
   virtual void initCULevel          ( Partitioner &partitioner, const CodingStructure& cs )                                 = 0;
   virtual void finishCULevel        ( Partitioner &partitioner )                                                            = 0;
 #if FastPartition
-  virtual void setFastPartitionContext(const FastPartitionCtuCache* ctuCache,
-                                       EncFastPartitionClassifierInfer* classifierInfer,
-                                       const FastPartitionChromaCtuCache* chromaCtuCache,
-                                       EncFastPartitionClassifierInfer* chromaClassifierInfer) {}
+  virtual void setFastPartitionContext(const FastPartitionLuma32CtuCache* luma32CtuCache,
+                                       EncFastPartitionClassifierInfer* classifierInfer) {}
 #endif
 
 protected:
@@ -789,10 +790,8 @@ class EncModeCtrlMTnoRQT : public EncModeCtrl, public CacheBlkInfoCtrl
 {
   unsigned m_skipThreshold;
 #if FastPartition
-  const FastPartitionCtuCache*       m_fastPartitionCtuCache = nullptr;
+  const FastPartitionLuma32CtuCache* m_fastPartitionLuma32CtuCache = nullptr;
   EncFastPartitionClassifierInfer*   m_fastPartitionClassifierInfer = nullptr;
-  const FastPartitionChromaCtuCache* m_fastPartitionChromaCtuCache = nullptr;
-  EncFastPartitionClassifierInfer*   m_fastPartitionChromaClassifierInfer = nullptr;
 #endif
 #if GDR_ENABLED
   EncCfg m_encCfg;
@@ -811,15 +810,11 @@ public:
 
   virtual bool checkSkipOtherLfnst( const EncTestMode& encTestmode, CodingStructure*& tempCS, Partitioner& partitioner );
 #if FastPartition
-  virtual void setFastPartitionContext(const FastPartitionCtuCache* ctuCache,
-                                       EncFastPartitionClassifierInfer* classifierInfer,
-                                       const FastPartitionChromaCtuCache* chromaCtuCache,
-                                       EncFastPartitionClassifierInfer* chromaClassifierInfer)
+  virtual void setFastPartitionContext(const FastPartitionLuma32CtuCache* luma32CtuCache,
+                                       EncFastPartitionClassifierInfer* classifierInfer)
   {
-    m_fastPartitionCtuCache = ctuCache;
+    m_fastPartitionLuma32CtuCache = luma32CtuCache;
     m_fastPartitionClassifierInfer = classifierInfer;
-    m_fastPartitionChromaCtuCache = chromaCtuCache;
-    m_fastPartitionChromaClassifierInfer = chromaClassifierInfer;
   }
 #endif
 

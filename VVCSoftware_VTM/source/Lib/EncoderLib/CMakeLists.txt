@@ -44,7 +44,7 @@ target_include_directories( ${LIB_NAME} PUBLIC . )
 target_link_libraries( ${LIB_NAME} CommonLib )
 
 if( FAST_PARTITION_ENABLED )
-  target_link_libraries( ${LIB_NAME} ${TORCH_LIBRARIES} )
+  target_link_libraries( ${LIB_NAME} FastPartitionOnnxRuntime )
 endif()
 
 if( CMAKE_COMPILER_IS_GNUCC )

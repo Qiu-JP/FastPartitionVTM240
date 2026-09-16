@@ -336,20 +336,13 @@ public:
 protected:
 
 #if FastPartition
-  FastPartitionCtuCache m_fastPartitionCtuCache;
-  EncFastPartitionSwinInfer m_fastPartitionSwinInfer;
+  FastPartitionLuma32CtuCache m_fastPartitionLuma32CtuCache;
+  EncFastPartitionLuma32SwinInfer m_fastPartitionLuma32SwinInfer;
   EncFastPartitionClassifierInfer m_fastPartitionClassifierInfer;
-  FastPartitionChromaCtuCache m_fastPartitionChromaCtuCache;
-  EncFastPartitionChromaSwinInfer m_fastPartitionChromaSwinInfer;
-  EncFastPartitionClassifierInfer m_fastPartitionChromaClassifierInfer;
 
-  void xFastPartitionPrepareCtu(CodingStructure& cs, const UnitArea& area, int qp);
-  void xFastPartitionBuildSwinInput96(const CodingStructure& cs, int targetX, int targetY, FastPartitionSwinInput& dst) const;
-  void xFastPartitionInferSwinCtu(int qp);
-  void xFastPartitionPrepareChromaCtu(CodingStructure& cs, const UnitArea& area, int qp);
-  void xFastPartitionBuildChromaSwinInput48(const CodingStructure& cs, int targetX, int targetY,
-                                            FastPartitionChromaSwinInput& dst) const;
-  void xFastPartitionInferChromaSwinCtu(int qp);
+  void xFastPartitionBuildLuma32SwinInput48(const CodingStructure& cs, int targetX, int targetY, FastPartitionLuma32SwinInput& dst) const;
+  void xFastPartitionInferLuma32SwinCtu(int qp);
+  void xFastPartitionPrepareLuma32Ctu(CodingStructure& cs, const UnitArea& area, int qp);
 #endif
 
   void xCalDebCost            ( CodingStructure &cs, Partitioner &partitioner, bool calDist = false );

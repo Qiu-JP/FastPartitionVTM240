@@ -69,7 +69,7 @@
 #if RDOStats
 namespace
 {
-constexpr size_t RDO_SPLIT_MODE_COUNT = 5;
+constexpr size_t RDO_MODE_COUNT = 6;
 
 uint64_t getArea4x4Units(int width, int height)
 {
@@ -82,16 +82,16 @@ struct RdoSplitStats
   {
     uint64_t splitTests = 0;
     uint64_t split4x4 = 0;
-    std::array<uint64_t, RDO_SPLIT_MODE_COUNT> modes{};
-    std::array<uint64_t, RDO_SPLIT_MODE_COUNT> mode4x4{};
+    std::array<uint64_t, RDO_MODE_COUNT> modes{};
+    std::array<uint64_t, RDO_MODE_COUNT> mode4x4{};
   };
 
   struct ChannelStats
   {
     std::atomic<uint64_t> splitTests{ 0 };
     std::atomic<uint64_t> split4x4{ 0 };
-    std::array<std::atomic<uint64_t>, RDO_SPLIT_MODE_COUNT> modes{};
-    std::array<std::atomic<uint64_t>, RDO_SPLIT_MODE_COUNT> mode4x4{};
+    std::array<std::atomic<uint64_t>, RDO_MODE_COUNT> modes{};
+    std::array<std::atomic<uint64_t>, RDO_MODE_COUNT> mode4x4{};
 
     std::mutex sizeMutex;
     std::map<std::pair<int, int>, SizeStats> sizeStats;
@@ -108,29 +108,51 @@ struct RdoSplitStats
 
   static void print(const char* channel, ChannelStats& stats)
   {
-    const uint64_t tests = stats.splitTests.load();
-    if (tests == 0)
+    const uint64_t totalTests = stats.splitTests.load();
+    if (totalTests == 0)
     {
       return;
     }
-    const uint64_t split4x4 = stats.split4x4.load();
+    const uint64_t total4x4 = stats.split4x4.load();
     std::fprintf(stderr,
-                 "[RdoSplitStats] channel=%s testedSplitModes=%llu testedSplit4x4=%llu "
-                 "QT=%llu BTH=%llu BTV=%llu TTH=%llu TTV=%llu "
-                 "QT4x4=%llu BTH4x4=%llu BTV4x4=%llu TTH4x4=%llu TTV4x4=%llu\n",
+                 "[RdoModeStats] channel=%s testedModes=%llu tested4x4=%llu "
+                 "NS=%llu QT=%llu BTH=%llu BTV=%llu TTH=%llu TTV=%llu "
+                 "NS4x4=%llu QT4x4=%llu BTH4x4=%llu BTV4x4=%llu TTH4x4=%llu TTV4x4=%llu\n",
                  channel,
-                 (unsigned long long)tests,
-                 (unsigned long long)split4x4,
+                 (unsigned long long)totalTests,
+                 (unsigned long long)total4x4,
                  (unsigned long long)stats.modes[0].load(),
                  (unsigned long long)stats.modes[1].load(),
                  (unsigned long long)stats.modes[2].load(),
                  (unsigned long long)stats.modes[3].load(),
                  (unsigned long long)stats.modes[4].load(),
+                 (unsigned long long)stats.modes[5].load(),
                  (unsigned long long)stats.mode4x4[0].load(),
                  (unsigned long long)stats.mode4x4[1].load(),
                  (unsigned long long)stats.mode4x4[2].load(),
                  (unsigned long long)stats.mode4x4[3].load(),
-                 (unsigned long long)stats.mode4x4[4].load());
+                 (unsigned long long)stats.mode4x4[4].load(),
+                 (unsigned long long)stats.mode4x4[5].load());
+
+    const uint64_t splitTests = totalTests - stats.modes[0].load();
+    const uint64_t split4x4 = total4x4 - stats.mode4x4[0].load();
+    std::fprintf(stderr,
+                 "[RdoSplitStats] channel=%s testedSplitModes=%llu testedSplit4x4=%llu "
+                 "QT=%llu BTH=%llu BTV=%llu TTH=%llu TTV=%llu "
+                 "QT4x4=%llu BTH4x4=%llu BTV4x4=%llu TTH4x4=%llu TTV4x4=%llu\n",
+                 channel,
+                 (unsigned long long)splitTests,
+                 (unsigned long long)split4x4,
+                 (unsigned long long)stats.modes[1].load(),
+                 (unsigned long long)stats.modes[2].load(),
+                 (unsigned long long)stats.modes[3].load(),
+                 (unsigned long long)stats.modes[4].load(),
+                 (unsigned long long)stats.modes[5].load(),
+                 (unsigned long long)stats.mode4x4[1].load(),
+                 (unsigned long long)stats.mode4x4[2].load(),
+                 (unsigned long long)stats.mode4x4[3].load(),
+                 (unsigned long long)stats.mode4x4[4].load(),
+                 (unsigned long long)stats.mode4x4[5].load());
 
     std::lock_guard<std::mutex> lock(stats.sizeMutex);
     for (const auto& entry : stats.sizeStats)
@@ -139,9 +161,9 @@ struct RdoSplitStats
       const int height = entry.first.second;
       const SizeStats& sizeStats = entry.second;
       std::fprintf(stderr,
-                   "[RdoSplitStatsSize] channel=%s size=%dx%d testedSplitModes=%llu testedSplit4x4=%llu "
-                   "QT=%llu BTH=%llu BTV=%llu TTH=%llu TTV=%llu "
-                   "QT4x4=%llu BTH4x4=%llu BTV4x4=%llu TTH4x4=%llu TTV4x4=%llu\n",
+                   "[RdoModeStatsSize] channel=%s size=%dx%d testedModes=%llu tested4x4=%llu "
+                   "NS=%llu QT=%llu BTH=%llu BTV=%llu TTH=%llu TTV=%llu "
+                   "NS4x4=%llu QT4x4=%llu BTH4x4=%llu BTV4x4=%llu TTH4x4=%llu TTV4x4=%llu\n",
                    channel,
                    width,
                    height,
@@ -152,16 +174,287 @@ struct RdoSplitStats
                    (unsigned long long)sizeStats.modes[2],
                    (unsigned long long)sizeStats.modes[3],
                    (unsigned long long)sizeStats.modes[4],
+                   (unsigned long long)sizeStats.modes[5],
                    (unsigned long long)sizeStats.mode4x4[0],
                    (unsigned long long)sizeStats.mode4x4[1],
                    (unsigned long long)sizeStats.mode4x4[2],
                    (unsigned long long)sizeStats.mode4x4[3],
-                   (unsigned long long)sizeStats.mode4x4[4]);
+                   (unsigned long long)sizeStats.mode4x4[4],
+                   (unsigned long long)sizeStats.mode4x4[5]);
     }
   }
 };
 
 RdoSplitStats g_rdoSplitStats;
+
+#if DumpRdoCost
+constexpr size_t RDO_COST_MODE_COUNT = 6;
+
+int getRdoCostModeIndex(EncTestModeType type)
+{
+  switch (type)
+  {
+  case ETM_INTRA:
+  case ETM_PALETTE:
+  case ETM_IBC:
+  case ETM_IBC_MERGE:  return 0;
+  case ETM_SPLIT_QT:   return 1;
+  case ETM_SPLIT_BT_H: return 2;
+  case ETM_SPLIT_BT_V: return 3;
+  case ETM_SPLIT_TT_H: return 4;
+  case ETM_SPLIT_TT_V: return 5;
+  default:              return -1;
+  }
+}
+
+const char* getRdoCostModeName(int index)
+{
+  static const char* names[RDO_COST_MODE_COUNT] = { "NS", "QT", "BTH", "BTV", "TTH", "TTV" };
+  return index >= 0 && index < int(RDO_COST_MODE_COUNT) ? names[index] : "ROOT";
+}
+
+struct RdoCostLog
+{
+  FILE* file = nullptr;
+  std::mutex mutex;
+  std::atomic<uint64_t> nextNodeId{ 0 };
+
+  RdoCostLog()
+  {
+    const char* path = std::getenv("VTM_RDO_COST_FILE");
+    if (path == nullptr || path[0] == '\0')
+    {
+      return;
+    }
+
+    file = std::fopen(path, "w");
+    if (file == nullptr)
+    {
+      std::fprintf(stderr, "[RdoCost] cannot open VTM_RDO_COST_FILE=%s\n", path);
+      return;
+    }
+    std::setvbuf(file, nullptr, _IOFBF, 1 << 20);
+    std::fprintf(file,
+                 "node_id\tparent_id\tvia_mode\tpoc\tchannel\tx\ty\twidth\theight\tdepth\tqt_depth\tmt_depth\tbt_depth\tqp"
+                 "\tNS_legal\tNS_scheduled\tNS_completed\tNS_cost\tNS_bits\tNS_dist"
+                 "\tQT_legal\tQT_scheduled\tQT_completed\tQT_cost\tQT_bits\tQT_dist"
+                 "\tBTH_legal\tBTH_scheduled\tBTH_completed\tBTH_cost\tBTH_bits\tBTH_dist"
+                 "\tBTV_legal\tBTV_scheduled\tBTV_completed\tBTV_cost\tBTV_bits\tBTV_dist"
+                 "\tTTH_legal\tTTH_scheduled\tTTH_completed\tTTH_cost\tTTH_bits\tTTH_dist"
+                 "\tTTV_legal\tTTV_scheduled\tTTV_completed\tTTV_cost\tTTV_bits\tTTV_dist"
+                 "\tselected\tbest_cost\n");
+  }
+
+  ~RdoCostLog()
+  {
+    if (file != nullptr)
+    {
+      std::fclose(file);
+    }
+  }
+};
+
+RdoCostLog g_rdoCostLog;
+
+struct RdoCostCandidate
+{
+  bool legal = false;
+  uint32_t scheduled = 0;
+  uint32_t completed = 0;
+  double cost = MAX_DOUBLE;
+  uint64_t bits = 0;
+  Distortion dist = 0;
+};
+
+struct RdoCostNodeRecorder;
+thread_local std::vector<RdoCostNodeRecorder*> g_rdoCostNodeStack;
+
+struct RdoCostNodeRecorder
+{
+  RdoCostNodeRecorder(CodingStructure*& bestCodingStructure, Partitioner& currentPartitioner)
+    : bestCS(bestCodingStructure), partitioner(currentPartitioner)
+  {
+    if (g_rdoCostLog.file == nullptr)
+    {
+      return;
+    }
+
+    active = true;
+    nodeId = g_rdoCostLog.nextNodeId.fetch_add(1, std::memory_order_relaxed);
+    parentId = g_rdoCostNodeStack.empty() ? -1 : int64_t(g_rdoCostNodeStack.back()->nodeId);
+    viaMode = g_rdoCostNodeStack.empty() ? -1 : g_rdoCostNodeStack.back()->activeChildMode;
+    const UnitArea& area = partitioner.currArea();
+    x = area.lx();
+    y = area.ly();
+    width = area.lwidth();
+    height = area.lheight();
+    channel = partitioner.chType;
+    depth = partitioner.currDepth;
+    qtDepth = partitioner.currQtDepth;
+    mtDepth = partitioner.currMtDepth;
+    btDepth = partitioner.currBtDepth;
+    poc = bestCS->slice == nullptr ? -1 : bestCS->slice->getPOC();
+    qp = bestCS->currQP[partitioner.chType];
+
+    // canSplit lazily updates the implicit-split cache. Query a copy so that
+    // enabling the recorder cannot change the encoder's partitioner state.
+    QTBTPartitioner observedPartitioner;
+    observedPartitioner.copyState(partitioner);
+    observedPartitioner.treeType = partitioner.treeType;
+    observedPartitioner.modeType = partitioner.modeType;
+    candidates[0].legal = observedPartitioner.canSplit(CU_DONT_SPLIT, *bestCS);
+    candidates[1].legal = observedPartitioner.canSplit(CU_QUAD_SPLIT, *bestCS);
+    candidates[2].legal = observedPartitioner.canSplit(CU_HORZ_SPLIT, *bestCS);
+    candidates[3].legal = observedPartitioner.canSplit(CU_VERT_SPLIT, *bestCS);
+    candidates[4].legal = observedPartitioner.canSplit(CU_TRIH_SPLIT, *bestCS);
+    candidates[5].legal = observedPartitioner.canSplit(CU_TRIV_SPLIT, *bestCS);
+    g_rdoCostNodeStack.push_back(this);
+  }
+
+  ~RdoCostNodeRecorder()
+  {
+    if (!active)
+    {
+      return;
+    }
+
+    if (g_rdoCostNodeStack.empty() || g_rdoCostNodeStack.back() != this)
+    {
+      std::fprintf(stderr, "[RdoCost] recorder stack mismatch\n");
+      return;
+    }
+    g_rdoCostNodeStack.pop_back();
+
+    const char* selected = "NONE";
+    double bestCost = MAX_DOUBLE;
+    if (bestCS != nullptr)
+    {
+      bestCost = bestCS->cost;
+      const CodingUnit* currentCU = bestCS->getCU(partitioner.currArea().block(partitioner.chType), partitioner.chType);
+      if (currentCU != nullptr)
+      {
+        const PartSplit split = CU::getSplitAtDepth(*currentCU, partitioner.currDepth);
+        switch (split)
+        {
+        case CU_DONT_SPLIT: selected = "NS";  break;
+        case CU_QUAD_SPLIT: selected = "QT";  break;
+        case CU_HORZ_SPLIT: selected = "BTH"; break;
+        case CU_VERT_SPLIT: selected = "BTV"; break;
+        case CU_TRIH_SPLIT: selected = "TTH"; break;
+        case CU_TRIV_SPLIT: selected = "TTV"; break;
+        default:            selected = "OTHER"; break;
+        }
+      }
+    }
+
+    std::lock_guard<std::mutex> lock(g_rdoCostLog.mutex);
+    std::fprintf(g_rdoCostLog.file, "%llu\t%lld\t%s\t%d\t%s\t%d\t%d\t%d\t%d\t%u\t%u\t%u\t%u\t%d",
+                 (unsigned long long)nodeId, (long long)parentId, getRdoCostModeName(viaMode), poc,
+                 channel == ChannelType::LUMA ? "L" : "C",
+                 x, y, width, height, depth, qtDepth, mtDepth, btDepth, qp);
+    for (const RdoCostCandidate& candidate : candidates)
+    {
+      std::fprintf(g_rdoCostLog.file, "\t%d\t%u\t%u\t",
+                   candidate.legal ? 1 : 0, candidate.scheduled, candidate.completed);
+      if (candidate.completed == 0 || candidate.cost == MAX_DOUBLE)
+      {
+        std::fprintf(g_rdoCostLog.file, "nan\tnan\tnan");
+      }
+      else
+      {
+        std::fprintf(g_rdoCostLog.file, "%.17g\t%llu\t%llu", candidate.cost,
+                     (unsigned long long)candidate.bits, (unsigned long long)candidate.dist);
+      }
+    }
+    if (bestCost == MAX_DOUBLE)
+    {
+      std::fprintf(g_rdoCostLog.file, "\t%s\tnan\n", selected);
+    }
+    else
+    {
+      std::fprintf(g_rdoCostLog.file, "\t%s\t%.17g\n", selected, bestCost);
+    }
+  }
+
+  void scheduled(EncTestModeType type)
+  {
+    const int index = getRdoCostModeIndex(type);
+    if (index >= 0)
+    {
+      candidates[size_t(index)].scheduled++;
+    }
+  }
+
+  void completed(const EncTestMode& mode, const CodingStructure& cs)
+  {
+    const int index = getRdoCostModeIndex(mode.type);
+    if (index < 0 || cs.cost == MAX_DOUBLE || cs.cus.empty())
+    {
+      return;
+    }
+    RdoCostCandidate& candidate = candidates[size_t(index)];
+    candidate.completed++;
+    if (cs.cost < candidate.cost)
+    {
+      candidate.cost = cs.cost;
+      candidate.bits = cs.fracBits;
+      candidate.dist = cs.dist;
+    }
+  }
+
+  CodingStructure*& bestCS;
+  Partitioner& partitioner;
+  bool active = false;
+  uint64_t nodeId = 0;
+  int64_t parentId = -1;
+  int viaMode = -1;
+  int activeChildMode = -1;
+  int poc = -1;
+  ChannelType channel = ChannelType::LUMA;
+  int x = 0;
+  int y = 0;
+  int width = 0;
+  int height = 0;
+  unsigned depth = 0;
+  unsigned qtDepth = 0;
+  unsigned mtDepth = 0;
+  unsigned btDepth = 0;
+  int qp = 0;
+  std::array<RdoCostCandidate, RDO_COST_MODE_COUNT> candidates{};
+};
+
+void rdoCostScheduled(EncTestModeType type)
+{
+  if (!g_rdoCostNodeStack.empty())
+  {
+    g_rdoCostNodeStack.back()->scheduled(type);
+  }
+}
+
+void rdoCostCompleted(const EncTestMode& mode, const CodingStructure& cs)
+{
+  if (!g_rdoCostNodeStack.empty())
+  {
+    g_rdoCostNodeStack.back()->completed(mode, cs);
+  }
+}
+
+void rdoCostBeginSplit(EncTestModeType type)
+{
+  if (!g_rdoCostNodeStack.empty())
+  {
+    g_rdoCostNodeStack.back()->activeChildMode = getRdoCostModeIndex(type);
+  }
+}
+
+void rdoCostEndSplit()
+{
+  if (!g_rdoCostNodeStack.empty())
+  {
+    g_rdoCostNodeStack.back()->activeChildMode = -1;
+  }
+}
+#endif // DumpRdoCost
 
 struct RdoSplitNodeCounter
 {
@@ -202,11 +495,12 @@ struct RdoSplitNodeCounter
   {
     switch (type)
     {
-    case ETM_SPLIT_QT:   modeCounts[0]++; break;
-    case ETM_SPLIT_BT_H: modeCounts[1]++; break;
-    case ETM_SPLIT_BT_V: modeCounts[2]++; break;
-    case ETM_SPLIT_TT_H: modeCounts[3]++; break;
-    case ETM_SPLIT_TT_V: modeCounts[4]++; break;
+    case ETM_INTRA:      modeCounts[0]++; break;
+    case ETM_SPLIT_QT:   modeCounts[1]++; break;
+    case ETM_SPLIT_BT_H: modeCounts[2]++; break;
+    case ETM_SPLIT_BT_V: modeCounts[3]++; break;
+    case ETM_SPLIT_TT_H: modeCounts[4]++; break;
+    case ETM_SPLIT_TT_V: modeCounts[5]++; break;
     default: break;
     }
   }
@@ -215,7 +509,7 @@ struct RdoSplitNodeCounter
   int width;
   int height;
   uint64_t area4x4;
-  std::array<uint64_t, RDO_SPLIT_MODE_COUNT> modeCounts{};
+  std::array<uint64_t, RDO_MODE_COUNT> modeCounts{};
 };
 }
 #endif
@@ -264,12 +558,25 @@ bool fastPartitionDumpBoundaryCtu()
   return enabled;
 }
 
+bool fastPartitionDumpAll()
+{
+  static const bool enabled = [] {
+    const char* value = std::getenv("FASTPARTITION_DUMP_ALL");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+  }();
+  return enabled;
+}
+
 bool isFastPartitionFirstLcuDumpArea(const CodingStructure& cs, const Partitioner& partitioner)
 {
   const UnitArea& area = partitioner.currArea();
   if (cs.slice == nullptr || cs.slice->getPOC() != 0 || !isLuma(partitioner.chType))
   {
     return false;
+  }
+  if (fastPartitionDumpAll())
+  {
+    return true;
   }
   const bool firstLcu = fastPartitionDumpFirstLcu() && area.lx() < 128 && area.ly() < 128;
   const bool boundaryCtu = fastPartitionDumpBoundaryCtu()
@@ -278,59 +585,7 @@ bool isFastPartitionFirstLcuDumpArea(const CodingStructure& cs, const Partitione
   return firstLcu || boundaryCtu;
 }
 
-void dumpFastPartitionFirstLcuGridmaps(const CodingStructure& cs, const FastPartitionCtuCache& ctuCache)
-{
-  if (cs.slice == nullptr || cs.slice->getPOC() != 0)
-  {
-    return;
-  }
-  const bool firstLcu = fastPartitionDumpFirstLcu() && ctuCache.ctuX == 0 && ctuCache.ctuY == 0;
-  const bool boundaryCtu = fastPartitionDumpBoundaryCtu()
-                           && (ctuCache.ctuX + ctuCache.ctuWidth > cs.picture->lwidth()
-                               || ctuCache.ctuY + ctuCache.ctuHeight > cs.picture->lheight());
-  if (!firstLcu && !boundaryCtu)
-  {
-    return;
-  }
-  FILE* statFile = fastPartitionStatFile();
-  if (statFile == nullptr)
-  {
-    return;
-  }
 
-  for (size_t mapIdx = 0; mapIdx < ctuCache.gridmaps.size(); mapIdx++)
-  {
-    const FastPartitionGridmap64& gridmap = ctuCache.gridmaps[mapIdx];
-    const bool isBoundary = gridmap.validWidthUnits < 16 || gridmap.validHeightUnits < 16;
-    if (!gridmap.valid)
-    {
-      std::fprintf(statFile,
-                   "[FastPartitionGridmap] poc=%d ctu=%d,%d block=%zu target=%d,%d valid=0 validGrid=%dx%d boundary=%d\n",
-                   cs.slice->getPOC(), ctuCache.ctuX, ctuCache.ctuY, mapIdx,
-                   gridmap.targetX, gridmap.targetY, gridmap.validWidthUnits, gridmap.validHeightUnits,
-                   isBoundary ? 1 : 0);
-      continue;
-    }
-    for (int channel = 0; channel < 2; channel++)
-    {
-      std::fprintf(statFile,
-                   "[FastPartitionGridmap] poc=%d ctu=%d,%d block=%zu target=%d,%d channel=%d shape=16x16 validGrid=%dx%d boundary=%d\n",
-                   cs.slice->getPOC(), ctuCache.ctuX, ctuCache.ctuY, mapIdx,
-                   gridmap.targetX, gridmap.targetY, channel,
-                   gridmap.validWidthUnits, gridmap.validHeightUnits, isBoundary ? 1 : 0);
-      for (int y = 0; y < 16; y++)
-      {
-        for (int x = 0; x < 16; x++)
-        {
-          const float value = gridmap.values[size_t(channel * 16 * 16 + y * 16 + x)];
-          std::fprintf(statFile, "%s%.6f", x == 0 ? "" : " ", value);
-        }
-        std::fprintf(statFile, "\n");
-      }
-    }
-  }
-  std::fflush(statFile);
-}
 }
 #endif
 
@@ -401,14 +656,11 @@ void EncCu::create( EncCfg* encCfg )
   m_CurrCtx = 0;
 
 #if FastPartition
-  m_fastPartitionSwinInfer.init(encCfg->getFastPartitionSwinModel());
-  m_fastPartitionClassifierInfer.init(encCfg->getFastPartitionClassifierModel());
-  if (!encCfg->getFastPartitionChromaSwinModel().empty()
-      && !encCfg->getFastPartitionChromaClassifierModel().empty())
-  {
-    m_fastPartitionChromaSwinInfer.init(encCfg->getFastPartitionChromaSwinModel());
-    m_fastPartitionChromaClassifierInfer.init(encCfg->getFastPartitionChromaClassifierModel());
-  }
+  const bool haveSwin = !encCfg->getFastPartitionSwinModel().empty();
+  const bool haveClassifier = !encCfg->getFastPartitionClassifierModel().empty();
+  CHECK(haveSwin != haveClassifier, "Configure both FastPartition luma models or neither for an anchor run");
+  if (haveSwin) m_fastPartitionLuma32SwinInfer.init(encCfg->getFastPartitionSwinModel());
+  if (haveClassifier) m_fastPartitionClassifierInfer.init(encCfg->getFastPartitionClassifierModel());
 #endif
 }
 
@@ -481,235 +733,97 @@ EncCu::~EncCu()
 }
 
 #if FastPartition
-void EncCu::xFastPartitionBuildSwinInput96(const CodingStructure& cs, int targetX, int targetY, FastPartitionSwinInput& dst) const{
+
+
+void EncCu::xFastPartitionBuildLuma32SwinInput48(const CodingStructure& cs, int targetX, int targetY,
+                                                 FastPartitionLuma32SwinInput& dst) const
+{
   dst.targetX = targetX;
   dst.targetY = targetY;
 
-  const CPelBuf origLuma = cs.picture->getOrigBuf(COMPONENT_Y);
+  const CPelBuf origLuma = cs.picture->getTrueOrigBuf(COMPONENT_Y);
   const int picWidth = int(origLuma.width);
   const int picHeight = int(origLuma.height);
-  const int cropX = targetX - 32;
-  const int cropY = targetY - 32;
+  const int cropX = targetX - 16;
+  const int cropY = targetY - 16;
   const int bitDepth = cs.sps->getBitDepth(ChannelType::LUMA);
   const int shift = std::max(0, bitDepth - 8);
   const int roundingOffset = shift > 0 ? (1 << (shift - 1)) : 0;
 
-  for (int y = 0; y < 96; y++)
+  for (int y = 0; y < 48; y++)
   {
     const int srcY = std::min(std::max(cropY + y, 0), picHeight - 1);
-    for (int x = 0; x < 96; x++)
+    for (int x = 0; x < 48; x++)
     {
       const int srcX = std::min(std::max(cropX + x, 0), picWidth - 1);
       int pel = int(origLuma.at(srcX, srcY));
       if (shift > 0)
       {
-        pel = (pel + roundingOffset) >> shift;
+        // Match np.round used by the training data (ties to even).
+        pel = (pel + roundingOffset - 1 + ((pel >> shift) & 1)) >> shift;
       }
       pel = std::min(std::max(pel, 0), 255);
-      dst.luma[size_t(y * 96 + x)] = float(pel);
+      dst.luma[size_t(y * 48 + x)] = float(pel);
     }
   }
 }
 
-void EncCu::xFastPartitionInferSwinCtu(int qp){
-  m_fastPartitionSwinInfer.inferCtu(m_fastPartitionCtuCache.swinInputs, qp, m_fastPartitionCtuCache.gridmaps);
+void EncCu::xFastPartitionInferLuma32SwinCtu(int qp)
+{
+  m_fastPartitionLuma32SwinInfer.inferCtu(m_fastPartitionLuma32CtuCache.swinInputs, qp, m_fastPartitionLuma32CtuCache.gridmaps);
 }
 
-void EncCu::xFastPartitionPrepareCtu(CodingStructure& cs, const UnitArea& area, int qp)
+void EncCu::xFastPartitionPrepareLuma32Ctu(CodingStructure& cs, const UnitArea& area, int qp)
 {
-  m_fastPartitionCtuCache.reset();
-
-  if (!cs.slice->isIntra())
-  {
-    return;
-  }
-  if (area.lumaSize().width != 128 || area.lumaSize().height != 128)
+  m_fastPartitionLuma32CtuCache.reset();
+  if (!m_fastPartitionLuma32SwinInfer.isInitialized()) return;
+  if (!cs.slice->isIntra() || area.lumaSize().width != 128 || area.lumaSize().height != 128)
   {
     return;
   }
 
   const int ctuX = area.lx();
   const int ctuY = area.ly();
+  m_fastPartitionLuma32CtuCache.ctuX = ctuX;
+  m_fastPartitionLuma32CtuCache.ctuY = ctuY;
+  m_fastPartitionLuma32CtuCache.ctuWidth = int(area.lumaSize().width);
+  m_fastPartitionLuma32CtuCache.ctuHeight = int(area.lumaSize().height);
 
-  m_fastPartitionCtuCache.ctuX = ctuX;
-  m_fastPartitionCtuCache.ctuY = ctuY;
-  m_fastPartitionCtuCache.ctuWidth = int(area.lumaSize().width);
-  m_fastPartitionCtuCache.ctuHeight = int(area.lumaSize().height);
-
-  const int targetOffsetX[4] = { 0, 64, 0, 64 };
-  const int targetOffsetY[4] = { 0, 0, 64, 64 };
-
-  for (int idx = 0; idx < 4; idx++)
+  int idx = 0;
+  for (int by = 0; by < 4; by++)
   {
-    xFastPartitionBuildSwinInput96(
-      cs,
-      ctuX + targetOffsetX[idx],
-      ctuY + targetOffsetY[idx],
-      m_fastPartitionCtuCache.swinInputs[size_t(idx)]);
+    for (int bx = 0; bx < 4; bx++)
+    {
+      xFastPartitionBuildLuma32SwinInput48(cs, ctuX + bx * 32, ctuY + by * 32,
+                                           m_fastPartitionLuma32CtuCache.swinInputs[size_t(idx)]);
+      idx++;
+    }
   }
 
-  xFastPartitionInferSwinCtu(qp);
+  xFastPartitionInferLuma32SwinCtu(qp);
 
   const int pictureWidth = cs.picture->lwidth();
   const int pictureHeight = cs.picture->lheight();
   bool hasValidGridmap = false;
-  for (FastPartitionGridmap64& gridmap : m_fastPartitionCtuCache.gridmaps)
-  {
-    const int validWidthPixels = std::max(0, std::min(64, pictureWidth - gridmap.targetX));
-    const int validHeightPixels = std::max(0, std::min(64, pictureHeight - gridmap.targetY));
-    gridmap.validWidthUnits = (validWidthPixels + 3) / 4;
-    gridmap.validHeightUnits = (validHeightPixels + 3) / 4;
-
-    if (gridmap.validWidthUnits == 0 || gridmap.validHeightUnits == 0)
-    {
-      gridmap.valid = false;
-      gridmap.values.fill(0.0f);
-      continue;
-    }
-
-    for (int channel = 0; channel < 2; channel++)
-    {
-      for (int y = 0; y < 16; y++)
-      {
-        for (int x = 0; x < 16; x++)
-        {
-          const bool outsidePicture = x >= gridmap.validWidthUnits || y >= gridmap.validHeightUnits;
-          const bool pictureRightEdge = channel == 0 && x == gridmap.validWidthUnits - 1;
-          const bool pictureBottomEdge = channel == 1 && y == gridmap.validHeightUnits - 1;
-          if (outsidePicture || pictureRightEdge || pictureBottomEdge)
-          {
-            gridmap.values[size_t(channel * 16 * 16 + y * 16 + x)] = 0.0f;
-          }
-        }
-      }
-    }
-    hasValidGridmap = true;
-  }
-  m_fastPartitionCtuCache.valid = hasValidGridmap;
-  dumpFastPartitionFirstLcuGridmaps(cs, m_fastPartitionCtuCache);
-}
-
-void EncCu::xFastPartitionBuildChromaSwinInput48(const CodingStructure& cs, int targetX, int targetY,
-                                                 FastPartitionChromaSwinInput& dst) const
-{
-  dst.targetX = targetX;
-  dst.targetY = targetY;
-
-  const CPelBuf origChroma[2] = {
-    cs.picture->getOrigBuf(COMPONENT_Cb),
-    cs.picture->getOrigBuf(COMPONENT_Cr),
-  };
-  const int cropX = targetX - 16;
-  const int cropY = targetY - 16;
-  const int bitDepth = cs.sps->getBitDepth(ChannelType::CHROMA);
-  const int shift = std::max(0, bitDepth - 8);
-  const int roundingOffset = shift > 0 ? (1 << (shift - 1)) : 0;
-
-  for (int channel = 0; channel < 2; channel++)
-  {
-    const CPelBuf& orig = origChroma[channel];
-    const int picWidth = int(orig.width);
-    const int picHeight = int(orig.height);
-    for (int y = 0; y < 48; y++)
-    {
-      const int srcY = std::min(std::max(cropY + y, 0), picHeight - 1);
-      for (int x = 0; x < 48; x++)
-      {
-        const int srcX = std::min(std::max(cropX + x, 0), picWidth - 1);
-        int pel = int(orig.at(srcX, srcY));
-        if (shift > 0)
-        {
-          pel = (pel + roundingOffset) >> shift;
-        }
-        pel = std::min(std::max(pel, 0), 255);
-        dst.chroma[size_t(channel * 48 * 48 + y * 48 + x)] = float(pel);
-      }
-    }
-  }
-}
-
-void EncCu::xFastPartitionInferChromaSwinCtu(int qp)
-{
-  m_fastPartitionChromaSwinInfer.inferCtu(m_fastPartitionChromaCtuCache.swinInputs, qp,
-                                          m_fastPartitionChromaCtuCache.gridmaps);
-}
-
-void EncCu::xFastPartitionPrepareChromaCtu(CodingStructure& cs, const UnitArea& area, int qp)
-{
-  m_fastPartitionChromaCtuCache.reset();
-
-  if (!m_fastPartitionChromaSwinInfer.isInitialized()
-      || !m_fastPartitionChromaClassifierInfer.isInitialized())
-  {
-    return;
-  }
-  if (!cs.slice->isIntra() || area.chromaFormat != ChromaFormat::_420)
-  {
-    return;
-  }
-  if (area.chromaSize().width != 64 || area.chromaSize().height != 64)
-  {
-    return;
-  }
-
-  const int ctuX = area.chromaPos().x;
-  const int ctuY = area.chromaPos().y;
-  m_fastPartitionChromaCtuCache.ctuX = ctuX;
-  m_fastPartitionChromaCtuCache.ctuY = ctuY;
-  m_fastPartitionChromaCtuCache.ctuWidth = int(area.chromaSize().width);
-  m_fastPartitionChromaCtuCache.ctuHeight = int(area.chromaSize().height);
-
-  const int targetOffsetX[4] = { 0, 32, 0, 32 };
-  const int targetOffsetY[4] = { 0, 0, 32, 32 };
-  for (int idx = 0; idx < 4; idx++)
-  {
-    xFastPartitionBuildChromaSwinInput48(
-      cs,
-      ctuX + targetOffsetX[idx],
-      ctuY + targetOffsetY[idx],
-      m_fastPartitionChromaCtuCache.swinInputs[size_t(idx)]);
-  }
-
-  xFastPartitionInferChromaSwinCtu(qp);
-
-  const CPelBuf origCb = cs.picture->getOrigBuf(COMPONENT_Cb);
-  const int pictureWidth = int(origCb.width);
-  const int pictureHeight = int(origCb.height);
-  bool hasValidGridmap = false;
-  for (FastPartitionChromaGridmap32& gridmap : m_fastPartitionChromaCtuCache.gridmaps)
+  for (FastPartitionLuma32Gridmap& gridmap : m_fastPartitionLuma32CtuCache.gridmaps)
   {
     const int validWidthPixels = std::max(0, std::min(32, pictureWidth - gridmap.targetX));
     const int validHeightPixels = std::max(0, std::min(32, pictureHeight - gridmap.targetY));
     gridmap.validWidthUnits = (validWidthPixels + 3) / 4;
     gridmap.validHeightUnits = (validHeightPixels + 3) / 4;
-
     if (gridmap.validWidthUnits == 0 || gridmap.validHeightUnits == 0)
     {
       gridmap.valid = false;
       gridmap.values.fill(0.0f);
       continue;
     }
-
-    for (int channel = 0; channel < 2; channel++)
-    {
-      for (int y = 0; y < 8; y++)
-      {
-        for (int x = 0; x < 8; x++)
-        {
-          const bool outsidePicture = x >= gridmap.validWidthUnits || y >= gridmap.validHeightUnits;
-          const bool pictureRightEdge = channel == 0 && x == gridmap.validWidthUnits - 1;
-          const bool pictureBottomEdge = channel == 1 && y == gridmap.validHeightUnits - 1;
-          if (outsidePicture || pictureRightEdge || pictureBottomEdge)
-          {
-            gridmap.values[size_t(channel * 8 * 8 + y * 8 + x)] = 0.0f;
-          }
-        }
-      }
-    }
+    // Classifier training consumes the raw predicted gridmap, including edges.
     hasValidGridmap = true;
   }
-  m_fastPartitionChromaCtuCache.valid = hasValidGridmap;
+  m_fastPartitionLuma32CtuCache.valid = hasValidGridmap;
 }
+
+
 #endif
 
 /** \param    pcEncLib      pointer of encoder class
@@ -759,7 +873,7 @@ void EncCu::compressCtu(CodingStructure &cs, const UnitArea &area, const unsigne
   QTBTPartitioner partitioner;
   partitioner.initCtu(area, ChannelType::LUMA, *cs.slice);
 #if FastPartition
-  xFastPartitionPrepareCtu(cs, area, currQP[ChannelType::LUMA]);
+  xFastPartitionPrepareLuma32Ctu(cs, area, currQP[ChannelType::LUMA]);
 #endif
   if (m_pcEncCfg->getIBCMode())
   {
@@ -810,9 +924,6 @@ void EncCu::compressCtu(CodingStructure &cs, const UnitArea &area, const unsigne
     m_CABACEstimator->getCtx() = m_CurrCtx->start;
 
     partitioner.initCtu(area, ChannelType::CHROMA, *cs.slice);
-#if FastPartition
-    xFastPartitionPrepareChromaCtu(cs, area, currQP[ChannelType::CHROMA]);
-#endif
 
     cs.initSubStructure(*tempCS, partitioner.chType, partitioner.currArea(), false);
     cs.initSubStructure(*bestCS, partitioner.chType, partitioner.currArea(), false);
@@ -966,6 +1077,12 @@ bool EncCu::xCheckBestMode( CodingStructure *&tempCS, CodingStructure *&bestCS, 
 
   if( !tempCS->cus.empty() )
   {
+#if RDOStats && DumpRdoCost
+    if (!isModeSplit(encTestMode))
+    {
+      rdoCostCompleted(encTestMode, *tempCS);
+    }
+#endif
     if( tempCS->cus.size() == 1 )
     {
       const CodingUnit& cu = *tempCS->cus.front();
@@ -1000,6 +1117,9 @@ void EncCu::xCompressCU( CodingStructure*& tempCS, CodingStructure*& bestCS, Par
   RdoSplitNodeCounter rdoSplitNodeCounter(partitioner.chType,
                                           rdoStatsArea.lwidth(),
                                           rdoStatsArea.lheight());
+#if DumpRdoCost
+  RdoCostNodeRecorder rdoCostNodeRecorder(bestCS, partitioner);
+#endif
 #endif
   CHECK(maxCostAllowed < 0, "Wrong value of maxCostAllowed!");
 
@@ -1065,8 +1185,7 @@ void EncCu::xCompressCU( CodingStructure*& tempCS, CodingStructure*& bestCS, Par
     m_modeCtrl->setQpCtu(m_pcSliceEncoder->getQpCtu());
   }
 #if FastPartition
-  m_modeCtrl->setFastPartitionContext(&m_fastPartitionCtuCache, &m_fastPartitionClassifierInfer,
-                                      &m_fastPartitionChromaCtuCache, &m_fastPartitionChromaClassifierInfer);
+  m_modeCtrl->setFastPartitionContext(&m_fastPartitionLuma32CtuCache, &m_fastPartitionClassifierInfer);
 #endif
   m_modeCtrl->initCULevel( partitioner, *tempCS );
 #if GDR_ENABLED
@@ -1238,6 +1357,9 @@ void EncCu::xCompressCU( CodingStructure*& tempCS, CodingStructure*& bestCS, Par
     }
     EncTestMode currTestMode = m_modeCtrl->currTestMode();
     currTestMode.maxCostAllowed = maxCostAllowed;
+#if RDOStats && DumpRdoCost
+    rdoCostScheduled(currTestMode.type);
+#endif
 
     if (pps.getUseDQP() && partitioner.isSepTree(*tempCS) && isChroma( partitioner.chType ))
     {
@@ -1330,6 +1452,9 @@ void EncCu::xCompressCU( CodingStructure*& tempCS, CodingStructure*& bestCS, Par
     }
     else if( currTestMode.type == ETM_INTRA )
     {
+#if RDOStats
+      rdoSplitNodeCounter.record(currTestMode.type);
+#endif
       if (slice.getSPS()->getUseColorTrans() && !CS::isDualITree(*tempCS))
       {
         bool skipSecColorSpace = false;
@@ -1442,7 +1567,13 @@ void EncCu::xCompressCU( CodingStructure*& tempCS, CodingStructure*& bestCS, Par
           }
         }
 
+#if RDOStats && DumpRdoCost
+        rdoCostBeginSplit(currTestMode.type);
+#endif
         xCheckModeSplit( tempCS, bestCS, partitioner, currTestMode, modeTypeParent, skipInterPass, splitRdCostBest );
+#if RDOStats && DumpRdoCost
+        rdoCostEndSplit();
+#endif
         tempCS->splitRdCostBest = splitRdCostBest;
         //recover cons modes
         tempCS->modeType = partitioner.modeType = modeTypeParent;
@@ -1527,9 +1658,10 @@ void EncCu::xCompressCU( CodingStructure*& tempCS, CodingStructure*& bestCS, Par
     if (statFile != nullptr)
     {
       PartSplit selectedSplit = CU_DONT_SPLIT;
-      if (!bestCS->cus.empty())
+      const CodingUnit* currentCU = bestCS->getCU(partitioner.currArea().block(partitioner.chType), partitioner.chType);
+      if (currentCU != nullptr)
       {
-        selectedSplit = CU::getSplitAtDepth(*bestCS->cus.front(), partitioner.currDepth);
+        selectedSplit = CU::getSplitAtDepth(*currentCU, partitioner.currDepth);
       }
       const UnitArea& area = partitioner.currArea();
       std::fprintf(statFile,
@@ -2047,6 +2179,9 @@ void EncCu::xCheckModeSplit(CodingStructure *&tempCS, CodingStructure *&bestCS, 
   }
 
   splitRdCostBest[getPartSplit(encTestMode)] = tempCS->cost;
+#if RDOStats && DumpRdoCost
+  rdoCostCompleted(encTestMode, *tempCS);
+#endif
   // RD check for sub partitioned coding structure.
   xCheckBestMode( tempCS, bestCS, partitioner, encTestMode );
 
@@ -5429,7 +5564,6 @@ void MergeItemList::resetList(size_t maxTrackingNum)
   m_maxTrackingNum = maxTrackingNum;
   m_numInterLayers = 0;
 }
-
 
 
 void MergeItemList::insertMergeItemToBackupList(MergeItem* p)

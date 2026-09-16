@@ -21,54 +21,15 @@
 
 FILE* fastPartitionStatFile();
 
-struct FastPartitionSwinInput
+
+struct FastPartitionLuma32SwinInput
 {
   int targetX = 0;
   int targetY = 0;
-  std::array<float, 96 * 96> luma;
+  std::array<float, 48 * 48> luma;
 };
 
-struct FastPartitionGridmap64
-{
-  bool valid = false;
-  int  targetX = 0;
-  int  targetY = 0;
-  int  validWidthUnits = 0;
-  int  validHeightUnits = 0;
-  std::array<float, 2 * 16 * 16> values;
-};
-
-struct FastPartitionCtuCache
-{
-  bool valid = false;
-  int  ctuX = 0;
-  int  ctuY = 0;
-  int  ctuWidth = 0;
-  int  ctuHeight = 0;
-  std::array<FastPartitionSwinInput, 4>  swinInputs;
-  std::array<FastPartitionGridmap64, 4>  gridmaps;
-
-  void reset()
-  {
-    valid = false;
-    ctuX = ctuY = ctuWidth = ctuHeight = 0;
-    for (auto& gridmap: gridmaps)
-    {
-      gridmap.valid = false;
-      gridmap.validWidthUnits = 0;
-      gridmap.validHeightUnits = 0;
-    }
-  }
-};
-
-struct FastPartitionChromaSwinInput
-{
-  int targetX = 0;
-  int targetY = 0;
-  std::array<float, 2 * 48 * 48> chroma;
-};
-
-struct FastPartitionChromaGridmap32
+struct FastPartitionLuma32Gridmap
 {
   bool valid = false;
   int  targetX = 0;
@@ -78,15 +39,15 @@ struct FastPartitionChromaGridmap32
   std::array<float, 2 * 8 * 8> values;
 };
 
-struct FastPartitionChromaCtuCache
+struct FastPartitionLuma32CtuCache
 {
   bool valid = false;
   int  ctuX = 0;
   int  ctuY = 0;
   int  ctuWidth = 0;
   int  ctuHeight = 0;
-  std::array<FastPartitionChromaSwinInput, 4> swinInputs;
-  std::array<FastPartitionChromaGridmap32, 4> gridmaps;
+  std::array<FastPartitionLuma32SwinInput, 16> swinInputs;
+  std::array<FastPartitionLuma32Gridmap, 16> gridmaps;
 
   void reset()
   {
@@ -101,43 +62,26 @@ struct FastPartitionChromaCtuCache
   }
 };
 
-class EncFastPartitionSwinInfer
+
+class EncFastPartitionLuma32SwinInfer
 {
 public:
-  EncFastPartitionSwinInfer();
-  ~EncFastPartitionSwinInfer();
+  EncFastPartitionLuma32SwinInfer();
+  ~EncFastPartitionLuma32SwinInfer();
 
-  EncFastPartitionSwinInfer(const EncFastPartitionSwinInfer&) = delete;
-  EncFastPartitionSwinInfer& operator=(const EncFastPartitionSwinInfer&) = delete;
+  EncFastPartitionLuma32SwinInfer(const EncFastPartitionLuma32SwinInfer&) = delete;
+  EncFastPartitionLuma32SwinInfer& operator=(const EncFastPartitionLuma32SwinInfer&) = delete;
 
   void init(const std::string& modelPath);
   bool isInitialized() const;
-  void inferCtu(const std::array<FastPartitionSwinInput, 4>& swinInputs, int qp,
-                std::array<FastPartitionGridmap64, 4>& gridmaps);
+  void inferCtu(const std::array<FastPartitionLuma32SwinInput, 16>& swinInputs, int qp,
+                std::array<FastPartitionLuma32Gridmap, 16>& gridmaps);
 
 private:
   struct Impl;
   std::unique_ptr<Impl> m_impl;
 };
 
-class EncFastPartitionChromaSwinInfer
-{
-public:
-  EncFastPartitionChromaSwinInfer();
-  ~EncFastPartitionChromaSwinInfer();
-
-  EncFastPartitionChromaSwinInfer(const EncFastPartitionChromaSwinInfer&) = delete;
-  EncFastPartitionChromaSwinInfer& operator=(const EncFastPartitionChromaSwinInfer&) = delete;
-
-  void init(const std::string& modelPath);
-  bool isInitialized() const;
-  void inferCtu(const std::array<FastPartitionChromaSwinInput, 4>& swinInputs, int qp,
-                std::array<FastPartitionChromaGridmap32, 4>& gridmaps);
-
-private:
-  struct Impl;
-  std::unique_ptr<Impl> m_impl;
-};
 
 class EncFastPartitionClassifierInfer
 {
@@ -150,9 +94,7 @@ public:
 
   void init(const std::string& modelPath);
   bool isInitialized() const;
-  bool inferCu(const FastPartitionCtuCache& ctuCache, int cuX, int cuY, int cuWidth, int cuHeight,
-               std::array<float, 6>& splitProbabilities);
-  bool inferCu(const FastPartitionChromaCtuCache& ctuCache, int cuX, int cuY, int cuWidth, int cuHeight,
+  bool inferCu(const FastPartitionLuma32CtuCache& ctuCache, int cuX, int cuY, int cuWidth, int cuHeight,
                std::array<float, 6>& splitProbabilities);
 
 private:

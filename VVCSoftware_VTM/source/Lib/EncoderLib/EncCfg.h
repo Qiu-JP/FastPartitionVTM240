@@ -50,6 +50,9 @@
 #include <array>
 #include <map>
 #include <sstream>
+#if FastPartition
+#include <cmath>
+#endif
 
 #if JVET_O0756_CALCULATE_HDRMETRICS
 #include "HDRLib/inc/DistortionMetric.H"
@@ -429,7 +432,6 @@ protected:
   bool      m_useAMaxBT;
   bool      m_e0023FastEnc;
   bool      m_contentBasedFastQtbt;
-  bool      m_splitStructurePruning;
   bool      m_useNonLinearAlfLuma;
   bool      m_useNonLinearAlfChroma;
   unsigned  m_maxNumAlfAlternativesChroma;
@@ -1084,14 +1086,9 @@ protected:
   ScalingListMode m_useScalingListId;             ///< Using quantization matrix i.e. 0=off, 1=default, 2=file.
   std::string m_scalingListFileName;              ///< quantization matrix file name
 #if FastPartition
-  std::string m_fastPartitionSwinModel;            ///< FastPartition Swin luma TorchScript model file name
-  std::string m_fastPartitionClassifierModel;      ///< FastPartition Classifier_I native JSON model file name
-  std::string m_fastPartitionChromaSwinModel;      ///< FastPartition Swin chroma TorchScript model file name
-  std::string m_fastPartitionChromaClassifierModel;///< FastPartition chroma Classifier_I native JSON model file name
-  std::string m_fastPartitionPreset;               ///< FastPartition classifier preset
-  double      m_fastPartitionThreshold = -1.0;     ///< FastPartition classifier threshold override
-  std::array<double, 6> m_fastPartitionThresholds = { { 0.1, 0.1, 0.1, 0.1, 0.1, 0.1 } };
-  bool        m_fastPartitionThresholdsEnabled = false;
+  std::string m_fastPartitionSwinModel;            ///< FastPartition Swin luma ONNX model file name
+  std::string m_fastPartitionClassifierModel;      ///< FastPartition Classifier_I ONNX bundle directory
+  int         m_fastPartitionLumaModelScale = 32;  ///< FastPartition luma model block size: 64 or 32
   std::map<std::pair<int, int>, std::array<double, 6>> m_fastPartitionThresholdsBySize;
 #endif
 
@@ -1848,8 +1845,6 @@ public:
   bool      getUseE0023FastEnc              () const         { return m_e0023FastEnc; }
   void      setUseContentBasedFastQtbt      ( bool b )       { m_contentBasedFastQtbt = b; }
   bool      getUseContentBasedFastQtbt      () const         { return m_contentBasedFastQtbt; }
-  void      setSplitStructurePruning        ( bool b )       { m_splitStructurePruning = b; }
-  bool      getSplitStructurePruning        () const         { return m_splitStructurePruning; }
   void      setUseNonLinearAlfLuma          ( bool b )       { m_useNonLinearAlfLuma = b; }
   bool      getUseNonLinearAlfLuma          () const         { return m_useNonLinearAlfLuma; }
   void      setUseNonLinearAlfChroma        ( bool b )       { m_useNonLinearAlfChroma = b; }
@@ -3236,43 +3231,12 @@ public:
   const std::string& getFastPartitionSwinModel() const               { return m_fastPartitionSwinModel;}
   void         setFastPartitionClassifierModel( const std::string &s ){ m_fastPartitionClassifierModel = s;   }
   const std::string& getFastPartitionClassifierModel() const          { return m_fastPartitionClassifierModel;}
-  void         setFastPartitionChromaSwinModel( const std::string &s ){ m_fastPartitionChromaSwinModel = s; }
-  const std::string& getFastPartitionChromaSwinModel() const          { return m_fastPartitionChromaSwinModel; }
-  void         setFastPartitionChromaClassifierModel( const std::string &s ){ m_fastPartitionChromaClassifierModel = s; }
-  const std::string& getFastPartitionChromaClassifierModel() const          { return m_fastPartitionChromaClassifierModel; }
-  void         setFastPartitionPreset       ( const std::string &s ) { m_fastPartitionPreset = s;      }
-  const std::string& getFastPartitionPreset() const                  { return m_fastPartitionPreset;   }
-  void         setFastPartitionThreshold    ( double d )             { m_fastPartitionThreshold = d;   }
-  double       getFastPartitionThreshold    () const                 { return m_fastPartitionThreshold;}
-  void         setFastPartitionThresholds   ( const std::string& s )
+  void         setFastPartitionLumaModelScale( int value )
   {
-    if (s.empty())
-    {
-      m_fastPartitionThresholdsEnabled = false;
-      return;
-    }
-
-    std::string values = s;
-    for (char& c : values)
-    {
-      if (c == '[' || c == ']' || c == ',')
-      {
-        c = ' ';
-      }
-    }
-
-    std::istringstream stream(values);
-    for (double& threshold : m_fastPartitionThresholds)
-    {
-      CHECK(!(stream >> threshold) || threshold < 0.0,
-            "FastPartitionTh must contain six non-negative thresholds");
-    }
-    std::string extra;
-    CHECK(stream >> extra, "FastPartitionTh must contain exactly six thresholds");
-    m_fastPartitionThresholdsEnabled = true;
+    CHECK(value != 32, "FastPartitionLumaModelScale must be 32");
+    m_fastPartitionLumaModelScale = value;
   }
-  bool         getFastPartitionThresholdsEnabled() const             { return m_fastPartitionThresholdsEnabled; }
-  const std::array<double, 6>& getFastPartitionThresholds() const    { return m_fastPartitionThresholds; }
+  int          getFastPartitionLumaModelScale() const                       { return m_fastPartitionLumaModelScale; }
   void         setFastPartitionThresholdsBySize( const std::string& s )
   {
     m_fastPartitionThresholdsBySize.clear();
@@ -3292,23 +3256,31 @@ public:
     }
 
     std::istringstream stream(values);
-    while (stream)
+    while (stream >> std::ws && !stream.eof())
     {
       int width = 0;
       int height = 0;
-      if (!(stream >> width >> height))
-      {
-        break;
-      }
-      CHECK(width <= 0 || height <= 0, "FastPartitionThBySize contains a non-positive CU size");
+      CHECK(!(stream >> width >> height), "FastPartitionThBySize contains an incomplete or invalid CU size");
+      CHECK(width < 4 || height < 4 || width > 64 || height > 64
+              || (width & (width - 1)) || (height & (height - 1)),
+            "FastPartitionThBySize CU dimensions must be powers of two between 4 and 64 pixels");
       std::array<double, 6> thresholds;
       for (double& threshold : thresholds)
       {
-        CHECK(!(stream >> threshold) || threshold < 0.0,
-              "FastPartitionThBySize entries must contain width, height, and six non-negative thresholds");
+        CHECK(!(stream >> threshold) || !std::isfinite(threshold) || threshold < 0.0 || threshold > 1.0,
+              "FastPartitionThBySize entries must contain six finite thresholds in [0, 1]");
       }
-      m_fastPartitionThresholdsBySize[std::make_pair(width, height)] = thresholds;
+      CHECK(!m_fastPartitionThresholdsBySize.emplace(std::make_pair(width, height), thresholds).second,
+            "FastPartitionThBySize contains a duplicate CU size");
     }
+  }
+  void         validateFastPartitionPolicy() const
+  {
+    const bool hasSwin = !m_fastPartitionSwinModel.empty();
+    const bool hasClassifier = !m_fastPartitionClassifierModel.empty();
+    CHECK(hasSwin != hasClassifier, "FastPartition requires both Swin and classifier ONNX paths");
+    CHECK(hasSwin && m_fastPartitionThresholdsBySize.empty(), "FastPartition requires FastPartitionThBySize");
+    CHECK(!hasSwin && !m_fastPartitionThresholdsBySize.empty(), "FastPartition thresholds require model paths");
   }
   bool         getFastPartitionThresholdsBySizeEnabled() const       { return !m_fastPartitionThresholdsBySize.empty(); }
   const std::array<double, 6>* getFastPartitionThresholdsForSize( int width, int height ) const

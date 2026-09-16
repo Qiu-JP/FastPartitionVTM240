@@ -858,7 +858,6 @@ void EncApp::xInitLibCfg( int layerIdx )
   m_cEncLib.setUseAMaxBT                                         ( m_useAMaxBT );
   m_cEncLib.setUseE0023FastEnc                                   ( m_e0023FastEnc );
   m_cEncLib.setUseContentBasedFastQtbt                           ( m_contentBasedFastQtbt );
-  m_cEncLib.setSplitStructurePruning                             ( m_splitStructurePruning );
   m_cEncLib.setUseNonLinearAlfLuma                               ( m_useNonLinearAlfLuma );
   m_cEncLib.setUseNonLinearAlfChroma                             ( m_useNonLinearAlfChroma );
   m_cEncLib.setMaxNumAlfAlternativesChroma                       ( m_maxNumAlfAlternativesChroma );
@@ -1452,12 +1451,9 @@ void EncApp::xInitLibCfg( int layerIdx )
 #if FastPartition
   m_cEncLib.setFastPartitionSwinModel                            ( m_fastPartitionSwinModel );
   m_cEncLib.setFastPartitionClassifierModel                      ( m_fastPartitionClassifierModel );
-  m_cEncLib.setFastPartitionChromaSwinModel                      ( m_fastPartitionChromaSwinModel );
-  m_cEncLib.setFastPartitionChromaClassifierModel                ( m_fastPartitionChromaClassifierModel );
-  m_cEncLib.setFastPartitionPreset                               ( m_fastPartitionPreset );
-  m_cEncLib.setFastPartitionThreshold                            ( m_fastPartitionThreshold );
-  m_cEncLib.setFastPartitionThresholds                           ( m_fastPartitionTh );
+  m_cEncLib.setFastPartitionLumaModelScale                       ( m_fastPartitionLumaModelScale );
   m_cEncLib.setFastPartitionThresholdsBySize                     ( m_fastPartitionThBySize );
+  m_cEncLib.validateFastPartitionPolicy();
 #endif
   m_cEncLib.setDisableScalingMatrixForLfnstBlks                  ( m_disableScalingMatrixForLfnstBlks);
   m_cEncLib.setDisableScalingMatrixForAlternativeColourSpace(m_disableScalingMatrixForAlternativeColourSpace);

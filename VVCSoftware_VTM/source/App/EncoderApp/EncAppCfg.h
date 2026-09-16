@@ -439,7 +439,6 @@ protected:
   int       m_mergeRdCandQuotaGpm;
   bool      m_e0023FastEnc;
   bool      m_contentBasedFastQtbt;
-  bool      m_splitStructurePruning;
   bool      m_useNonLinearAlfLuma;
   bool      m_useNonLinearAlfChroma;
   unsigned  m_maxNumAlfAlternativesChroma;
@@ -967,13 +966,9 @@ protected:
   ScalingListMode m_useScalingListId;                         ///< using quantization matrix
   std::string m_scalingListFileName;                          ///< quantization matrix file name
 #if FastPartition
-  std::string m_fastPartitionSwinModel;                        ///< FastPartition Swin luma TorchScript model file name
-  std::string m_fastPartitionClassifierModel;                  ///< FastPartition Classifier_I native JSON model file name
-  std::string m_fastPartitionChromaSwinModel;                  ///< FastPartition Swin chroma TorchScript model file name
-  std::string m_fastPartitionChromaClassifierModel;            ///< FastPartition chroma Classifier_I native JSON model file name
-  std::string m_fastPartitionPreset;                           ///< FastPartition classifier preset
-  double      m_fastPartitionThreshold;                        ///< FastPartition classifier threshold override
-  std::string m_fastPartitionTh;                               ///< FastPartition per-class thresholds
+  std::string m_fastPartitionSwinModel;                        ///< FastPartition Swin luma ONNX model file name
+  std::string m_fastPartitionClassifierModel;                  ///< FastPartition Classifier_I ONNX bundle directory
+  int         m_fastPartitionLumaModelScale;                   ///< FastPartition luma model block size
   std::string m_fastPartitionThBySize;                         ///< FastPartition size-aware per-class thresholds
 #endif
   bool      m_disableScalingMatrixForLfnstBlks;
